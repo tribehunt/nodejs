@@ -106,7 +106,6 @@ wss.on("connection", (ws) => {
   });
   ws.on("close", () => {
     room.clients.delete(ws);
-    // reset if someone leaves
     room.started = false;
     room.seed = 0;
     broadcast(room, { type: "lobby", room: roomId, users: lobbyState(room), started: room.started });
