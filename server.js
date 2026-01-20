@@ -121,6 +121,13 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    if (msg.type === "chat") {
+      const text = String(msg.text || "").slice(0, 200).trim();
+      if (!text) return;
+      broadcast(room, { type: "chat", from: meta.id, name: meta.name || meta.id, text, ts: Date.now() });
+      return;
+    }
+
     // Relay gameplay messages only after start
     if (!room.started) return;
 
@@ -142,6 +149,6 @@ wss.on("connection", (ws) => {
   });
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, "0.0.0.0", () => {
   console.log("WebSocket relay on port", PORT);
 });
