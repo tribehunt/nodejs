@@ -6,9 +6,9 @@
   "author": "alphasec",
   "license": "MIT",
   "dependencies": {
-    "express": "^4.19.2"
+    "ws": "^8.0.0"
   },
   "scripts": {
-    "start": "node app.js"
+    "start": "node server.js"
   }
 }
