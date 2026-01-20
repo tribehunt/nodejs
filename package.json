@@ -2,8 +2,8 @@
   "name": "nodejs-app",
   "version": "1.0.0",
   "description": "A minimal Node.js web application.",
-  "main": "app.js",
-  "author": "alphasec",
+  "main": "server.js",
+  "author": "dedset media",
   "license": "MIT",
   "dependencies": {
     "ws": "^8.0.0"
