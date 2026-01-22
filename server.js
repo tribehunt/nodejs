@@ -6,16 +6,6 @@ const server = http.createServer((req, res) => {
   res.end("OK\n");
 });
 const wss = new WebSocket.Server({ server });
-const HB_MS = 25000;
-function _hbMarkAlive() { this.isAlive = true; }
-const _hb = setInterval(() => {
-  for (const ws of wss.clients) {
-    if (ws.isAlive === false) { try { ws.terminate(); } catch {} continue; }
-    ws.isAlive = false;
-    try { ws.ping(); } catch {}
-  }
-}, HB_MS);
-wss.on("close", () => { try { clearInterval(_hb); } catch {} });
 /**
  * Rooms:
  * roomId -> {
@@ -67,9 +57,7 @@ function maybeStart(room, roomId) {
   });
 }
 wss.on("connection", (ws) => {
-    ws.isAlive = true;
-  ws.on(\"pong\", _hbMarkAlive);
-let roomId = "public";
+  let roomId = "public";
   let room = getRoom(roomId);
   let meta = { id: "U" + Math.floor(Math.random() * 1e9).toString(36), name: "", ready: false };
   room.clients.set(ws, meta);
@@ -108,10 +96,6 @@ let roomId = "public";
       const text = String(msg.text || "").slice(0, 200).trim();
       if (!text) return;
       broadcast(room, { type: "chat", from: meta.id, name: meta.name || meta.id, text, ts: Date.now() });
-      return;
-    }
-    if (msg.type === "ping") {
-      try { ws.send(JSON.stringify({ type: "pong", ts: Date.now() })); } catch {}
       return;
     }
     if (!room.started) return;
