@@ -1,10 +1,10 @@
 {
   "name": "nodejs-app",
-  "version": "1.0.0",
-  "description": "A minimal Node.js web application.",
+  "version": "1.3",
+  "description": "Node.js server for Dorfwärter.",
   "main": "server.js",
-  "author": "dedset media",
-  "license": "MIT",
+  "author": "Dedset Media",
+  "license": "©",
   "dependencies": {
     "ws": "^8.0.0"
   },
