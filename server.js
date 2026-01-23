@@ -6,6 +6,23 @@ const server = http.createServer((req, res) => {
   res.end("OK\n");
 });
 const wss = new WebSocket.Server({ server });
+
+// Keepalive for platforms/proxies that drop long-lived sockets.
+// Browser clients automatically respond to protocol-level ping with pong.
+const HEARTBEAT_MS = 30000;
+setInterval(() => {
+  try {
+    wss.clients.forEach((ws) => {
+      if (ws.isAlive === false) {
+        try { ws.terminate(); } catch {}
+        return;
+      }
+      ws.isAlive = false;
+      try { ws.ping(); } catch {}
+    });
+  } catch {}
+}, HEARTBEAT_MS);
+
 /**
  * Rooms:
  * roomId -> {
@@ -61,6 +78,8 @@ wss.on("connection", (ws) => {
   let room = getRoom(roomId);
   let meta = { id: "U" + Math.floor(Math.random() * 1e9).toString(36), name: "", ready: false };
   room.clients.set(ws, meta);
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
   function syncLobby() {
     broadcast(room, { type: "lobby", room: roomId, users: lobbyState(room), started: room.started });
   }
@@ -96,6 +115,10 @@ wss.on("connection", (ws) => {
       const text = String(msg.text || "").slice(0, 200).trim();
       if (!text) return;
       broadcast(room, { type: "chat", from: meta.id, name: meta.name || meta.id, text, ts: Date.now() });
+      return;
+    }
+    if (msg.type === "ping") {
+      try { ws.send(JSON.stringify({ type: "pong", t: Date.now() })); } catch {}
       return;
     }
     if (!room.started) return;
