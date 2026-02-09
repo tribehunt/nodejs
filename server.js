@@ -1,6 +1,5 @@
 const http = require("http");
 const WebSocket = require("ws");
-const { execFileSync } = require("child_process");
 const PORT = process.env.PORT || 8080;
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "content-type": "text/plain" });
@@ -25,7 +24,7 @@ function safeRoomId(s) {
 function getRoom(roomId) {
   roomId = safeRoomId(roomId);
   if (!rooms.has(roomId)) {
-    rooms.set(roomId, { clients: new Map(), started: false, seed: 0, map: null });
+    rooms.set(roomId, { clients: new Map(), started: false, seed: 0, map: null, pending: false, generator: null });
   }
   return rooms.get(roomId);
 }
@@ -42,52 +41,23 @@ function lobbyState(room) {
   }
   return users;
 }
-
-function generateMapFromPython(seed, w=64, h=64){
-  const py = process.env.PYTHON || "python";
-  try{
-    const code = `
-import json
-import map
-print(json.dumps(map.generate_map(${w}, ${h}, ${seed})))
-`;
-    const out = execFileSync(py, ["-c", code], { encoding:"utf8" });
-    const data = JSON.parse(out.trim());
-    // basic validation
-    if(!data || !Array.isArray(data.grid) || !data.grid.length) throw new Error("bad map");
-    return data;
-  }catch(e){
-    // fallback: simple open arena
-    const W = (w|0) || 64, H = (h|0) || 64;
-    const grid = [];
-    for(let y=0;y<H;y++){
-      let row="";
-      for(let x=0;x<W;x++){
-        const border = (x===0||y===0||x===W-1||y===H-1);
-        row += border ? "1" : "0";
-      }
-      grid.push(row);
-    }
-    return { w:W, h:H, grid, spawns:[{x:3.5,y:3.5},{x:W-4.5,y:H-4.5}], seed:seed>>>0 };
-  }
-}
-
-function maybeStart(room, roomId) {
-  if (room.started) return;
+function maybeStart(room, roomId, triggerWs) {
+  if (room.started || room.pending) return;
   const metas = [...room.clients.values()];
   if (metas.length !== 2) return;
   if (!metas.every(m => m.ready)) return;
-  room.started = true;
-  room.seed = (Date.now() ^ (Math.random() * 0xffffffff)) >>> 0;
-    room.map = generateMapFromPython(room.seed, 64, 64);
-  broadcast(room, {
-    type: "start",
-    room: roomId,
-    seed: room.seed,
-    map: room.map
-  });
-}
 
+  // When the 2nd player clicks ready (the trigger), THEY generate the match map on their machine.
+  room.pending = true;
+  room.map = null;
+  room.generator = triggerWs;
+
+  try {
+    if (triggerWs && triggerWs.readyState === WebSocket.OPEN) {
+      triggerWs.send(JSON.stringify({ type: "gen_map", room: roomId }));
+    }
+  } catch {}
+}
 wss.on("connection", (ws) => {
   let roomId = "public";
   let room = getRoom(roomId);
@@ -121,7 +91,19 @@ wss.on("connection", (ws) => {
     if (msg.type === "ready") {
       meta.ready = !!msg.ready;
       syncLobby();
-      maybeStart(room, roomId);
+      maybeStart(room, roomId, ws);
+      return;
+    }
+    if (msg.type === "map_data") {
+      // Only accept from the designated generator while pending
+      if (!room.pending || room.started) return;
+      if (room.generator && room.generator !== ws) return;
+      const md = msg.map;
+      if (!md || !Array.isArray(md.grid) || !md.grid.length || !md.w || !md.h) return;
+      room.map = { w: md.w|0, h: md.h|0, grid: md.grid, spawns: md.spawns||null, seed: md.seed>>>0 };
+      room.started = true;
+      room.pending = false;
+      broadcast(room, { type:"start", room: roomId, map: room.map });
       return;
     }
     if (msg.type === "chat") {
@@ -140,6 +122,9 @@ wss.on("connection", (ws) => {
     room.clients.delete(ws);
     room.started = false;
     room.seed = 0;
+    room.map = null;
+    room.pending = false;
+    room.generator = null;
     broadcast(room, { type: "lobby", room: roomId, users: lobbyState(room), started: room.started });
     if (room.clients.size === 0) rooms.delete(roomId);
   });
