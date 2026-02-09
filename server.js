@@ -24,7 +24,7 @@ function safeRoomId(s) {
 function getRoom(roomId) {
   roomId = safeRoomId(roomId);
   if (!rooms.has(roomId)) {
-    rooms.set(roomId, { clients: new Map(), started: false, seed: 0, map: null, pending: false, generator: null });
+    rooms.set(roomId, { clients: new Map(), started: false, seed: 0 });
   }
   return rooms.get(roomId);
 }
@@ -41,22 +41,20 @@ function lobbyState(room) {
   }
   return users;
 }
-function maybeStart(room, roomId, triggerWs) {
-  if (room.started || room.pending) return;
+function maybeStart(room, roomId) {
+  if (room.started) return;
   const metas = [...room.clients.values()];
   if (metas.length !== 2) return;
   if (!metas.every(m => m.ready)) return;
-
-  // When the 2nd player clicks ready (the trigger), THEY generate the match map on their machine.
-  room.pending = true;
-  room.map = null;
-  room.generator = triggerWs;
-
-  try {
-    if (triggerWs && triggerWs.readyState === WebSocket.OPEN) {
-      triggerWs.send(JSON.stringify({ type: "gen_map", room: roomId }));
-    }
-  } catch {}
+  room.started = true;
+  room.seed = (Date.now() ^ (Math.random() * 0xffffffff)) >>> 0;
+  broadcast(room, {
+    type: "start",
+    room: roomId,
+    seed: room.seed,
+    mapW: 64,
+    mapH: 64
+  });
 }
 wss.on("connection", (ws) => {
   let roomId = "public";
@@ -91,19 +89,7 @@ wss.on("connection", (ws) => {
     if (msg.type === "ready") {
       meta.ready = !!msg.ready;
       syncLobby();
-      maybeStart(room, roomId, ws);
-      return;
-    }
-    if (msg.type === "map_data") {
-      // Only accept from the designated generator while pending
-      if (!room.pending || room.started) return;
-      if (room.generator && room.generator !== ws) return;
-      const md = msg.map;
-      if (!md || !Array.isArray(md.grid) || !md.grid.length || !md.w || !md.h) return;
-      room.map = { w: md.w|0, h: md.h|0, grid: md.grid, spawns: md.spawns||null, seed: md.seed>>>0 };
-      room.started = true;
-      room.pending = false;
-      broadcast(room, { type:"start", room: roomId, map: room.map });
+      maybeStart(room, roomId);
       return;
     }
     if (msg.type === "chat") {
@@ -122,9 +108,6 @@ wss.on("connection", (ws) => {
     room.clients.delete(ws);
     room.started = false;
     room.seed = 0;
-    room.map = null;
-    room.pending = false;
-    room.generator = null;
     broadcast(room, { type: "lobby", room: roomId, users: lobbyState(room), started: room.started });
     if (room.clients.size === 0) rooms.delete(roomId);
   });
