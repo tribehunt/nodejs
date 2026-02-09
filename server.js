@@ -52,8 +52,8 @@ function maybeStart(room, roomId) {
     type: "start",
     room: roomId,
     seed: room.seed,
-    mapW: 64,
-    mapH: 64
+    mapW: 80,
+    mapH: 45
   });
 }
 wss.on("connection", (ws) => {
