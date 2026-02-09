@@ -95,14 +95,9 @@ wss.on("connection", (ws) => {
     if (msg.type === "chat") {
       const text = String(msg.text || "").slice(0, 200).trim();
       if (!text) return;
-
-      // Allow optional bot/system chat name overrides (used for in-game NPC chat like "Jimbo").
-      // Client may send: {type:"chat", text:"...", as:"Jimbo"} and it will be displayed as that name.
-      // If omitted, falls back to the player's meta name/id.
       const as = String(msg.as || "").slice(0, 24).trim();
       const from = as ? as : meta.id;
       const name = as ? as : (meta.name || meta.id);
-
       broadcast(room, { type: "chat", from, name, text, ts: Date.now() });
       return;
     }
