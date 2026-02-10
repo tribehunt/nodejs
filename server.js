@@ -183,6 +183,15 @@ function maybeAdvanceMission(room) {
     return;
   }
 }
+
+// Keep targets inside the map bounds and aligned to the same coordinate space as clients.
+function setMissionTarget(room, x, y) {
+  const w = room.mapW || 80;
+  const h = room.mapH || 45;
+  const nx = clamp(x, 1.5, w - 2.5);
+  const ny = clamp(y, 1.5, h - 2.5);
+  room.mission.target = { x: Math.round(nx * 1000) / 1000, y: Math.round(ny * 1000) / 1000 };
+}
 function broadcast(room, msgObj) {
   const data = JSON.stringify(msgObj);
   for (const ws of room.clients.keys()) {
@@ -256,6 +265,22 @@ wss.on("connection", (ws) => {
     if (msg.type === "mission_request") {
       if (!room.started) return;
       ensureMission(room);
+      return;
+    }
+
+    // Client adjustment: mission targets can land inside a wall tile. Clients know the map,
+    // so they report the nearest empty tile for the current rally target.
+    if (msg.type === "m_target") {
+      if (!room.started) return;
+      if (!room.mission || room.mission.phase !== "rally") return;
+      const x = Number(msg.x), y = Number(msg.y);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+      // Only accept small adjustments (avoid abuse / teleporting target across the map)
+      const t = room.mission.target || { x: 0, y: 0 };
+      const dx = x - t.x, dy = y - t.y;
+      if ((dx * dx + dy * dy) > (6.5 * 6.5)) return;
+      setMissionTarget(room, x, y);
+      pushMission(room);
       return;
     }
     if (msg.type === "chat") {
