@@ -1,15 +1,11 @@
 const http = require("http");
 const WebSocket = require("ws");
-
 const PORT = process.env.PORT || 8080;
-
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "content-type": "text/plain" });
   res.end("OK\n");
 });
-
 const wss = new WebSocket.Server({ server });
-
 /**
  * Rooms:
  * roomId -> {
@@ -29,14 +25,12 @@ const wss = new WebSocket.Server({ server });
  * }
  */
 const rooms = new Map();
-
 function safeRoomId(s) {
   if (!s) return "public";
   s = String(s).trim().toLowerCase();
   s = s.replace(/[^a-z0-9_-]/g, "");
   return s.slice(0, 32) || "public";
 }
-
 function getRoom(roomId) {
   roomId = safeRoomId(roomId);
   if (!rooms.has(roomId)) {
@@ -52,14 +46,12 @@ function getRoom(roomId) {
   }
   return rooms.get(roomId);
 }
-
 function broadcast(room, msgObj) {
   const data = JSON.stringify(msgObj);
   for (const ws of room.clients.keys()) {
     if (ws.readyState === WebSocket.OPEN) ws.send(data);
   }
 }
-
 function lobbyState(room) {
   const users = [];
   for (const meta of room.clients.values()) {
@@ -67,19 +59,16 @@ function lobbyState(room) {
   }
   return users;
 }
-
 function clamp(n, a, b) {
   n = Number(n);
   if (!Number.isFinite(n)) return a;
   return Math.max(a, Math.min(b, n));
 }
-
 function rndInt(min, max) {
   min = Math.floor(min);
   max = Math.floor(max);
   return min + Math.floor(Math.random() * (max - min + 1));
 }
-
 function mulberry32(seed) {
   let t = (seed >>> 0);
   return function () {
@@ -89,13 +78,10 @@ function mulberry32(seed) {
     return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
   };
 }
-
-// Deterministic dune map: "1" = wall, "0" = empty
 function genDuneMap(w, h, seed) {
   w = Math.max(24, Math.floor(w));
   h = Math.max(18, Math.floor(h));
   const rnd = mulberry32((seed >>> 0) || 1);
-
   const g = new Array(h);
   for (let y = 0; y < h; y++) {
     let row = "";
@@ -105,10 +91,8 @@ function genDuneMap(w, h, seed) {
     }
     g[y] = row;
   }
-
   const duneCount = Math.max(6, Math.floor((w * h) / 700));
   const bumps = Math.max(8, Math.floor((w * h) / 500));
-
   function stampEllipse(cx, cy, rx, ry) {
     const x0 = Math.max(1, Math.floor(cx - rx));
     const x1 = Math.min(w - 2, Math.ceil(cx + rx));
@@ -123,7 +107,6 @@ function genDuneMap(w, h, seed) {
       g[yy] = row.join("");
     }
   }
-
   for (let i = 0; i < duneCount; i++) {
     const cx = 2 + Math.floor(rnd() * (w - 4));
     const cy = 2 + Math.floor(rnd() * (h - 4));
@@ -138,7 +121,6 @@ function genDuneMap(w, h, seed) {
     const ry = 1 + Math.floor(rnd() * 3);
     stampEllipse(cx + 0.5, cy + 0.5, rx, ry);
   }
-
   function carve(cx, cy, r) {
     for (let yy = Math.max(1, cy - r); yy <= Math.min(h - 2, cy + r); yy++) {
       let row = g[yy].split("");
@@ -150,21 +132,17 @@ function genDuneMap(w, h, seed) {
   }
   carve(4, 4, 4);
   carve(w - 5, h - 5, 4);
-
   return g;
 }
-
 function isWall(room, x, y) {
   const xi = Math.floor(x), yi = Math.floor(y);
   if (xi < 0 || yi < 0 || xi >= room.mapW || yi >= room.mapH) return true;
   const row = room.mapGrid && room.mapGrid[yi];
   return row ? row[xi] === "1" : true;
 }
-
 function findNearestEmpty(room, x, y) {
   if (!isWall(room, x, y)) return { x, y };
   const bx = Math.floor(x) + 0.5, by = Math.floor(y) + 0.5;
-
   for (let r = 1; r < Math.max(room.mapW, room.mapH); r++) {
     for (let dy = -r; dy <= r; dy++) {
       for (let dx = -r; dx <= r; dx++) {
@@ -175,8 +153,6 @@ function findNearestEmpty(room, x, y) {
       }
     }
   }
-
-  // Fallback scan
   for (let yy = 1; yy < room.mapH - 1; yy++) {
     for (let xx = 1; xx < room.mapW - 1; xx++) {
       if (!isWall(room, xx + 0.5, yy + 0.5)) return { x: xx + 0.5, y: yy + 0.5 };
@@ -184,11 +160,9 @@ function findNearestEmpty(room, x, y) {
   }
   return { x: 2.5, y: 2.5 };
 }
-
 function jimboSay(room, text) {
   broadcast(room, { type: "chat", from: "JIMBO", name: "Jimbo", text: "@@JIMBO@@" + String(text || ""), ts: Date.now() });
 }
-
 function pushMission(room) {
   broadcast(room, {
     type: "mission",
@@ -198,7 +172,6 @@ function pushMission(room) {
     entities: room.mission.entities
   });
 }
-
 function pickRallyTarget(room) {
   const w = room.mapW, h = room.mapH;
   const raw = {
@@ -207,14 +180,11 @@ function pickRallyTarget(room) {
   };
   return findNearestEmpty(room, raw.x, raw.y);
 }
-
 function spawnLocalEntities(room, type, center, count) {
   const w = room.mapW, h = room.mapH;
   const out = [];
   const radius = 6.5;
-
   for (let i = 0; i < count; i++) {
-    // try a few random samples, then snap
     let x = center.x, y = center.y;
     for (let t = 0; t < 12; t++) {
       const a = Math.random() * Math.PI * 2;
@@ -224,7 +194,6 @@ function spawnLocalEntities(room, type, center, count) {
       if (!isWall(room, x, y)) break;
     }
     const snapped = findNearestEmpty(room, x, y);
-
     const ent = {
       id: room.mission.nextId++,
       type,
@@ -236,20 +205,16 @@ function spawnLocalEntities(room, type, center, count) {
   }
   return out;
 }
-
 function startMission(room) {
   room.mission.step = 0;
   room.mission.phase = "rally";
   room.mission.entities = [];
   room.mission.nextId = 1;
-
   const tgt = pickRallyTarget(room);
   room.mission.target = { x: Math.round(tgt.x * 1000) / 1000, y: Math.round(tgt.y * 1000) / 1000 };
-
   jimboSay(room, `AZHA / MIL-AI ONLINE. Tankers, rally at the marked nav blip. (X:${room.mission.target.x.toFixed(1)} Y:${room.mission.target.y.toFixed(1)})`);
   pushMission(room);
 }
-
 function ensureMission(room) {
   if (!room.started) return;
   if (!room.mission || !room.mission.target || !Number.isFinite(room.mission.target.x) || !Number.isFinite(room.mission.target.y)) {
@@ -262,28 +227,23 @@ function ensureMission(room) {
     startMission(room);
     return;
   }
-  // Snap current target if needed
   const sn = findNearestEmpty(room, room.mission.target.x, room.mission.target.y);
   room.mission.target = { x: Math.round(sn.x * 1000) / 1000, y: Math.round(sn.y * 1000) / 1000 };
   pushMission(room);
 }
-
 function within(a, b, r) {
   const dx = a.x - b.x;
   const dy = a.y - b.y;
   return (dx * dx + dy * dy) <= (r * r);
 }
-
 function maybeAdvanceMission(room) {
   if (!room.started) return;
   const metas = [...room.clients.values()];
   if (metas.length !== 2) return;
   if (!metas.every(m => m && m.state && Number.isFinite(m.state.x) && Number.isFinite(m.state.y))) return;
-
   const p0 = { x: metas[0].state.x, y: metas[0].state.y };
   const p1 = { x: metas[1].state.x, y: metas[1].state.y };
   const tgt = room.mission.target;
-
   if (room.mission.phase === "rally") {
     if (within(p0, tgt, 1.25) && within(p1, tgt, 1.25)) {
       room.mission.step++;
@@ -291,7 +251,6 @@ function maybeAdvanceMission(room) {
       room.mission.phase = pick;
       room.mission.entities = [];
       room.mission.nextId = Math.max(room.mission.nextId || 1, 1);
-
       if (pick === "destroy") {
         const count = rndInt(2, 7); // 1d6+1
         room.mission.entities = spawnLocalEntities(room, "enemy", tgt, count);
@@ -305,11 +264,9 @@ function maybeAdvanceMission(room) {
     }
     return;
   }
-
   if (room.mission.phase === "destroy" || room.mission.phase === "retrieve") {
     if (room.mission.entities.length === 0) {
       jimboSay(room, room.mission.phase === "destroy" ? `AREA SECURED. Stand by for next nav task.` : `DATA RECOVERED. Stand by for next nav task.`);
-      // New rally
       room.mission.step++;
       room.mission.phase = "rally";
       room.mission.entities = [];
@@ -321,47 +278,37 @@ function maybeAdvanceMission(room) {
     }
   }
 }
-
 function maybeStart(room, roomId) {
   if (room.started) return;
   const metas = [...room.clients.values()];
   if (metas.length !== 2) return;
   if (!metas.every(m => m.ready)) return;
-
   room.started = true;
   room.seed = (Date.now() ^ (Math.random() * 0xffffffff)) >>> 0;
   room.mapW = 80;
   room.mapH = 45;
   room.mapGrid = genDuneMap(room.mapW, room.mapH, room.seed);
-
   broadcast(room, { type: "start", room: roomId, seed: room.seed, mapW: room.mapW, mapH: room.mapH });
   startMission(room);
 }
-
 wss.on("connection", (ws) => {
   let roomId = "public";
   let room = getRoom(roomId);
-
   let meta = {
     id: "U" + Math.floor(Math.random() * 1e9).toString(36),
     name: "",
     ready: false,
     state: null
   };
-
   room.clients.set(ws, meta);
-
   function syncLobby() {
     broadcast(room, { type: "lobby", room: roomId, users: lobbyState(room), started: room.started });
   }
-
   syncLobby();
-
   ws.on("message", (buf) => {
     let msg;
     try { msg = JSON.parse(buf.toString("utf8")); } catch { return; }
     if (!msg || !msg.type) return;
-
     if (msg.type === "join") {
       const nextRoomId = safeRoomId(msg.room || "public");
       const nextRoom = getRoom(nextRoomId);
@@ -371,32 +318,26 @@ wss.on("connection", (ws) => {
       }
       room.clients.delete(ws);
       syncLobby();
-
       roomId = nextRoomId;
       room = nextRoom;
-
       meta.id = String(msg.id || meta.id).slice(0, 32);
       meta.name = String(msg.name || "").slice(0, 24);
       meta.ready = false;
       meta.state = null;
-
       room.clients.set(ws, meta);
       syncLobby();
       return;
     }
-
     if (msg.type === "ready") {
       meta.ready = !!msg.ready;
       syncLobby();
       maybeStart(room, roomId);
       return;
     }
-
     if (msg.type === "mission_request") {
       ensureMission(room);
       return;
     }
-
     if (msg.type === "chat") {
       const text = String(msg.text || "").slice(0, 200).trim();
       if (!text) return;
@@ -406,9 +347,7 @@ wss.on("connection", (ws) => {
       broadcast(room, { type: "chat", from, name, text, ts: Date.now() });
       return;
     }
-
     if (!room.started) return;
-
     if (msg.type === "state") {
       if (msg.s && Number.isFinite(msg.s.x) && Number.isFinite(msg.s.y)) {
         meta.state = { x: Number(msg.s.x), y: Number(msg.s.y), ang: Number(msg.s.ang) };
@@ -418,14 +357,11 @@ wss.on("connection", (ws) => {
       broadcast(room, msg);
       return;
     }
-
     if (msg.type === "shoot" || msg.type === "event") {
       msg.from = meta.id;
       broadcast(room, msg);
       return;
     }
-
-    // Mission combat/collection events
     if (msg.type === "m_hit") {
       const eid = msg.eid | 0;
       if (!eid) return;
@@ -442,7 +378,6 @@ wss.on("connection", (ws) => {
       maybeAdvanceMission(room);
       return;
     }
-
     if (msg.type === "m_collect") {
       const eid = msg.eid | 0;
       if (!eid) return;
@@ -454,7 +389,6 @@ wss.on("connection", (ws) => {
       return;
     }
   });
-
   ws.on("close", () => {
     room.clients.delete(ws);
     room.started = false;
@@ -465,7 +399,6 @@ wss.on("connection", (ws) => {
     if (room.clients.size === 0) rooms.delete(roomId);
   });
 });
-
 server.listen(PORT, "0.0.0.0", () => {
   console.log("WebSocket relay on port", PORT);
 });
