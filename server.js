@@ -292,7 +292,7 @@ function maybeStart(room, roomId) {
   startMission(room);
 }
 wss.on("connection", (ws) => {
-  let roomId = "public";
+  let roomId = "global";
   let room = getRoom(roomId);
   let meta = {
     id: "U" + Math.floor(Math.random() * 1e9).toString(36),
@@ -310,7 +310,7 @@ wss.on("connection", (ws) => {
     try { msg = JSON.parse(buf.toString("utf8")); } catch { return; }
     if (!msg || !msg.type) return;
     if (msg.type === "join") {
-      const nextRoomId = safeRoomId(msg.room || "public");
+      const nextRoomId = safeRoomId(msg.room || "global");
       const nextRoom = getRoom(nextRoomId);
       if (nextRoom.clients.size >= 2 && !nextRoom.clients.has(ws)) {
         ws.send(JSON.stringify({ type: "error", message: "Room is full (2 players max)." }));
