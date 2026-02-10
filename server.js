@@ -52,11 +52,6 @@ function broadcast(room, msgObj) {
     if (ws.readyState === WebSocket.OPEN) ws.send(data);
   }
 }
-function sendOne(ws, msgObj){
-  try{
-    if(ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msgObj));
-  }catch(e){}
-}
 function lobbyState(room) {
   const users = [];
   for (const meta of room.clients.values()) {
@@ -243,58 +238,49 @@ function within(a, b, r) {
 }
 function maybeAdvanceMission(room) {
   if (!room.started) return;
-  const metas = [...room.clients.values()].filter(m => m && m.state && m.alive !== false);
-  if (metas.length < 1) return;
-  ensureMission(room);
-  const tgt = room.mission && room.mission.target ? room.mission.target : {x:2.5,y:2.5};
+  const metas = [...room.clients.values()];
+  if (metas.length !== 2) return;
+  if (!metas.every(m => m && m.state && Number.isFinite(m.state.x) && Number.isFinite(m.state.y))) return;
+  const p0 = { x: metas[0].state.x, y: metas[0].state.y };
+  const p1 = { x: metas[1].state.x, y: metas[1].state.y };
+  const tgt = room.mission.target;
   if (room.mission.phase === "rally") {
-    const allNear = metas.every(m => within(m.state, tgt, 3.0));
-    if (allNear) {
-      room.mission.phase = "destroy";
-      room.mission.step = (room.mission.step|0)+1;
-      const pick = (Math.random() < 0.60) ? "destroy" : "retrieve";
+    if (within(p0, tgt, 1.25) && within(p1, tgt, 1.25)) {
+      room.mission.step++;
+      const pick = Math.random() < 0.5 ? "destroy" : "retrieve";
+      room.mission.phase = pick;
+      room.mission.entities = [];
       room.mission.nextId = Math.max(room.mission.nextId || 1, 1);
       if (pick === "destroy") {
-        const count = rndInt(2, 7);
+        const count = rndInt(2, 7); // 1d6+1
         room.mission.entities = spawnLocalEntities(room, "enemy", tgt, count);
         jimboSay(room, `CONTACT. Hostile old-tech drones detected. Destroy all targets in the local grid. (${count} total)`);
       } else {
-        const count = rndInt(1, 6);
+        const count = rndInt(1, 6); // 1d6
         room.mission.entities = spawnLocalEntities(room, "datnode", tgt, count);
-        jimboSay(room, `SIGNAL. Locate and retrieve the scattered datnodes. (${count} total)`);
+        jimboSay(room, `DATA SIGNATURES FOUND. Retrieve all datnodes in the local grid. (${count} total)`);
       }
       pushMission(room);
     }
     return;
   }
-  if (room.mission.phase === "destroy") {
-    const enemiesLeft = (room.mission.entities||[]).some(e => e && e.type === "enemy");
-    if (!enemiesLeft) {
-      room.mission.phase = "retrieve";
-      room.mission.step = (room.mission.step|0)+1;
-      room.mission.entities = spawnLocalEntities(room, "datnode", tgt, rndInt(1, 6));
-      jimboSay(room, "CLEAR. Recover any remaining datnodes and rally.");
-      pushMission(room);
-    }
-    return;
-  }
-  if (room.mission.phase === "retrieve") {
-    const datLeft = (room.mission.entities||[]).some(e => e && e.type === "datnode");
-    if (!datLeft) {
+  if (room.mission.phase === "destroy" || room.mission.phase === "retrieve") {
+    if (room.mission.entities.length === 0) {
+      jimboSay(room, room.mission.phase === "destroy" ? `AREA SECURED. Stand by for next nav task.` : `DATA RECOVERED. Stand by for next nav task.`);
+      room.mission.step++;
       room.mission.phase = "rally";
-      room.mission.step = (room.mission.step|0)+1;
       room.mission.entities = [];
-      room.mission.target = pickRallyTarget(room);
-      jimboSay(room, "MOVE. Rally on the next coordinate.");
+      room.mission.nextId = 1;
+      const nt = pickRallyTarget(room);
+      room.mission.target = { x: Math.round(nt.x * 1000) / 1000, y: Math.round(nt.y * 1000) / 1000 };
+      jimboSay(room, `New nav blip uploaded. Rally at (X:${room.mission.target.x.toFixed(1)} Y:${room.mission.target.y.toFixed(1)}).`);
       pushMission(room);
     }
-    return;
   }
 }
 function maybeStart(room, roomId) {
   if (room.started) return;
   const metas = [...room.clients.values()];
-  if (metas.length < 1) return;
   if (metas.length !== 2) return;
   if (!metas.every(m => m.ready)) return;
   room.started = true;
@@ -302,7 +288,6 @@ function maybeStart(room, roomId) {
   room.mapW = 80;
   room.mapH = 45;
   room.mapGrid = genDuneMap(room.mapW, room.mapH, room.seed);
-  for (const m of metas) { m.alive = true; }
   broadcast(room, { type: "start", room: roomId, seed: room.seed, mapW: room.mapW, mapH: room.mapH });
   startMission(room);
 }
@@ -313,8 +298,7 @@ wss.on("connection", (ws) => {
     id: "U" + Math.floor(Math.random() * 1e9).toString(36),
     name: "",
     ready: false,
-    state: null,
-    alive: true
+    state: null
   };
   room.clients.set(ws, meta);
   function syncLobby() {
@@ -340,18 +324,12 @@ wss.on("connection", (ws) => {
       meta.name = String(msg.name || "").slice(0, 24);
       meta.ready = false;
       meta.state = null;
-      meta.alive = true;
       room.clients.set(ws, meta);
       syncLobby();
       return;
     }
     if (msg.type === "ready") {
       meta.ready = !!msg.ready;
-      if (room.started && meta.ready) {
-        meta.alive = true;
-        sendOne(ws, { type: "start", room: roomId, seed: room.seed, mapW: room.mapW, mapH: room.mapH });
-        ensureMission(room);
-      }
       syncLobby();
       maybeStart(room, roomId);
       return;
@@ -367,14 +345,6 @@ wss.on("connection", (ws) => {
       const from = as ? as : meta.id;
       const name = as ? as : (meta.name || meta.id);
       broadcast(room, { type: "chat", from, name, text, ts: Date.now() });
-      return;
-    }
-    if (msg.type === "dead") {
-      meta.alive = false;
-      meta.ready = false;
-      meta.state = null;
-      syncLobby();
-      sendOne(ws, { type: "dead_ack" });
       return;
     }
     if (!room.started) return;
@@ -429,85 +399,6 @@ wss.on("connection", (ws) => {
     if (room.clients.size === 0) rooms.delete(roomId);
   });
 });
-const AI_TICK_MS = 110;
-const ENEMY_SPEED = 0.62;
-const RAM_RANGE = 0.90;
-const ZAP_RANGE = 6.60;
-const ZAP_MIN = 2.30;
-const RAM_DMG = 4;
-const ZAP_DMG = 2;
-function stepEnemy(room, ent, dt){
-  if(!ent || ent.type!=="enemy") return;
-  const metas = [...room.clients.values()].filter(m=>m && m.state && m.alive !== false);
-  if(metas.length<1) return;
-  let best=null, bd=1e9;
-  for(const m of metas){
-    const dx=m.state.x-ent.x, dy=m.state.y-ent.y;
-    const d=Math.hypot(dx,dy);
-    if(d<bd){bd=d; best=m;}
-  }
-  if(!best) return;
-  const px=best.state.x, py=best.state.y, pid=best.id;
-  const dx=px-ent.x, dy=py-ent.y;
-  const dist=Math.hypot(dx,dy) || 0.00001;
-  const now=Date.now();
-  if(ent._cdRam==null) ent._cdRam=0;
-  if(ent._cdZap==null) ent._cdZap=0;
-  if(dist <= RAM_RANGE && now >= ent._cdRam){
-    ent._cdRam = now + 650 + rndInt(0,250);
-    broadcast(room, { type:"m_fx", kind:"ram", eid: ent.id, x: ent.x, y: ent.y, tx: px, ty: py, target: pid, dmg: RAM_DMG, ts: now });
-  }else if(dist <= ZAP_RANGE && now >= ent._cdZap){
-    const wantRam = (dist < 1.35) || (dist < 3.80 && Math.random() < 0.22);
-    if(!wantRam){
-      ent._cdZap = now + 820 + rndInt(0,350);
-      broadcast(room, { type:"m_fx", kind:"zap", eid: ent.id, x: ent.x, y: ent.y, tx: px, ty: py, target: pid, dmg: ZAP_DMG, ts: now });
-    }
-  }
-  let vx=0, vy=0;
-  if(dist > 0.0001){
-    let txDir = dx/dist, tyDir = dy/dist;
-    if(dist < ZAP_MIN && (ent._cdZap && (ent._cdZap - now) > 250)){
-      txDir = -txDir; tyDir = -tyDir;
-    }else if(dist < ZAP_MIN && (now < (ent._cdZap||0))){
-      txDir = -txDir; tyDir = -tyDir;
-    }else if(dist < ZAP_MIN && Math.random() < 0.65){
-      txDir = -txDir; tyDir = -tyDir;
-    }
-    if(dist < 1.10){ txDir = -txDir; tyDir = -tyDir; }
-    vx = txDir * ENEMY_SPEED;
-    vy = tyDir * ENEMY_SPEED;
-  }
-  const step = Math.min(0.25, dt) * 1.0;
-  const nx = ent.x + vx * step;
-  const ny = ent.y + vy * step;
-  let moved=false;
-  if(!isWall(room, nx, ent.y)){ ent.x = Math.round(nx*1000)/1000; moved=true; }
-  if(!isWall(room, ent.x, ny)){ ent.y = Math.round(ny*1000)/1000; moved=true; }
-  if(!moved){
-    const jx = ent.x + (Math.random()*2-1)*0.25;
-    const jy = ent.y + (Math.random()*2-1)*0.25;
-    if(!isWall(room, jx, ent.y)) ent.x = Math.round(jx*1000)/1000;
-    if(!isWall(room, ent.x, jy)) ent.y = Math.round(jy*1000)/1000;
-  }
-  if(ent._tpos==null) ent._tpos=0;
-  ent._tpos += dt*1000;
-  if(ent._tpos > 160){
-    ent._tpos = 0;
-    broadcast(room, { type:"m_update", op:"pos", eid: ent.id, x: ent.x, y: ent.y });
-  }
-}
-function tickEnemyAI(){
-  const dt = AI_TICK_MS/1000;
-  for(const room of rooms.values()){
-    if(!room || !room.started) continue;
-    const ents = room.mission && Array.isArray(room.mission.entities) ? room.mission.entities : null;
-    if(!ents || ents.length<1) continue;
-    for(const ent of ents){
-      if(ent && ent.type==="enemy") stepEnemy(room, ent, dt);
-    }
-  }
-}
-setInterval(tickEnemyAI, AI_TICK_MS);
 server.listen(PORT, "0.0.0.0", () => {
   console.log("WebSocket relay on port", PORT);
 });
