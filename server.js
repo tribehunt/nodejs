@@ -102,19 +102,8 @@ wss.on("connection", (ws) => {
       return;
     }
     if (!room.started) return;
-    // allow gameplay message fanout (authoritative logic lives on clients)
-    if (msg && msg.type) {
+    if (msg.type === "state" || msg.type === "shoot" || msg.type === "event") {
       msg.from = meta.id;
-      msg.name = meta.name || meta.id;
-      // hard reset on death -> return BOTH to lobby, clear ready flags
-      if (msg.type === "event" && msg.kind === "death") {
-        room.started = false;
-        room.seed = 0;
-        for (const m of room.clients.values()) m.ready = false;
-        broadcast(room, msg);
-        broadcast(room, { type: "lobby", room: roomId, users: lobbyState(room), started: room.started });
-        return;
-      }
       broadcast(room, msg);
     }
   });
