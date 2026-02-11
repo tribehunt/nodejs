@@ -291,133 +291,6 @@ function maybeStart(room, roomId) {
   broadcast(room, { type: "start", room: roomId, seed: room.seed, mapW: room.mapW, mapH: room.mapH });
   startMission(room);
 }
-
-function hasLOS(room, ax, ay, bx, by) {
-  let dx = bx - ax, dy = by - ay;
-  const dist = Math.hypot(dx, dy);
-  if (dist < 1e-6) return true;
-  dx /= dist; dy /= dist;
-  const step = 0.12;
-  let x = ax, y = ay;
-  for (let t = 0; t < dist; t += step) {
-    x += dx * step;
-    y += dy * step;
-    if (isWall(room, x, y)) return false;
-  }
-  return true;
-}
-function _nowMs(){ return Date.now(); }
-function _enemyInit(ent){
-  if (!ent) return;
-  if (ent.ai) return;
-  ent.ai = {
-    mode: (Math.random() < 0.55) ? "aggr" : "skirm",
-    nextAttack: 0,
-    strafe: (Math.random() < 0.5) ? -1 : 1,
-    nextRepath: 0,
-    vx: 0, vy: 0
-  };
-  ent.maxhp = (ent.hp|0) || 2;
-}
-function _tryMove(room, ent, nx, ny){
-  if (!isWall(room, nx, ny)) { ent.x = nx; ent.y = ny; return true; }
-  if (!isWall(room, nx, ent.y)) { ent.x = nx; return true; }
-  if (!isWall(room, ent.x, ny)) { ent.y = ny; return true; }
-  return false;
-}
-function tickEnemies(room){
-  if (!room || !room.started) return;
-  if (!room.mission || room.mission.phase !== "destroy") return;
-  if (!Array.isArray(room.mission.entities) || room.mission.entities.length === 0) return;
-
-  const metas = [...room.clients.values()].filter(m => m && m.state && Number.isFinite(m.state.x) && Number.isFinite(m.state.y));
-  if (metas.length === 0) return;
-  const ps = metas.map(m => ({ id: m.id, x: m.state.x, y: m.state.y }));
-
-  const w = room.mapW, h = room.mapH;
-  const t = _nowMs();
-  let moved = false;
-
-  for (const ent of room.mission.entities) {
-    if (!ent || ent.type !== "enemy") continue;
-    _enemyInit(ent);
-
-    let target = ps[0];
-    let bestD2 = 1e18;
-    for (const p of ps) {
-      const dx = p.x - ent.x, dy = p.y - ent.y;
-      const d2 = dx*dx + dy*dy;
-      if (d2 < bestD2) { bestD2 = d2; target = p; }
-    }
-    const dx = target.x - ent.x, dy = target.y - ent.y;
-    const dist = Math.hypot(dx, dy) + 1e-6;
-
-    const hp = (ent.hp|0) || 1;
-    const maxhp = (ent.maxhp|0) || Math.max(2, hp);
-    const low = hp <= Math.max(1, Math.floor(maxhp*0.34));
-
-    const canSee = dist <= 9.5 && hasLOS(room, ent.x, ent.y, target.x, target.y);
-    const meleeRange = 0.90;
-    const rangedMin = 2.0;
-    const rangedMax = 7.0;
-
-    let wantFlee = false;
-    if (low && dist < 4.5) wantFlee = true;
-    if (ent.ai.mode === "skirm" && dist < 2.25 && Math.random() < 0.25) wantFlee = true;
-
-    // attack
-    if (t >= ent.ai.nextAttack) {
-      if (dist <= meleeRange) {
-        ent.ai.nextAttack = t + 750 + ((Math.random()*250)|0);
-        broadcast(room, { type:"hurt", to: target.id, kind:"melee", eid: ent.id, amt: 1, ts: t });
-      } else if (canSee && dist >= rangedMin && dist <= rangedMax) {
-        ent.ai.nextAttack = t + 1100 + ((Math.random()*450)|0);
-        broadcast(room, { type:"hurt", to: target.id, kind:"zap", eid: ent.id, amt: 1, ts: t, x: ent.x, y: ent.y });
-      }
-    }
-
-    // movement
-    const baseSpd = 0.060; // per tick (~20hz)
-    let spd = baseSpd;
-    if (dist > 8) spd *= 1.15;
-    if (low) spd *= 1.05;
-
-    let ux = dx / dist, uy = dy / dist;
-    if (wantFlee) { ux = -ux; uy = -uy; }
-
-    // skirmish strafe a bit
-    let sx = 0, sy = 0;
-    if (!wantFlee && ent.ai.mode === "skirm" && canSee && dist < 6.0) {
-      sx = -uy * ent.ai.strafe;
-      sy = ux * ent.ai.strafe;
-    }
-    let mx = ux + sx*0.55;
-    let my = uy + sy*0.55;
-    const ml = Math.hypot(mx, my) + 1e-6;
-    mx /= ml; my /= ml;
-
-    const nx = clamp(ent.x + mx*spd, 1.5, w-2.5);
-    const ny = clamp(ent.y + my*spd, 1.5, h-2.5);
-
-    const ox = ent.x, oy = ent.y;
-    if (_tryMove(room, ent, nx, ny)) {
-      if (Math.abs(ent.x-ox) > 1e-4 || Math.abs(ent.y-oy) > 1e-4) moved = true;
-    } else if (Math.random() < 0.15) {
-      ent.ai.strafe *= -1;
-    }
-  }
-
-  if (moved) {
-    broadcast(room, { type:"m_update", op:"pos", ents: room.mission.entities.filter(e => e && e.type==="enemy").map(e => ({id:e.id,x:e.x,y:e.y})) });
-  }
-}
-// 20Hz AI tick
-setInterval(() => {
-  for (const room of rooms.values()) {
-    try { tickEnemies(room); } catch(e) {}
-  }
-}, 50);
-
 wss.on("connection", (ws) => {
   let roomId = "global";
   let room = getRoom(roomId);
@@ -478,15 +351,10 @@ wss.on("connection", (ws) => {
     if (msg.type === "state") {
       if (msg.s && Number.isFinite(msg.s.x) && Number.isFinite(msg.s.y)) {
         meta.state = { x: Number(msg.s.x), y: Number(msg.s.y), ang: Number(msg.s.ang) };
+        if (msg.name != null) meta.name = String(msg.name || meta.name || "").slice(0, 24);
+        meta._dirty = true;
         maybeAdvanceMission(room);
       }
-      msg.from = meta.id;
-      broadcast(room, msg);
-      return;
-    }
-    if (msg.type === "shoot" || msg.type === "event") {
-      msg.from = meta.id;
-      broadcast(room, msg);
       return;
     }
     if (msg.type === "m_hit") {
@@ -526,6 +394,84 @@ wss.on("connection", (ws) => {
     if (room.clients.size === 0) rooms.delete(roomId);
   });
 });
+// ===== fixed-rate net sync & enemy AI tick (prevents client freeze from message flood) =====
+const TICK_MS = 50;       // 20 Hz player state relay
+const ENEMY_MS = 100;     // 10 Hz enemy sim
+let _accEnemy = 0;
+setInterval(() => {
+  for (const room of rooms.values()) {
+    if (!room || !room.started) continue;
+    const metas = [...room.clients.entries()];
+    if (metas.length === 0) continue;
+
+    // relay player states at fixed rate (only when dirty)
+    for (const [wsA, metaA] of metas) {
+      if (!metaA || !metaA.state || !metaA._dirty) continue;
+      metaA._dirty = false;
+      const msg = { type: "state", from: metaA.id, name: metaA.name || metaA.id, s: metaA.state };
+      for (const [wsB] of metas) {
+        try { if (wsB && wsB.readyState === 1) wsB.send(JSON.stringify(msg)); } catch {}
+      }
+    }
+
+    // enemy sim (very small, wall-aware)
+    _accEnemy += TICK_MS;
+    if (_accEnemy >= ENEMY_MS) {
+      _accEnemy = 0;
+      if (room.mission && room.mission.phase === "destroy" && Array.isArray(room.mission.entities) && room.mission.entities.length) {
+        const players = metas.map(([,m]) => (m && m.state) ? { x: m.state.x, y: m.state.y } : null).filter(Boolean);
+        if (players.length) {
+          let moved = null;
+          for (const e of room.mission.entities) {
+            if (!e || e.type !== "enemy") continue;
+            const ex = e.x, ey = e.y;
+
+            // pick nearest player
+            let best = players[0], bestD2 = 1e9;
+            for (const p of players) {
+              const dx = p.x - ex, dy = p.y - ey;
+              const d2 = dx*dx + dy*dy;
+              if (d2 < bestD2) { bestD2 = d2; best = p; }
+            }
+
+            const hp = (e.hp|0) || 2;
+            const flee = hp <= 1 && bestD2 < 9.0; // low hp + close -> flee
+            const speed = flee ? 0.020 : 0.028;
+
+            let vx = best.x - ex, vy = best.y - ey;
+            const mag = Math.hypot(vx, vy) || 1;
+            vx /= mag; vy /= mag;
+            if (flee) { vx = -vx; vy = -vy; }
+
+            let nx = ex + vx*speed;
+            let ny = ey + vy*speed;
+
+            // simple wall collision: slide on axes
+            if (isWall(room, nx, ny)) {
+              if (!isWall(room, nx, ey)) { ny = ey; }
+              else if (!isWall(room, ex, ny)) { nx = ex; }
+              else { nx = ex; ny = ey; }
+            }
+
+            // clamp
+            nx = clamp(nx, 1.25, (room.mapW||80) - 2.25);
+            ny = clamp(ny, 1.25, (room.mapH||45) - 2.25);
+
+            const dxm = nx - ex, dym = ny - ey;
+            if ((dxm*dxm + dym*dym) > 1e-6) {
+              e.x = Math.round(nx * 1000) / 1000;
+              e.y = Math.round(ny * 1000) / 1000;
+              (moved || (moved = [])).push({ id: e.id|0, x: e.x, y: e.y, hp: e.hp|0 });
+            }
+          }
+          if (moved && moved.length) {
+            broadcast(room, { type: "m_update", op: "pos", list: moved });
+          }
+        }
+      }
+    }
+  }
+}, TICK_MS);
 server.listen(PORT, "0.0.0.0", () => {
   console.log("WebSocket relay on port", PORT);
 });
