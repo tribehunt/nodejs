@@ -200,7 +200,14 @@ function spawnLocalEntities(room, type, center, count) {
       x: Math.round(snapped.x * 1000) / 1000,
       y: Math.round(snapped.y * 1000) / 1000
     };
-    if (type === "enemy") ent.hp = 2;
+    if (type === "enemy") {
+    const r = Math.random();
+    const kind = (r < 0.12) ? "gorgek" : "unclean";
+    ent.kind = kind;
+    ent.seed = (Math.random()*0xFFFFFFFF)>>>0;
+    if (kind === "gorgek") { ent.hp = 9; ent.maxhp = 9; ent.nextSummonAt = Date.now() + 2800 + Math.random()*1800; }
+    else { ent.hp = 4; ent.maxhp = 4; }
+  }
     out.push(ent);
   }
   return out;
@@ -394,7 +401,6 @@ wss.on("connection", (ws) => {
     if (room.clients.size === 0) rooms.delete(roomId);
   });
 });
-// ===== fixed-rate net sync & enemy AI tick (prevents client freeze from message flood) =====
 const TICK_MS = 50;       // 20 Hz player state relay
 const ENEMY_MS = 100;     // 10 Hz enemy sim
 let _accEnemy = 0;
@@ -403,8 +409,6 @@ setInterval(() => {
     if (!room || !room.started) continue;
     const metas = [...room.clients.entries()];
     if (metas.length === 0) continue;
-
-    // relay player states at fixed rate (only when dirty)
     for (const [wsA, metaA] of metas) {
       if (!metaA || !metaA.state || !metaA._dirty) continue;
       metaA._dirty = false;
@@ -413,8 +417,6 @@ setInterval(() => {
         try { if (wsB && wsB.readyState === 1) wsB.send(JSON.stringify(msg)); } catch {}
       }
     }
-
-    // enemy sim (very small, wall-aware)
     _accEnemy += TICK_MS;
     if (_accEnemy >= ENEMY_MS) {
       _accEnemy = 0;
@@ -425,38 +427,55 @@ setInterval(() => {
           for (const e of room.mission.entities) {
             if (!e || e.type !== "enemy") continue;
             const ex = e.x, ey = e.y;
-
-            // pick nearest player
             let best = players[0], bestD2 = 1e9;
             for (const p of players) {
               const dx = p.x - ex, dy = p.y - ey;
               const d2 = dx*dx + dy*dy;
               if (d2 < bestD2) { bestD2 = d2; best = p; }
             }
+            const kind = e.kind || "unclean";
+            const hp = (e.hp|0) || (kind==="gorgek" ? 9 : kind==="abyss_spider" ? 1 : 4);
+            const flee = (kind !== "gorgek") && hp <= 1 && bestD2 < 9.0; // low hp + close -> flee (gorgek never flees)
+            if (kind === "gorgek") {
+              const nowt = Date.now();
+              const nxt = (e.nextSummonAt|0) || 0;
+              if (nowt >= nxt) {
+                let spiders = 0;
+                for (const q of room.mission.entities) { if (q && q.type==="enemy" && q.kind==="abyss_spider") spiders++; }
+                if (spiders < 3) {
+                  const spawnN = (Math.random() < 0.5) ? 1 : 2;
+                  for (let si=0; si<spawnN; si++) {
+                    const a = Math.random() * Math.PI * 2;
+                    const r = 0.9 + Math.random() * 1.6;
+                    let sx = clamp(e.x + Math.cos(a)*r, 1.5, w - 2.5);
+                    let sy = clamp(e.y + Math.sin(a)*r, 1.5, h - 2.5);
+                    const sn = findNearestEmpty(room, sx, sy);
+                    const sp = { id: room.mission.nextId++, type:"enemy", kind:"abyss_spider", x: Math.round(sn.x*1000)/1000, y: Math.round(sn.y*1000)/1000, hp:1, maxhp:1, seed:(Math.random()*0xFFFFFFFF)>>>0 };
+                    room.mission.entities.push(sp);
+                  }
+                  pushMission(room);
+                }
+                e.nextSummonAt = nowt + 3800 + Math.random()*2200;
+              }
+            }
 
-            const hp = (e.hp|0) || 2;
-            const flee = hp <= 1 && bestD2 < 9.0; // low hp + close -> flee
-            const speed = flee ? 0.020 : 0.028;
-
+            let speed = 0.028;
+            if (kind === "gorgek") speed = 0.020;
+            else if (kind === "abyss_spider") speed = 0.040;
+            else speed = flee ? 0.020 : 0.028;
             let vx = best.x - ex, vy = best.y - ey;
             const mag = Math.hypot(vx, vy) || 1;
             vx /= mag; vy /= mag;
             if (flee) { vx = -vx; vy = -vy; }
-
             let nx = ex + vx*speed;
             let ny = ey + vy*speed;
-
-            // simple wall collision: slide on axes
             if (isWall(room, nx, ny)) {
               if (!isWall(room, nx, ey)) { ny = ey; }
               else if (!isWall(room, ex, ny)) { nx = ex; }
               else { nx = ex; ny = ey; }
             }
-
-            // clamp
             nx = clamp(nx, 1.25, (room.mapW||80) - 2.25);
             ny = clamp(ny, 1.25, (room.mapH||45) - 2.25);
-
             const dxm = nx - ex, dym = ny - ey;
             if ((dxm*dxm + dym*dym) > 1e-6) {
               e.x = Math.round(nx * 1000) / 1000;
