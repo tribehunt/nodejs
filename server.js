@@ -394,6 +394,7 @@ wss.on("connection", (ws) => {
     if (room.clients.size === 0) rooms.delete(roomId);
   });
 });
+// ===== fixed-rate net sync & enemy AI tick (prevents client freeze from message flood) =====
 const TICK_MS = 50;       // 20 Hz player state relay
 const ENEMY_MS = 100;     // 10 Hz enemy sim
 let _accEnemy = 0;
@@ -402,6 +403,8 @@ setInterval(() => {
     if (!room || !room.started) continue;
     const metas = [...room.clients.entries()];
     if (metas.length === 0) continue;
+
+    // relay player states at fixed rate (only when dirty)
     for (const [wsA, metaA] of metas) {
       if (!metaA || !metaA.state || !metaA._dirty) continue;
       metaA._dirty = false;
@@ -410,6 +413,8 @@ setInterval(() => {
         try { if (wsB && wsB.readyState === 1) wsB.send(JSON.stringify(msg)); } catch {}
       }
     }
+
+    // enemy sim (very small, wall-aware)
     _accEnemy += TICK_MS;
     if (_accEnemy >= ENEMY_MS) {
       _accEnemy = 0;
@@ -420,28 +425,38 @@ setInterval(() => {
           for (const e of room.mission.entities) {
             if (!e || e.type !== "enemy") continue;
             const ex = e.x, ey = e.y;
+
+            // pick nearest player
             let best = players[0], bestD2 = 1e9;
             for (const p of players) {
               const dx = p.x - ex, dy = p.y - ey;
               const d2 = dx*dx + dy*dy;
               if (d2 < bestD2) { bestD2 = d2; best = p; }
             }
+
             const hp = (e.hp|0) || 2;
             const flee = hp <= 1 && bestD2 < 9.0; // low hp + close -> flee
             const speed = flee ? 0.020 : 0.028;
+
             let vx = best.x - ex, vy = best.y - ey;
             const mag = Math.hypot(vx, vy) || 1;
             vx /= mag; vy /= mag;
             if (flee) { vx = -vx; vy = -vy; }
+
             let nx = ex + vx*speed;
             let ny = ey + vy*speed;
+
+            // simple wall collision: slide on axes
             if (isWall(room, nx, ny)) {
               if (!isWall(room, nx, ey)) { ny = ey; }
               else if (!isWall(room, ex, ny)) { nx = ex; }
               else { nx = ex; ny = ey; }
             }
+
+            // clamp
             nx = clamp(nx, 1.25, (room.mapW||80) - 2.25);
             ny = clamp(ny, 1.25, (room.mapH||45) - 2.25);
+
             const dxm = nx - ex, dym = ny - ey;
             if ((dxm*dxm + dym*dym) > 1e-6) {
               e.x = Math.round(nx * 1000) / 1000;
