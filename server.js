@@ -201,20 +201,20 @@ function spawnLocalEntities(room, type, center, count) {
       y: Math.round(snapped.y * 1000) / 1000
     };
     if (type === "enemy") {
-      // Enemy variants: Unclean (dalek-like) and rare Gorgek (spawns abyss spiders)
+      // enemy kind/variant/seed for client rendering + balance
       const roll = Math.random();
-      if (roll < 0.12) {
+      if (roll < 0.14) {
         ent.kind = "gorgek";
         ent.variant = 7;
         ent.maxhp = 10;
         ent.hp = 10;
-        ent.spNext = 0;
       } else {
         ent.kind = "unclean";
-        ent.variant = rndInt(0, 6);
+        ent.variant = (Math.random()*7)|0;
         ent.maxhp = 3;
         ent.hp = 3;
       }
+      ent.seed = (Math.random()*4294967296)>>>0;
     }
     out.push(ent);
   }
@@ -409,7 +409,6 @@ wss.on("connection", (ws) => {
     if (room.clients.size === 0) rooms.delete(roomId);
   });
 });
-// ===== fixed-rate net sync & enemy AI tick (prevents client freeze from message flood) =====
 const TICK_MS = 50;       // 20 Hz player state relay
 const ENEMY_MS = 100;     // 10 Hz enemy sim
 let _accEnemy = 0;
@@ -418,8 +417,6 @@ setInterval(() => {
     if (!room || !room.started) continue;
     const metas = [...room.clients.entries()];
     if (metas.length === 0) continue;
-
-    // relay player states at fixed rate (only when dirty)
     for (const [wsA, metaA] of metas) {
       if (!metaA || !metaA.state || !metaA._dirty) continue;
       metaA._dirty = false;
@@ -428,97 +425,50 @@ setInterval(() => {
         try { if (wsB && wsB.readyState === 1) wsB.send(JSON.stringify(msg)); } catch {}
       }
     }
-
-    // enemy sim (very small, wall-aware)
     _accEnemy += TICK_MS;
     if (_accEnemy >= ENEMY_MS) {
       _accEnemy = 0;
       if (room.mission && room.mission.phase === "destroy" && Array.isArray(room.mission.entities) && room.mission.entities.length) {
         const players = metas.map(([,m]) => (m && m.state) ? { x: m.state.x, y: m.state.y } : null).filter(Boolean);
         if (players.length) {
-          const now = Date.now();
           let moved = null;
-          let spawned = null;
-          let spiderCount = 0;
-          for (const ee of room.mission.entities) { if (ee && ee.type === "enemy" && ee.kind === "abyss_spider") spiderCount++; }
-
           for (const e of room.mission.entities) {
             if (!e || e.type !== "enemy") continue;
             const ex = e.x, ey = e.y;
-
-            // pick nearest player
             let best = players[0], bestD2 = 1e9;
             for (const p of players) {
               const dx = p.x - ex, dy = p.y - ey;
               const d2 = dx*dx + dy*dy;
               if (d2 < bestD2) { bestD2 = d2; best = p; }
             }
-
             const hp = (e.hp|0) || 2;
             const flee = hp <= 1 && bestD2 < 9.0; // low hp + close -> flee
-            const kind = e.kind || "unclean";
-            const base = (kind === "gorgek") ? 0.020 : (kind === "abyss_spider" ? 0.034 : 0.028);
-            const speed = flee ? (base * 0.85) : base;
-
+            const speed = flee ? 0.020 : 0.028;
             let vx = best.x - ex, vy = best.y - ey;
             const mag = Math.hypot(vx, vy) || 1;
             vx /= mag; vy /= mag;
             if (flee) { vx = -vx; vy = -vy; }
-
             let nx = ex + vx*speed;
             let ny = ey + vy*speed;
-
-            // simple wall collision: slide on axes
             if (isWall(room, nx, ny)) {
               if (!isWall(room, nx, ey)) { ny = ey; }
               else if (!isWall(room, ex, ny)) { nx = ex; }
               else { nx = ex; ny = ey; }
             }
-
-            // clamp
             nx = clamp(nx, 1.25, (room.mapW||80) - 2.25);
             ny = clamp(ny, 1.25, (room.mapH||45) - 2.25);
-
             const dxm = nx - ex, dym = ny - ey;
             if ((dxm*dxm + dym*dym) > 1e-6) {
               e.x = Math.round(nx * 1000) / 1000;
               e.y = Math.round(ny * 1000) / 1000;
               (moved || (moved = [])).push({ id: e.id|0, x: e.x, y: e.y, hp: e.hp|0 });
-                        // Gorgek spawns abyss spiders (server-authoritative)
-            if (kind === "gorgek" && (room.mission.entities.length < 24) && spiderCount < 10) {
-              if (!e.spNext) e.spNext = now + rndInt(600, 1400);
-              if (now >= e.spNext) {
-                if (Math.random() < 0.55) {
-                  const ox = (Math.random()*2 - 1) * 1.8;
-                  const oy = (Math.random()*2 - 1) * 1.8;
-                  const sn2 = findNearestEmpty(room, ex + ox, ey + oy);
-                  const sp = {
-                    id: room.mission.nextId++,
-                    type: "enemy",
-                    x: Math.round(sn2.x * 1000) / 1000,
-                    y: Math.round(sn2.y * 1000) / 1000,
-                    kind: "abyss_spider",
-                    variant: 8,
-                    maxhp: 2,
-                    hp: 2
-                  };
-                  room.mission.entities.push(sp);
-                  (spawned || (spawned = [])).push(sp);
-                  spiderCount++;
-                }
-                e.spNext = now + rndInt(1200, 2600);
-              }
             }
           }
           if (moved && moved.length) {
             broadcast(room, { type: "m_update", op: "pos", list: moved });
           }
-          if (spawned && spawned.length) {
-            broadcast(room, { type: "m_update", op: "spawn", list: spawned });
-          }
         }
       }
-    }
     }
   }
 }, TICK_MS);
