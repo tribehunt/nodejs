@@ -1,57 +1,118 @@
-// Minimal 2-player WebSocket relay.
-// Deploy this on Railway (or run locally) and point clients to wss://.../ (already provided in Python client).
-// Protocol: JSON messages with t=join/state/shot/scan/start/end. Server assigns id 0/1.
-
+// AZHA Multiplayer Relay Server (Node.js + ws)
+// Run: npm i ws && node server.js
+// Deploy: Railway/Render/etc
 const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocket.Server({ port: PORT });
 
-let clients = []; // {ws,id}
+const rooms = new Map(); // room -> { clients: Map(id, ws), ready: Map(id,bool), seed, difficulty }
 
-function broadcastExcept(sender, obj) {
+function rid() {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+function roomGet(name) {
+  if (!rooms.has(name)) {
+    rooms.set(name, { clients: new Map(), ready: new Map(), seed: null, difficulty: 1, missionActive: false });
+  }
+  return rooms.get(name);
+}
+
+function broadcast(room, obj, exceptId=null) {
   const msg = JSON.stringify(obj);
-  for (const c of clients) {
-    if (c.ws !== sender && c.ws.readyState === WebSocket.OPEN) c.ws.send(msg);
+  for (const [id, ws] of room.clients) {
+    if (exceptId && id === exceptId) continue;
+    if (ws.readyState === WebSocket.OPEN) ws.send(msg);
   }
 }
 
-function prune() {
-  clients = clients.filter(c => c.ws.readyState === WebSocket.OPEN);
+function roomState(room) {
+  const r = {};
+  for (const [id, val] of room.ready) r[id] = !!val;
+  return { t: "room_state", seed: room.seed, difficulty: room.difficulty, ready: r, missionActive: room.missionActive };
 }
 
 wss.on("connection", (ws) => {
-  prune();
-  if (clients.length >= 2) {
-    ws.send(JSON.stringify({ t: "full" }));
-    ws.close();
-    return;
-  }
+  const id = rid();
+  ws._id = id;
+  ws._room = "public";
 
-  const id = clients.length;
-  clients.push({ ws, id });
-
-  ws.send(JSON.stringify({ t: "welcome", id }));
-  broadcastExcept(ws, { t: "peer", id });
+  ws.send(JSON.stringify({ t: "welcome", id, room: ws._room }));
 
   ws.on("message", (buf) => {
-    let data;
-    try { data = JSON.parse(buf.toString()); } catch { return; }
-    if (!data || typeof data.t !== "string") return;
+    let m;
+    try { m = JSON.parse(buf.toString()); } catch { return; }
+    const t = m.t;
 
-    // Relay everything (except join)
-    if (data.t === "join") return;
+    if (t === "hello") {
+      const roomName = (m.room || "public").toString().slice(0, 32);
+      // leave old
+      const old = roomGet(ws._room);
+      old.clients.delete(id);
+      old.ready.delete(id);
 
-    // attach sender id
-    data.from = id;
-    broadcastExcept(ws, data);
+      ws._room = roomName;
+      const room = roomGet(roomName);
+      room.clients.set(id, ws);
+      if (!room.ready.has(id)) room.ready.set(id, false);
+
+      ws.send(JSON.stringify({ t: "welcome", id, room: ws._room }));
+      ws.send(JSON.stringify(roomState(room)));
+      broadcast(room, { t:"msg", s:`${id} joined.` }, id);
+      return;
+    }
+
+    const room = roomGet(ws._room);
+
+    if (t === "scan") {
+      room.seed = m.seed ?? room.seed;
+      room.difficulty = m.difficulty ?? room.difficulty;
+      room.missionActive = false;
+      // reset ready on scan
+      for (const k of room.ready.keys()) room.ready.set(k, false);
+      broadcast(room, { t:"scan", seed: room.seed, difficulty: room.difficulty });
+      broadcast(room, roomState(room));
+      return;
+    }
+
+    if (t === "ready") {
+      room.ready.set(id, !!m.ready);
+      broadcast(room, roomState(room));
+
+      // start when exactly 2 players present and both ready and seed exists
+      const ids = [...room.clients.keys()];
+      if (ids.length >= 2 && room.seed != null) {
+        const r0 = !!room.ready.get(ids[0]);
+        const r1 = !!room.ready.get(ids[1]);
+        if (r0 && r1 && !room.missionActive) {
+          room.missionActive = true;
+          broadcast(room, { t:"start", seed: room.seed, difficulty: room.difficulty });
+          broadcast(room, roomState(room));
+        }
+      }
+      return;
+    }
+
+    if (t === "state") {
+      // relay positional state to others
+      broadcast(room, { t:"state", id, x:m.x, y:m.y, a:m.a, hp:m.hp }, id);
+      return;
+    }
+
+    if (t === "shot") {
+      broadcast(room, { t:"shot", id, x:m.x, y:m.y, vx:m.vx, vy:m.vy, dmg:m.dmg }, id);
+      return;
+    }
   });
 
   ws.on("close", () => {
-    prune();
-    // Notify remaining client
-    broadcastExcept(ws, { t: "peer_left", id });
+    const room = roomGet(ws._room);
+    room.clients.delete(id);
+    room.ready.delete(id);
+    broadcast(room, { t:"leave", id });
+    if (room.clients.size === 0) rooms.delete(ws._room);
   });
 });
 
-console.log("WS relay listening on", PORT);
+console.log(`AZHA relay server listening on :${PORT}`);
