@@ -27,14 +27,14 @@ function roomState(room) {
 wss.on("connection", (ws) => {
   const id = rid();
   ws._id = id;
-  ws._room = "public";
+  ws._room = "brothers";
   ws.send(JSON.stringify({ t: "welcome", id, room: ws._room }));
   ws.on("message", (buf) => {
     let m;
     try { m = JSON.parse(buf.toString()); } catch { return; }
     const t = m.t;
     if (t === "hello") {
-      const roomName = (m.room || "public").toString().slice(0, 32);
+      const roomName = (m.room || "brothers").toString().slice(0, 32);
       const old = roomGet(ws._room);
       old.clients.delete(id);
       old.ready.delete(id);
@@ -61,13 +61,23 @@ wss.on("connection", (ws) => {
       room.ready.set(id, !!m.ready);
       broadcast(room, roomState(room));
       const ids = [...room.clients.keys()].sort();
-      if (ids.length >= 2 && room.seed != null) {
-        const r0 = !!room.ready.get(ids[0]);
-        const r1 = !!room.ready.get(ids[1]);
-        if (r0 && r1 && !room.missionActive) {
-          room.missionActive = true;
-          broadcast(room, { t:"start", seed: room.seed, difficulty: room.difficulty, players: ids });
-          broadcast(room, roomState(room));
+      if (room.seed != null && !room.missionActive) {
+        if (ws._room === "solo") {
+          if (!!room.ready.get(id)) {
+            room.missionActive = true;
+            broadcast(room, { t:"start", seed: room.seed, difficulty: room.difficulty, players: [id] });
+            broadcast(room, roomState(room));
+          }
+        } else {
+          if (ids.length >= 2) {
+            const r0 = !!room.ready.get(ids[0]);
+            const r1 = !!room.ready.get(ids[1]);
+            if (r0 && r1) {
+              room.missionActive = true;
+              broadcast(room, { t:"start", seed: room.seed, difficulty: room.difficulty, players: ids.slice(0,2) });
+              broadcast(room, roomState(room));
+            }
+          }
         }
       }
       return;
