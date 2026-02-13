@@ -1,4 +1,3 @@
-// AZHA Multiplayer Relay Server (Node.js + ws)
 // Run: npm i ws && node server.js
 // Deploy: Railway/Render/etc
 const WebSocket = require("ws");
@@ -102,6 +101,12 @@ wss.on("connection", (ws) => {
 
     if (t === "shot") {
       broadcast(room, { t:"shot", id, x:m.x, y:m.y, vx:m.vx, vy:m.vy, dmg:m.dmg }, id);
+      return;
+    }
+
+    if (t === "msg") {
+      const s = (m.s ?? "").toString().slice(0, 240);
+      if (s.length) broadcast(room, { t:"msg", s }, null);
       return;
     }
   });
