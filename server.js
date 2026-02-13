@@ -76,6 +76,10 @@ wss.on("connection", (ws) => {
       broadcast(room, { t:"state", id, x:m.x, y:m.y, a:m.a, hp:m.hp }, id);
       return;
     }
+    if (t === "mission_exit") {
+      broadcast(room, { t:"mission_exit", id, reason: m.reason, hp: m.hp }, id);
+      return;
+    }
     if (t === "shot") {
       broadcast(room, { t:"shot", id, x:m.x, y:m.y, vx:m.vx, vy:m.vy, dmg:m.dmg }, id);
       return;
