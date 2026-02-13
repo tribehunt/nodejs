@@ -106,7 +106,8 @@ wss.on("connection", (ws) => {
 
     if (t === "msg") {
       const s = (m.s ?? "").toString().slice(0, 240);
-      if (s.length) broadcast(room, { t:"msg", s }, null);
+      // Sender already renders locally; broadcast to everyone else to avoid duplicates.
+      if (s.length) broadcast(room, { t:"msg", s }, id);
       return;
     }
   });
