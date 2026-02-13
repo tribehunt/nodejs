@@ -1,23 +1,16 @@
-// Run: npm i ws && node server.js
-// Deploy: Railway/Render/etc
 const WebSocket = require("ws");
-
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocket.Server({ port: PORT });
-
 const rooms = new Map(); // room -> { clients: Map(id, ws), ready: Map(id,bool), seed, difficulty }
-
 function rid() {
   return Math.random().toString(36).slice(2, 10);
 }
-
 function roomGet(name) {
   if (!rooms.has(name)) {
     rooms.set(name, { clients: new Map(), ready: new Map(), seed: null, difficulty: 1, missionActive: false });
   }
   return rooms.get(name);
 }
-
 function broadcast(room, obj, exceptId=null) {
   const msg = JSON.stringify(obj);
   for (const [id, ws] of room.clients) {
@@ -25,61 +18,47 @@ function broadcast(room, obj, exceptId=null) {
     if (ws.readyState === WebSocket.OPEN) ws.send(msg);
   }
 }
-
 function roomState(room) {
   const r = {};
   for (const [id, val] of room.ready) r[id] = !!val;
   return { t: "room_state", seed: room.seed, difficulty: room.difficulty, ready: r, missionActive: room.missionActive };
 }
-
 wss.on("connection", (ws) => {
   const id = rid();
   ws._id = id;
   ws._room = "public";
-
   ws.send(JSON.stringify({ t: "welcome", id, room: ws._room }));
-
   ws.on("message", (buf) => {
     let m;
     try { m = JSON.parse(buf.toString()); } catch { return; }
     const t = m.t;
-
     if (t === "hello") {
       const roomName = (m.room || "public").toString().slice(0, 32);
-      // leave old
       const old = roomGet(ws._room);
       old.clients.delete(id);
       old.ready.delete(id);
-
       ws._room = roomName;
       const room = roomGet(roomName);
       room.clients.set(id, ws);
       if (!room.ready.has(id)) room.ready.set(id, false);
-
       ws.send(JSON.stringify({ t: "welcome", id, room: ws._room }));
       ws.send(JSON.stringify(roomState(room)));
       broadcast(room, { t:"msg", s:`${id} joined.` }, id);
       return;
     }
-
     const room = roomGet(ws._room);
-
     if (t === "scan") {
       room.seed = m.seed ?? room.seed;
       room.difficulty = m.difficulty ?? room.difficulty;
       room.missionActive = false;
-      // reset ready on scan
       for (const k of room.ready.keys()) room.ready.set(k, false);
       broadcast(room, { t:"scan", seed: room.seed, difficulty: room.difficulty });
       broadcast(room, roomState(room));
       return;
     }
-
     if (t === "ready") {
       room.ready.set(id, !!m.ready);
       broadcast(room, roomState(room));
-
-      // start when exactly 2 players present and both ready and seed exists
       const ids = [...room.clients.keys()];
       if (ids.length >= 2 && room.seed != null) {
         const r0 = !!room.ready.get(ids[0]);
@@ -92,26 +71,20 @@ wss.on("connection", (ws) => {
       }
       return;
     }
-
     if (t === "state") {
-      // relay positional state to others
       broadcast(room, { t:"state", id, x:m.x, y:m.y, a:m.a, hp:m.hp }, id);
       return;
     }
-
     if (t === "shot") {
       broadcast(room, { t:"shot", id, x:m.x, y:m.y, vx:m.vx, vy:m.vy, dmg:m.dmg }, id);
       return;
     }
-
     if (t === "msg") {
       const s = (m.s ?? "").toString().slice(0, 240);
-      // Sender already renders locally; broadcast to everyone else to avoid duplicates.
       if (s.length) broadcast(room, { t:"msg", s }, id);
       return;
     }
   });
-
   ws.on("close", () => {
     const room = roomGet(ws._room);
     room.clients.delete(id);
@@ -120,5 +93,4 @@ wss.on("connection", (ws) => {
     if (room.clients.size === 0) rooms.delete(ws._room);
   });
 });
-
 console.log(`AZHA relay server listening on :${PORT}`);
