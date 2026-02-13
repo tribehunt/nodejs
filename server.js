@@ -21,7 +21,8 @@ function broadcast(room, obj, exceptId=null) {
 function roomState(room) {
   const r = {};
   for (const [id, val] of room.ready) r[id] = !!val;
-  return { t: "room_state", seed: room.seed, difficulty: room.difficulty, ready: r, missionActive: room.missionActive };
+  const players = [...room.clients.keys()].sort();
+  return { t: "room_state", seed: room.seed, difficulty: room.difficulty, ready: r, missionActive: room.missionActive, players };
 }
 wss.on("connection", (ws) => {
   const id = rid();
@@ -59,13 +60,13 @@ wss.on("connection", (ws) => {
     if (t === "ready") {
       room.ready.set(id, !!m.ready);
       broadcast(room, roomState(room));
-      const ids = [...room.clients.keys()];
+      const ids = [...room.clients.keys()].sort();
       if (ids.length >= 2 && room.seed != null) {
         const r0 = !!room.ready.get(ids[0]);
         const r1 = !!room.ready.get(ids[1]);
         if (r0 && r1 && !room.missionActive) {
           room.missionActive = true;
-          broadcast(room, { t:"start", seed: room.seed, difficulty: room.difficulty });
+          broadcast(room, { t:"start", seed: room.seed, difficulty: room.difficulty, players: ids });
           broadcast(room, roomState(room));
         }
       }
@@ -77,6 +78,11 @@ wss.on("connection", (ws) => {
     }
     if (t === "shot") {
       broadcast(room, { t:"shot", id, x:m.x, y:m.y, vx:m.vx, vy:m.vy, dmg:m.dmg }, id);
+      return;
+    }
+    if (t === "enemies") {
+      // Host-authoritative enemy/tear snapshots.
+      broadcast(room, { t:"enemies", id, en:m.en, te:m.te, stl:m.stl, swc:m.swc, ssd:m.ssd, mt:m.mt }, id);
       return;
     }
     if (t === "msg") {
