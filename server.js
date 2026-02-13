@@ -642,7 +642,10 @@ wss.on("connection", (ws) => {
       }
 
       if (type === "chat") {
-        const text = String(m.text || "").slice(0, 200).trim();
+        let text = String(m.text || "").trim();
+        const isJimboFrame = text.startsWith("@@JIMBO@@v1|") || text.startsWith("@@JIMBO@@");
+        const cap = isJimboFrame ? 900 : 200;
+        text = text.slice(0, cap).trim();
         if (!text) return;
         const as = String(m.as || "").slice(0, 24).trim();
         const from = as ? as : azha_meta.id;
