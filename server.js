@@ -84,6 +84,10 @@ wss.on("connection", (ws) => {
       broadcast(room, { t:"shot", id, x:m.x, y:m.y, vx:m.vx, vy:m.vy, dmg:m.dmg }, id);
       return;
     }
+    if (t === "dmg") {
+      broadcast(room, { t:"dmg", from:id, to:m.to, amt:m.amt }, id);
+      return;
+    }
     if (t === "enemies") {
       // Host-authoritative enemy/tear snapshots.
       broadcast(room, { t:"enemies", id, en:m.en, te:m.te, stl:m.stl, swc:m.swc, ssd:m.ssd, mt:m.mt }, id);
