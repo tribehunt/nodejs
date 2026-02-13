@@ -1,7 +1,5 @@
-// merged server.js - supports:
-// 1) ECF/BROTHERS protocol (messages with field `t`)
-// 2) Simple lobby relay protocol (messages with field `type`)
-// 3) AZHA mission server protocol (messages with field `type` + mission system)
+// merged server.js - supports BOTH ECF (t:...) and AZHA (type:...)
+// One process, one port, isolated rooms by game.
 
 const http = require("http");
 const WebSocket = require("ws");
@@ -15,7 +13,14 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ server });
 
-/* ===================== shared helpers ===================== */
+// ------------------------------------------------------------
+// Shared helpers
+// ------------------------------------------------------------
+function clamp(n, a, b) {
+  n = Number(n);
+  if (!Number.isFinite(n)) return a;
+  return Math.max(a, Math.min(b, n));
+}
 
 function safeRoomId(s, fallback) {
   if (!s) return fallback;
@@ -24,10 +29,106 @@ function safeRoomId(s, fallback) {
   return s.slice(0, 32) || fallback;
 }
 
-function clamp(n, a, b) {
-  n = Number(n);
-  if (!Number.isFinite(n)) return a;
-  return Math.max(a, Math.min(b, n));
+function rid() {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+function nowSeed() {
+  return (Date.now() ^ (Math.random() * 0xffffffff)) >>> 0;
+}
+
+// ------------------------------------------------------------
+// Room registry: key = `${game}:${room}`
+// game is "ECF" or "AZHA"
+// ------------------------------------------------------------
+const rooms = new Map();
+
+function roomKey(game, room) {
+  return `${game}:${room}`;
+}
+
+function getRoom(game, roomName) {
+  const key = roomKey(game, roomName);
+  if (!rooms.has(key)) {
+    if (game === "ECF") {
+      rooms.set(key, {
+        game: "ECF",
+        name: roomName,
+        clients: new Map(),     // id -> ws
+        ready: new Map(),       // id -> bool
+        seed: null,
+        difficulty: 1,
+        missionActive: false
+      });
+    } else {
+      rooms.set(key, {
+        game: "AZHA",
+        name: roomName,
+        clients: new Map(),     // ws -> meta
+        started: false,
+        seed: 0,
+        mapW: 80,
+        mapH: 45,
+        mapGrid: null,
+        mission: { step: 0, phase: "rally", target: { x: 2.5, y: 2.5 }, entities: [], nextId: 1 }
+      });
+    }
+  }
+  return rooms.get(key);
+}
+
+function deleteRoomIfEmpty(room) {
+  if (!room) return;
+  if (room.game === "ECF") {
+    if (room.clients.size === 0) rooms.delete(roomKey("ECF", room.name));
+  } else {
+    if (room.clients.size === 0) rooms.delete(roomKey("AZHA", room.name));
+  }
+}
+
+// ------------------------------------------------------------
+// ECF protocol (t:...)
+// ------------------------------------------------------------
+function ecfBroadcast(room, obj, exceptId = null) {
+  const msg = JSON.stringify(obj);
+  for (const [id, ws] of room.clients) {
+    if (exceptId && id === exceptId) continue;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try { ws.send(msg); } catch {}
+    }
+  }
+}
+
+function ecfRoomState(room) {
+  const r = {};
+  for (const [id, val] of room.ready) r[id] = !!val;
+  const players = [...room.clients.keys()].sort();
+  return { t: "room_state", seed: room.seed, difficulty: room.difficulty, ready: r, missionActive: room.missionActive, players };
+}
+
+// ------------------------------------------------------------
+// AZHA protocol (type:...)
+// (ported from your AZHA server)
+// ------------------------------------------------------------
+function azhaBroadcast(room, msgObj) {
+  const data = JSON.stringify(msgObj);
+  for (const ws of room.clients.keys()) {
+    if (ws.readyState === WebSocket.OPEN) {
+      try { ws.send(data); } catch {}
+    }
+  }
+}
+
+function azhaLobbyState(room) {
+  const users = [];
+  for (const meta of room.clients.values()) {
+    users.push({ id: meta.id, name: meta.name, ready: meta.ready });
+  }
+  return users;
+}
+
+function azhaSyncLobby(room, roomId) {
+  azhaBroadcast(room, { type: "lobby", room: roomId, users: azhaLobbyState(room), started: room.started });
 }
 
 function rndInt(min, max) {
@@ -46,141 +147,6 @@ function mulberry32(seed) {
   };
 }
 
-/* ===================== 1) ECF/BROTHERS rooms (t-protocol) ===================== */
-
-const roomsECF = new Map(); // room -> { clients: Map(id, ws), ready: Map(id,bool), seed, difficulty, missionActive }
-
-function ridECF() {
-  return Math.random().toString(36).slice(2, 10);
-}
-
-function roomGetECF(name) {
-  name = safeRoomId(name, "brothers");
-  if (!roomsECF.has(name)) {
-    roomsECF.set(name, { clients: new Map(), ready: new Map(), seed: null, difficulty: 1, missionActive: false });
-  }
-  return roomsECF.get(name);
-}
-
-function broadcastECF(room, obj, exceptId = null) {
-  const msg = JSON.stringify(obj);
-  for (const [id, ws] of room.clients) {
-    if (exceptId && id === exceptId) continue;
-    if (ws.readyState === WebSocket.OPEN) ws.send(msg);
-  }
-}
-
-function roomStateECF(room) {
-  const r = {};
-  for (const [id, val] of room.ready) r[id] = !!val;
-  const players = [...room.clients.keys()].sort();
-  return { t: "room_state", seed: room.seed, difficulty: room.difficulty, ready: r, missionActive: room.missionActive, players };
-}
-
-function ecfJoin(ws, id, roomName) {
-  // leave old
-  if (ws._ecfRoom) {
-    const old = roomGetECF(ws._ecfRoom);
-    old.clients.delete(id);
-    old.ready.delete(id);
-    if (old.clients.size === 0) roomsECF.delete(ws._ecfRoom);
-  }
-  ws._ecfRoom = safeRoomId(roomName, "brothers");
-  const room = roomGetECF(ws._ecfRoom);
-  room.clients.set(id, ws);
-  if (!room.ready.has(id)) room.ready.set(id, false);
-  ws.send(JSON.stringify({ t: "welcome", id, room: ws._ecfRoom }));
-  ws.send(JSON.stringify(roomStateECF(room)));
-  broadcastECF(room, { t: "msg", s: `${id} joined.` }, id);
-}
-
-function ecfClose(ws, id) {
-  if (!ws._ecfRoom) return;
-  const room = roomGetECF(ws._ecfRoom);
-  room.clients.delete(id);
-  room.ready.delete(id);
-  broadcastECF(room, { t: "leave", id });
-  if (room.clients.size === 0) roomsECF.delete(ws._ecfRoom);
-}
-
-/* ===================== 2) SIMPLE lobby rooms (type-protocol) ===================== */
-
-const roomsSimple = new Map(); // room -> { clients: Map(ws -> meta), started, seed }
-
-function getRoomSimple(roomId) {
-  roomId = safeRoomId(roomId, "public");
-  if (!roomsSimple.has(roomId)) {
-    roomsSimple.set(roomId, { clients: new Map(), started: false, seed: 0 });
-  }
-  return roomsSimple.get(roomId);
-}
-
-function broadcastSimple(room, msgObj) {
-  const data = JSON.stringify(msgObj);
-  for (const ws of room.clients.keys()) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(data);
-  }
-}
-
-function lobbyStateSimple(room) {
-  const users = [];
-  for (const meta of room.clients.values()) users.push({ id: meta.id, name: meta.name, ready: meta.ready });
-  return users;
-}
-
-function maybeStartSimple(room, roomId) {
-  if (room.started) return;
-  const metas = [...room.clients.values()];
-  if (metas.length !== 2) return;
-  if (!metas.every(m => m.ready)) return;
-  room.started = true;
-  room.seed = (Date.now() ^ (Math.random() * 0xffffffff)) >>> 0;
-  broadcastSimple(room, { type: "start", room: roomId, seed: room.seed, mapW: 64, mapH: 64 });
-}
-
-function simpleClose(sess) {
-  if (!sess.simpleRoomId || !sess.simpleRoom) return;
-  const room = sess.simpleRoom;
-  room.clients.delete(sess.ws);
-  room.started = false;
-  room.seed = 0;
-  broadcastSimple(room, { type: "lobby", room: sess.simpleRoomId, users: lobbyStateSimple(room), started: room.started });
-  if (room.clients.size === 0) roomsSimple.delete(sess.simpleRoomId);
-}
-
-/* ===================== 3) AZHA mission rooms (type-protocol + mission) ===================== */
-
-const roomsAZHA = new Map(); // room -> AZHA room object
-
-function getRoomAZHA(roomId) {
-  roomId = safeRoomId(roomId, "global");
-  if (!roomsAZHA.has(roomId)) {
-    roomsAZHA.set(roomId, {
-      clients: new Map(), // ws -> meta
-      started: false,
-      seed: 0,
-      mapW: 80,
-      mapH: 45,
-      mapGrid: null,
-      mission: { step: 0, phase: "rally", target: { x: 2.5, y: 2.5 }, entities: [], nextId: 1 }
-    });
-  }
-  return roomsAZHA.get(roomId);
-}
-
-function broadcastAZHA(room, msgObj) {
-  const data = JSON.stringify(msgObj);
-  for (const ws of room.clients.keys()) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(data);
-  }
-}
-
-function lobbyStateAZHA(room) {
-  const users = [];
-  for (const meta of room.clients.values()) users.push({ id: meta.id, name: meta.name, ready: meta.ready });
-  return users;
-}
-
 function genDuneMap(w, h, seed) {
   w = Math.max(24, Math.floor(w));
   h = Math.max(18, Math.floor(h));
@@ -194,6 +160,7 @@ function genDuneMap(w, h, seed) {
     }
     g[y] = row;
   }
+
   const duneCount = Math.max(6, Math.floor((w * h) / 700));
   const bumps = Math.max(8, Math.floor((w * h) / 500));
 
@@ -219,6 +186,7 @@ function genDuneMap(w, h, seed) {
     const ry = 2 + Math.floor(rnd() * 6);
     stampEllipse(cx + 0.5, cy + 0.5, rx, ry);
   }
+
   for (let i = 0; i < bumps; i++) {
     const cx = 2 + Math.floor(rnd() * (w - 4));
     const cy = 2 + Math.floor(rnd() * (h - 4));
@@ -230,7 +198,9 @@ function genDuneMap(w, h, seed) {
   function carve(cx, cy, r) {
     for (let yy = Math.max(1, cy - r); yy <= Math.min(h - 2, cy + r); yy++) {
       let row = g[yy].split("");
-      for (let xx = Math.max(1, cx - r); xx <= Math.min(w - 2, cx + r); xx++) row[xx] = "0";
+      for (let xx = Math.max(1, cx - r); xx <= Math.min(w - 2, cx + r); xx++) {
+        row[xx] = "0";
+      }
       g[yy] = row.join("");
     }
   }
@@ -240,15 +210,15 @@ function genDuneMap(w, h, seed) {
   return g;
 }
 
-function isWallAZHA(room, x, y) {
+function azhaIsWall(room, x, y) {
   const xi = Math.floor(x), yi = Math.floor(y);
   if (xi < 0 || yi < 0 || xi >= room.mapW || yi >= room.mapH) return true;
   const row = room.mapGrid && room.mapGrid[yi];
   return row ? row[xi] === "1" : true;
 }
 
-function findNearestEmptyAZHA(room, x, y) {
-  if (!isWallAZHA(room, x, y)) return { x, y };
+function azhaFindNearestEmpty(room, x, y) {
+  if (!azhaIsWall(room, x, y)) return { x, y };
   const bx = Math.floor(x) + 0.5, by = Math.floor(y) + 0.5;
   for (let r = 1; r < Math.max(room.mapW, room.mapH); r++) {
     for (let dy = -r; dy <= r; dy++) {
@@ -256,24 +226,24 @@ function findNearestEmptyAZHA(room, x, y) {
         if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
         const nx = bx + dx, ny = by + dy;
         if (nx < 1 || ny < 1 || nx >= room.mapW - 1 || ny >= room.mapH - 1) continue;
-        if (!isWallAZHA(room, nx, ny)) return { x: nx, y: ny };
+        if (!azhaIsWall(room, nx, ny)) return { x: nx, y: ny };
       }
     }
   }
   for (let yy = 1; yy < room.mapH - 1; yy++) {
     for (let xx = 1; xx < room.mapW - 1; xx++) {
-      if (!isWallAZHA(room, xx + 0.5, yy + 0.5)) return { x: xx + 0.5, y: yy + 0.5 };
+      if (!azhaIsWall(room, xx + 0.5, yy + 0.5)) return { x: xx + 0.5, y: yy + 0.5 };
     }
   }
   return { x: 2.5, y: 2.5 };
 }
 
-function jimboSay(room, text) {
-  broadcastAZHA(room, { type: "chat", from: "JIMBO", name: "Jimbo", text: "@@JIMBO@@" + String(text || ""), ts: Date.now() });
+function azhaJimboSay(room, text) {
+  azhaBroadcast(room, { type: "chat", from: "JIMBO", name: "Jimbo", text: "@@JIMBO@@" + String(text || ""), ts: Date.now() });
 }
 
-function pushMission(room) {
-  broadcastAZHA(room, {
+function azhaPushMission(room) {
+  azhaBroadcast(room, {
     type: "mission",
     phase: room.mission.phase,
     step: room.mission.step,
@@ -282,13 +252,16 @@ function pushMission(room) {
   });
 }
 
-function pickRallyTarget(room) {
+function azhaPickRallyTarget(room) {
   const w = room.mapW, h = room.mapH;
-  const raw = { x: rndInt(2, Math.max(2, w - 3)) + 0.5, y: rndInt(2, Math.max(2, h - 3)) + 0.5 };
-  return findNearestEmptyAZHA(room, raw.x, raw.y);
+  const raw = {
+    x: rndInt(2, Math.max(2, w - 3)) + 0.5,
+    y: rndInt(2, Math.max(2, h - 3)) + 0.5
+  };
+  return azhaFindNearestEmpty(room, raw.x, raw.y);
 }
 
-function spawnLocalEntities(room, type, center, count) {
+function azhaSpawnLocalEntities(room, type, center, count) {
   const w = room.mapW, h = room.mapH;
   const out = [];
   const radius = 6.5;
@@ -299,57 +272,56 @@ function spawnLocalEntities(room, type, center, count) {
       const r = Math.random() * radius;
       x = clamp(center.x + Math.cos(a) * r, 1.5, w - 2.5);
       y = clamp(center.y + Math.sin(a) * r, 1.5, h - 2.5);
-      if (!isWallAZHA(room, x, y)) break;
+      if (!azhaIsWall(room, x, y)) break;
     }
-    const snapped = findNearestEmptyAZHA(room, x, y);
-    const ent = { id: room.mission.nextId++, type, x: Math.round(snapped.x * 1000) / 1000, y: Math.round(snapped.y * 1000) / 1000 };
-
-    if (type === "enemy") {
-      const roll = Math.random();
-      ent.kind = (roll < 0.10) ? "gorgek" : "unclean";
-      if (ent.kind === "gorgek") { ent.variant = 7; ent.maxhp = 10; ent.hp = 10; }
-      else { ent.variant = 5; ent.maxhp = 3; ent.hp = 3; }
-      ent.seed = ((room.seed | 0) ^ ((ent.id | 0) * 2654435761)) | 0;
-    }
+    const snapped = azhaFindNearestEmpty(room, x, y);
+    const ent = {
+      id: room.mission.nextId++,
+      type,
+      x: Math.round(snapped.x * 1000) / 1000,
+      y: Math.round(snapped.y * 1000) / 1000
+    };
+    if (type === "enemy") ent.hp = 2;
     out.push(ent);
   }
   return out;
 }
 
-function startMission(room) {
+function azhaStartMission(room) {
   room.mission.step = 0;
   room.mission.phase = "rally";
   room.mission.entities = [];
   room.mission.nextId = 1;
-  const tgt = pickRallyTarget(room);
+  const tgt = azhaPickRallyTarget(room);
   room.mission.target = { x: Math.round(tgt.x * 1000) / 1000, y: Math.round(tgt.y * 1000) / 1000 };
-  jimboSay(room, `AZHA / MIL-AI ONLINE. Tankers, rally at the marked nav blip. (X:${room.mission.target.x.toFixed(1)} Y:${room.mission.target.y.toFixed(1)})`);
-  pushMission(room);
+  azhaJimboSay(room, `AZHA / MIL-AI ONLINE. Tankers, rally at the marked nav blip. (X:${room.mission.target.x.toFixed(1)} Y:${room.mission.target.y.toFixed(1)})`);
+  azhaPushMission(room);
 }
 
-function ensureMission(room) {
+function azhaEnsureMission(room) {
   if (!room.started) return;
   if (!room.mission || !room.mission.target || !Number.isFinite(room.mission.target.x) || !Number.isFinite(room.mission.target.y)) {
     room.mission = { step: 0, phase: "rally", target: { x: 2.5, y: 2.5 }, entities: [], nextId: 1 };
   }
-  if (!room.mapGrid) room.mapGrid = genDuneMap(room.mapW || 80, room.mapH || 45, room.seed || 1);
-
+  if (!room.mapGrid) {
+    room.mapGrid = genDuneMap(room.mapW || 80, room.mapH || 45, room.seed || 1);
+  }
   if (room.mission.target.x === 0 && room.mission.target.y === 0) {
-    startMission(room);
+    azhaStartMission(room);
     return;
   }
-  const sn = findNearestEmptyAZHA(room, room.mission.target.x, room.mission.target.y);
+  const sn = azhaFindNearestEmpty(room, room.mission.target.x, room.mission.target.y);
   room.mission.target = { x: Math.round(sn.x * 1000) / 1000, y: Math.round(sn.y * 1000) / 1000 };
-  pushMission(room);
+  azhaPushMission(room);
 }
 
-function within(a, b, r) {
+function azhaWithin(a, b, r) {
   const dx = a.x - b.x;
   const dy = a.y - b.y;
   return (dx * dx + dy * dy) <= (r * r);
 }
 
-function maybeAdvanceMission(room) {
+function azhaMaybeAdvanceMission(room) {
   if (!room.started) return;
   const metas = [...room.clients.values()];
   if (metas.length !== 2) return;
@@ -360,7 +332,7 @@ function maybeAdvanceMission(room) {
   const tgt = room.mission.target;
 
   if (room.mission.phase === "rally") {
-    if (within(p0, tgt, 1.25) && within(p1, tgt, 1.25)) {
+    if (azhaWithin(p0, tgt, 1.25) && azhaWithin(p1, tgt, 1.25)) {
       room.mission.step++;
       const pick = Math.random() < 0.5 ? "destroy" : "retrieve";
       room.mission.phase = pick;
@@ -369,141 +341,187 @@ function maybeAdvanceMission(room) {
 
       if (pick === "destroy") {
         const count = rndInt(2, 7);
-        room.mission.entities = spawnLocalEntities(room, "enemy", tgt, count);
-        jimboSay(room, `CONTACT. Hostile old-tech drones detected. Destroy all targets in the local grid. (${count} total)`);
+        room.mission.entities = azhaSpawnLocalEntities(room, "enemy", tgt, count);
+        azhaJimboSay(room, `CONTACT. Hostile old-tech drones detected. Destroy all targets in the local grid. (${count} total)`);
       } else {
         const count = rndInt(1, 6);
-        room.mission.entities = spawnLocalEntities(room, "datnode", tgt, count);
-        jimboSay(room, `DATA SIGNATURES FOUND. Retrieve all datnodes in the local grid. (${count} total)`);
+        room.mission.entities = azhaSpawnLocalEntities(room, "datnode", tgt, count);
+        azhaJimboSay(room, `DATA SIGNATURES FOUND. Retrieve all datnodes in the local grid. (${count} total)`);
       }
-      pushMission(room);
+      azhaPushMission(room);
     }
     return;
   }
 
   if (room.mission.phase === "destroy" || room.mission.phase === "retrieve") {
     if (room.mission.entities.length === 0) {
-      jimboSay(room, room.mission.phase === "destroy" ? `AREA SECURED. Stand by for next nav task.` : `DATA RECOVERED. Stand by for next nav task.`);
+      azhaJimboSay(room, room.mission.phase === "destroy" ? `AREA SECURED. Stand by for next nav task.` : `DATA RECOVERED. Stand by for next nav task.`);
       room.mission.step++;
       room.mission.phase = "rally";
       room.mission.entities = [];
       room.mission.nextId = 1;
-      const nt = pickRallyTarget(room);
+
+      const nt = azhaPickRallyTarget(room);
       room.mission.target = { x: Math.round(nt.x * 1000) / 1000, y: Math.round(nt.y * 1000) / 1000 };
-      jimboSay(room, `New nav blip uploaded. Rally at (X:${room.mission.target.x.toFixed(1)} Y:${room.mission.target.y.toFixed(1)}).`);
-      pushMission(room);
+      azhaJimboSay(room, `New nav blip uploaded. Rally at (X:${room.mission.target.x.toFixed(1)} Y:${room.mission.target.y.toFixed(1)}).`);
+      azhaPushMission(room);
     }
   }
 }
 
-function maybeStartAZHA(room, roomId) {
+function azhaMaybeStart(room, roomId) {
   if (room.started) return;
   const metas = [...room.clients.values()];
   if (metas.length !== 2) return;
   if (!metas.every(m => m.ready)) return;
+
   room.started = true;
-  room.seed = (Date.now() ^ (Math.random() * 0xffffffff)) >>> 0;
+  room.seed = nowSeed();
   room.mapW = 80;
   room.mapH = 45;
   room.mapGrid = genDuneMap(room.mapW, room.mapH, room.seed);
-  broadcastAZHA(room, { type: "start", room: roomId, seed: room.seed, mapW: room.mapW, mapH: room.mapH });
-  startMission(room);
+
+  azhaBroadcast(room, { type: "start", room: roomId, seed: room.seed, mapW: room.mapW, mapH: room.mapH });
+  azhaStartMission(room);
 }
 
-function azhaClose(sess) {
-  if (!sess.azhaRoomId || !sess.azhaRoom) return;
-  const room = sess.azhaRoom;
-  room.clients.delete(sess.ws);
-  room.started = false;
-  room.seed = 0;
-  room.mapGrid = null;
-  room.mission = { step: 0, phase: "rally", target: { x: 2.5, y: 2.5 }, entities: [], nextId: 1 };
-  broadcastAZHA(room, { type: "lobby", room: sess.azhaRoomId, users: lobbyStateAZHA(room), started: room.started });
-  if (room.clients.size === 0) roomsAZHA.delete(sess.azhaRoomId);
-}
-
-/* ===================== connection/session router ===================== */
-
-function isAZHAMessage(msg) {
-  const t = msg && msg.type;
-  if (!t) return false;
-  return (
-    t === "mission_request" ||
-    t === "mission" ||
-    t === "m_hit" ||
-    t === "m_collect" ||
-    t === "m_update" ||
-    t === "state"
-  );
-}
-
-function parseJSON(buf) {
-  try { return JSON.parse(buf.toString("utf8")); } catch { return null; }
-}
-
+// ------------------------------------------------------------
+// Connection handler (auto-detect protocol)
+// ------------------------------------------------------------
 wss.on("connection", (ws) => {
-  const sess = {
-    ws,
-    // ECF
-    ecfId: ridECF(),
-    // SIMPLE
-    simpleRoomId: null,
-    simpleRoom: null,
-    simpleMeta: { id: "U" + Math.floor(Math.random() * 1e9).toString(36), name: "", ready: false },
-    // AZHA
-    azhaRoomId: null,
-    azhaRoom: null,
-    azhaMeta: { id: "U" + Math.floor(Math.random() * 1e9).toString(36), name: "", ready: false, state: null, _dirty: false },
-    // mode is chosen lazily based on first valid message (t-protocol vs type-protocol)
-    mode: null // 'ECF' | 'SIMPLE' | 'AZHA'
+  // protocol is unknown until first valid message
+  ws._proto = null; // "ECF" | "AZHA"
+  ws._ecf_id = null;
+  ws._roomGame = null; // "ECF"|"AZHA"
+  ws._roomName = null;
+
+  // ECF defaults
+  let ecf_id = rid();
+  let ecf_roomName = "brothers";
+
+  // AZHA defaults
+  let azha_roomName = "global";
+  let azha_meta = {
+    id: "U" + Math.floor(Math.random() * 1e9).toString(36),
+    name: "",
+    ready: false,
+    state: null
   };
 
-  // let ECF clients see a welcome immediately; others will ignore it safely
-  try { ws.send(JSON.stringify({ t: "welcome", id: sess.ecfId, room: "brothers" })); } catch {}
+  function detachFromCurrentRoom() {
+    if (!ws._roomGame || !ws._roomName) return;
+
+    if (ws._roomGame === "ECF") {
+      const room = getRoom("ECF", ws._roomName);
+      if (ecf_id && room.clients.get(ecf_id) === ws) room.clients.delete(ecf_id);
+      room.ready.delete(ecf_id);
+      ecfBroadcast(room, { t: "leave", id: ecf_id });
+      deleteRoomIfEmpty(room);
+    } else {
+      const room = getRoom("AZHA", ws._roomName);
+      room.clients.delete(ws);
+      room.started = false;
+      room.seed = 0;
+      room.mapGrid = null;
+      room.mission = { step: 0, phase: "rally", target: { x: 2.5, y: 2.5 }, entities: [], nextId: 1 };
+      azhaSyncLobby(room, ws._roomName);
+      deleteRoomIfEmpty(room);
+    }
+
+    ws._roomGame = null;
+    ws._roomName = null;
+  }
+
+  function attachToRoom(game, roomName) {
+    ws._roomGame = game;
+    ws._roomName = roomName;
+
+    if (game === "ECF") {
+      const room = getRoom("ECF", roomName);
+      room.clients.set(ecf_id, ws);
+      if (!room.ready.has(ecf_id)) room.ready.set(ecf_id, false);
+      return room;
+    } else {
+      const room = getRoom("AZHA", roomName);
+      room.clients.set(ws, azha_meta);
+      return room;
+    }
+  }
+
+  // Attach nowhere until first protocol message, BUT:
+  // For compatibility with existing ECF clients expecting welcome immediately:
+  // We send nothing until we see a message. (ECF client typically sends "hello" right away)
 
   ws.on("message", (buf) => {
-    const msg = parseJSON(buf);
-    if (!msg) return;
+    let m;
+    try { m = JSON.parse(buf.toString("utf8")); } catch { return; }
+    if (!m) return;
 
-    // ---------- ECF/BROTHERS protocol ----------
-    if (msg.t) {
-      if (sess.mode !== "ECF") {
-        if (sess.mode === "SIMPLE") simpleClose(sess);
-        if (sess.mode === "AZHA") azhaClose(sess);
-        sess.mode = "ECF";
-        ecfJoin(ws, sess.ecfId, "brothers");
+    // Detect protocol once
+    if (!ws._proto) {
+      if (m.t) ws._proto = "ECF";
+      else if (m.type) ws._proto = "AZHA";
+      else return;
+    }
+
+    // --------------------------------------------------------
+    // ECF handling
+    // --------------------------------------------------------
+    if (ws._proto === "ECF") {
+      const t = m.t;
+
+      // ensure in an ECF room
+      if (!ws._roomGame) {
+        ws._roomGame = "ECF";
+        ws._roomName = ecf_roomName;
+        ws._ecf_id = ecf_id;
+        const room = attachToRoom("ECF", ecf_roomName);
+        ws.send(JSON.stringify({ t: "welcome", id: ecf_id, room: ecf_roomName }));
+        ws.send(JSON.stringify(ecfRoomState(room)));
       }
 
-      const t = msg.t;
+      const room = getRoom("ECF", ws._roomName);
+
+      // hard guard: don't allow ECF traffic into AZHA room
+      if (room.game !== "ECF") return;
+
       if (t === "hello") {
-        const roomName = safeRoomId(msg.room || "brothers", "brothers");
-        ecfJoin(ws, sess.ecfId, roomName);
+        const roomName = safeRoomId(m.room || "brothers", "brothers");
+        // move rooms
+        const oldRoomName = ws._roomName;
+        if (oldRoomName !== roomName) {
+          detachFromCurrentRoom();
+          ecf_roomName = roomName;
+          attachToRoom("ECF", roomName);
+        }
+
+        ws.send(JSON.stringify({ t: "welcome", id: ecf_id, room: ws._roomName }));
+        ws.send(JSON.stringify(ecfRoomState(getRoom("ECF", ws._roomName))));
+        ecfBroadcast(getRoom("ECF", ws._roomName), { t: "msg", s: `${ecf_id} joined.` }, ecf_id);
         return;
       }
 
-      const room = roomGetECF(ws._ecfRoom || "brothers");
-
       if (t === "scan") {
-        room.seed = (msg.seed ?? room.seed);
-        room.difficulty = (msg.difficulty ?? room.difficulty);
+        room.seed = (m.seed ?? room.seed);
+        room.difficulty = (m.difficulty ?? room.difficulty);
         room.missionActive = false;
         for (const k of room.ready.keys()) room.ready.set(k, false);
-        broadcastECF(room, { t: "scan", seed: room.seed, difficulty: room.difficulty });
-        broadcastECF(room, roomStateECF(room));
+        ecfBroadcast(room, { t: "scan", seed: room.seed, difficulty: room.difficulty });
+        ecfBroadcast(room, ecfRoomState(room));
         return;
       }
 
       if (t === "ready") {
-        room.ready.set(sess.ecfId, !!msg.ready);
-        broadcastECF(room, roomStateECF(room));
-        const ids = [...room.clients.keys()].sort();
+        room.ready.set(ecf_id, !!m.ready);
+        ecfBroadcast(room, ecfRoomState(room));
 
+        const ids = [...room.clients.keys()].sort();
         if (room.seed != null && !room.missionActive) {
-          if ((ws._ecfRoom || "brothers") === "solo") {
-            if (!!room.ready.get(sess.ecfId)) {
+          if (ws._roomName === "solo") {
+            if (!!room.ready.get(ecf_id)) {
               room.missionActive = true;
-              broadcastECF(room, { t: "start", seed: room.seed, difficulty: room.difficulty, players: [sess.ecfId] });
-              broadcastECF(room, roomStateECF(room));
+              ecfBroadcast(room, { t: "start", seed: room.seed, difficulty: room.difficulty, players: [ecf_id] });
+              ecfBroadcast(room, ecfRoomState(room));
             }
           } else {
             if (ids.length >= 2) {
@@ -511,8 +529,8 @@ wss.on("connection", (ws) => {
               const r1 = !!room.ready.get(ids[1]);
               if (r0 && r1) {
                 room.missionActive = true;
-                broadcastECF(room, { t: "start", seed: room.seed, difficulty: room.difficulty, players: ids.slice(0, 2) });
-                broadcastECF(room, roomStateECF(room));
+                ecfBroadcast(room, { t: "start", seed: room.seed, difficulty: room.difficulty, players: ids.slice(0, 2) });
+                ecfBroadcast(room, ecfRoomState(room));
               }
             }
           }
@@ -520,109 +538,133 @@ wss.on("connection", (ws) => {
         return;
       }
 
-      if (t === "state") { broadcastECF(room, { t: "state", id: sess.ecfId, x: msg.x, y: msg.y, a: msg.a, hp: msg.hp }, sess.ecfId); return; }
-      if (t === "mission_exit") { broadcastECF(room, { t: "mission_exit", id: sess.ecfId, reason: msg.reason, hp: msg.hp }, sess.ecfId); return; }
-      if (t === "shot") { broadcastECF(room, { t: "shot", id: sess.ecfId, x: msg.x, y: msg.y, vx: msg.vx, vy: msg.vy, dmg: msg.dmg }, sess.ecfId); return; }
-      if (t === "dmg") { broadcastECF(room, { t: "dmg", from: sess.ecfId, to: msg.to, amt: msg.amt }, sess.ecfId); return; }
-      if (t === "obj_use") { broadcastECF(room, { t: "obj_use", id: sess.ecfId, i: msg.i, on: !!msg.on }, sess.ecfId); return; }
+      if (t === "state") {
+        ecfBroadcast(room, { t: "state", id: ecf_id, x: m.x, y: m.y, a: m.a, hp: m.hp }, ecf_id);
+        return;
+      }
+
+      if (t === "mission_exit") {
+        ecfBroadcast(room, { t: "mission_exit", id: ecf_id, reason: m.reason, hp: m.hp }, ecf_id);
+        return;
+      }
+
+      if (t === "shot") {
+        ecfBroadcast(room, { t: "shot", id: ecf_id, x: m.x, y: m.y, vx: m.vx, vy: m.vy, dmg: m.dmg }, ecf_id);
+        return;
+      }
+
+      if (t === "dmg") {
+        ecfBroadcast(room, { t: "dmg", from: ecf_id, to: m.to, amt: m.amt }, ecf_id);
+        return;
+      }
+
+      if (t === "obj_use") {
+        ecfBroadcast(room, { t: "obj_use", id: ecf_id, i: m.i, on: !!m.on }, ecf_id);
+        return;
+      }
+
       if (t === "enemies") {
-        broadcastECF(room, {
+        ecfBroadcast(room, {
           t: "enemies",
-          id: sess.ecfId,
-          en: msg.en, te: msg.te, stl: msg.stl, swc: msg.swc, ssd: msg.ssd,
-          mt: msg.mt, obj: msg.obj, op: msg.op, od: msg.od, ex: msg.ex, ext: msg.ext, exr: msg.exr
-        }, sess.ecfId);
+          id: ecf_id,
+          en: m.en, te: m.te, stl: m.stl, swc: m.swc, ssd: m.ssd,
+          mt: m.mt, obj: m.obj, op: m.op, od: m.od,
+          ex: m.ex, ext: m.ext, exr: m.exr
+        }, ecf_id);
         return;
       }
+
       if (t === "msg") {
-        const s = (msg.s ?? "").toString().slice(0, 240);
-        if (s.length) broadcastECF(room, { t: "msg", s }, sess.ecfId);
+        const s = (m.s ?? "").toString().slice(0, 240);
+        if (s.length) ecfBroadcast(room, { t: "msg", s }, ecf_id);
         return;
       }
+
       return;
     }
 
-    // ---------- type-protocol (AZHA or SIMPLE) ----------
-    if (!msg.type) return;
+    // --------------------------------------------------------
+    // AZHA handling
+    // --------------------------------------------------------
+    if (ws._proto === "AZHA") {
+      const type = m.type;
 
-    // decide AZHA vs SIMPLE using message shape
-    const wantsAZHA = isAZHAMessage(msg) && (msg.type !== "state" || (msg.s && Number.isFinite(msg.s.x) && Number.isFinite(msg.s.y)));
-
-    if (wantsAZHA) {
-      if (sess.mode !== "AZHA") {
-        if (sess.mode === "SIMPLE") simpleClose(sess);
-        if (sess.mode === "ECF") ecfClose(ws, sess.ecfId);
-        sess.mode = "AZHA";
-        sess.azhaRoomId = "global";
-        sess.azhaRoom = getRoomAZHA(sess.azhaRoomId);
-        sess.azhaRoom.clients.set(ws, sess.azhaMeta);
-        broadcastAZHA(sess.azhaRoom, { type: "lobby", room: sess.azhaRoomId, users: lobbyStateAZHA(sess.azhaRoom), started: sess.azhaRoom.started });
+      // ensure in an AZHA room
+      if (!ws._roomGame) {
+        ws._roomGame = "AZHA";
+        ws._roomName = azha_roomName;
+        const room = attachToRoom("AZHA", azha_roomName);
+        azhaSyncLobby(room, ws._roomName);
       }
 
-      let roomId = sess.azhaRoomId;
-      let room = sess.azhaRoom;
-      let meta = sess.azhaMeta;
+      let room = getRoom("AZHA", ws._roomName);
 
-      function syncLobby() {
-        broadcastAZHA(room, { type: "lobby", room: roomId, users: lobbyStateAZHA(room), started: room.started });
-      }
+      // hard guard: don't allow AZHA traffic into ECF room
+      if (room.game !== "AZHA") return;
 
-      if (msg.type === "join") {
-        const nextRoomId = safeRoomId(msg.room || "global", "global");
-        const nextRoom = getRoomAZHA(nextRoomId);
+      if (type === "join") {
+        const nextRoomId = safeRoomId(m.room || "global", "global");
+        const nextRoom = getRoom("AZHA", nextRoomId);
+
+        // AZHA cap: 2 players max
         if (nextRoom.clients.size >= 2 && !nextRoom.clients.has(ws)) {
-          ws.send(JSON.stringify({ type: "error", message: "Room is full (2 players max)." }));
+          try { ws.send(JSON.stringify({ type: "error", message: "Room is full (2 players max)." })); } catch {}
           return;
         }
-        room.clients.delete(ws);
-        syncLobby();
-        roomId = nextRoomId;
-        room = nextRoom;
-        meta.id = String(msg.id || meta.id).slice(0, 32);
-        meta.name = String(msg.name || "").slice(0, 24);
-        meta.ready = false;
-        meta.state = null;
-        meta._dirty = false;
-        room.clients.set(ws, meta);
-        sess.azhaRoomId = roomId;
-        sess.azhaRoom = room;
-        syncLobby();
+
+        // move rooms
+        detachFromCurrentRoom();
+        azha_roomName = nextRoomId;
+        ws._roomGame = "AZHA";
+        ws._roomName = nextRoomId;
+        room = attachToRoom("AZHA", nextRoomId);
+
+        azha_meta.id = String(m.id || azha_meta.id).slice(0, 32);
+        azha_meta.name = String(m.name || "").slice(0, 24);
+        azha_meta.ready = false;
+        azha_meta.state = null;
+        room.clients.set(ws, azha_meta);
+
+        azhaSyncLobby(room, nextRoomId);
         return;
       }
 
-      if (msg.type === "ready") {
-        meta.ready = !!msg.ready;
-        syncLobby();
-        maybeStartAZHA(room, roomId);
+      if (type === "ready") {
+        azha_meta.ready = !!m.ready;
+        azhaSyncLobby(room, ws._roomName);
+        azhaMaybeStart(room, ws._roomName);
         return;
       }
 
-      if (msg.type === "mission_request") { ensureMission(room); return; }
+      if (type === "mission_request") {
+        azhaEnsureMission(room);
+        return;
+      }
 
-      if (msg.type === "chat") {
-        const text = String(msg.text || "").slice(0, 200).trim();
+      if (type === "chat") {
+        const text = String(m.text || "").slice(0, 200).trim();
         if (!text) return;
-        const as = String(msg.as || "").slice(0, 24).trim();
-        const from = as ? as : meta.id;
-        const name = as ? as : (meta.name || meta.id);
-        broadcastAZHA(room, { type: "chat", from, name, text, ts: Date.now() });
+        const as = String(m.as || "").slice(0, 24).trim();
+        const from = as ? as : azha_meta.id;
+        const name = as ? as : (azha_meta.name || azha_meta.id);
+        azhaBroadcast(room, { type: "chat", from, name, text, ts: Date.now() });
         return;
       }
 
       if (!room.started) return;
 
-      if (msg.type === "state") {
-        if (msg.s && Number.isFinite(msg.s.x) && Number.isFinite(msg.s.y)) {
-          meta.state = { x: Number(msg.s.x), y: Number(msg.s.y), ang: Number(msg.s.ang) };
-          if (msg.name != null) meta.name = String(msg.name || meta.name || "").slice(0, 24);
-          meta._dirty = true;
-          maybeAdvanceMission(room);
+      if (type === "state") {
+        if (m.s && Number.isFinite(m.s.x) && Number.isFinite(m.s.y)) {
+          azha_meta.state = { x: Number(m.s.x), y: Number(m.s.y), ang: Number(m.s.ang) };
+          if (m.name != null) azha_meta.name = String(m.name || azha_meta.name || "").slice(0, 24);
+          azha_meta._dirty = true;
+          azhaMaybeAdvanceMission(room);
         }
         return;
       }
 
-      if (msg.type === "m_hit") {
-        const eid = msg.eid | 0;
+      if (type === "m_hit") {
+        const eid = m.eid | 0;
         if (!eid) return;
         const idx = room.mission.entities.findIndex(e => e.id === eid && e.type === "enemy");
         if (idx === -1) return;
@@ -630,107 +672,47 @@ wss.on("connection", (ws) => {
         ent.hp = (ent.hp | 0) - 1;
         if (ent.hp <= 0) {
           room.mission.entities.splice(idx, 1);
-          broadcastAZHA(room, { type: "m_update", op: "remove", eid, by: meta.id });
+          azhaBroadcast(room, { type: "m_update", op: "remove", eid, by: azha_meta.id });
         } else {
-          broadcastAZHA(room, { type: "m_update", op: "hp", eid, hp: ent.hp, by: meta.id });
+          azhaBroadcast(room, { type: "m_update", op: "hp", eid, hp: ent.hp, by: azha_meta.id });
         }
-        maybeAdvanceMission(room);
+        azhaMaybeAdvanceMission(room);
         return;
       }
 
-      if (msg.type === "m_collect") {
-        const eid = msg.eid | 0;
+      if (type === "m_collect") {
+        const eid = m.eid | 0;
         if (!eid) return;
         const idx = room.mission.entities.findIndex(e => e.id === eid && e.type === "datnode");
         if (idx === -1) return;
         room.mission.entities.splice(idx, 1);
-        broadcastAZHA(room, { type: "m_update", op: "remove", eid, by: meta.id });
-        maybeAdvanceMission(room);
+        azhaBroadcast(room, { type: "m_update", op: "remove", eid, by: azha_meta.id });
+        azhaMaybeAdvanceMission(room);
         return;
       }
 
-      return;
-    }
-
-    // SIMPLE handler
-    if (sess.mode !== "SIMPLE") {
-      if (sess.mode === "AZHA") azhaClose(sess);
-      if (sess.mode === "ECF") ecfClose(ws, sess.ecfId);
-      sess.mode = "SIMPLE";
-      sess.simpleRoomId = "public";
-      sess.simpleRoom = getRoomSimple(sess.simpleRoomId);
-      sess.simpleRoom.clients.set(ws, sess.simpleMeta);
-      broadcastSimple(sess.simpleRoom, { type: "lobby", room: sess.simpleRoomId, users: lobbyStateSimple(sess.simpleRoom), started: sess.simpleRoom.started });
-    }
-
-    let roomId = sess.simpleRoomId;
-    let room = sess.simpleRoom;
-    let meta = sess.simpleMeta;
-
-    function syncLobby() {
-      broadcastSimple(room, { type: "lobby", room: roomId, users: lobbyStateSimple(room), started: room.started });
-    }
-
-    if (msg.type === "join") {
-      const nextRoomId = safeRoomId(msg.room || "public", "public");
-      const nextRoom = getRoomSimple(nextRoomId);
-      if (nextRoom.clients.size >= 2 && !nextRoom.clients.has(ws)) {
-        ws.send(JSON.stringify({ type: "error", message: "Room is full (2 players max)." }));
-        return;
-      }
-      room.clients.delete(ws);
-      syncLobby();
-      roomId = nextRoomId;
-      room = nextRoom;
-      meta.id = String(msg.id || meta.id).slice(0, 32);
-      meta.name = String(msg.name || "").slice(0, 24);
-      meta.ready = false;
-      room.clients.set(ws, meta);
-      sess.simpleRoomId = roomId;
-      sess.simpleRoom = room;
-      syncLobby();
-      return;
-    }
-
-    if (msg.type === "ready") {
-      meta.ready = !!msg.ready;
-      syncLobby();
-      maybeStartSimple(room, roomId);
-      return;
-    }
-
-    if (msg.type === "chat") {
-      const text = String(msg.text || "").slice(0, 200).trim();
-      if (!text) return;
-      broadcastSimple(room, { type: "chat", from: meta.id, name: meta.name || meta.id, text, ts: Date.now() });
-      return;
-    }
-
-    if (!room.started) return;
-
-    if (msg.type === "state" || msg.type === "shoot" || msg.type === "event") {
-      msg.from = meta.id;
-      broadcastSimple(room, msg);
       return;
     }
   });
 
   ws.on("close", () => {
-    if (sess.mode === "ECF") ecfClose(ws, sess.ecfId);
-    if (sess.mode === "SIMPLE") simpleClose(sess);
-    if (sess.mode === "AZHA") azhaClose(sess);
+    detachFromCurrentRoom();
   });
 });
 
-/* ===== fixed-rate net sync & enemy AI tick for AZHA (prevents client freeze from message flood) ===== */
-
-const TICK_MS = 50;
-const ENEMY_MS = 100;
+// ------------------------------------------------------------
+// AZHA fixed-rate net sync & enemy AI tick
+// (runs ONLY for AZHA rooms)
+// ------------------------------------------------------------
+const TICK_MS = 50;   // 20 Hz
+const ENEMY_MS = 100; // 10 Hz
 let _accEnemy = 0;
 
 setInterval(() => {
-  for (const room of roomsAZHA.values()) {
-    if (!room || !room.started) continue;
+  for (const room of rooms.values()) {
+    if (!room || room.game !== "AZHA") continue;
+    if (!room.started) continue;
+
     const metas = [...room.clients.entries()];
     if (metas.length === 0) continue;
 
@@ -739,8 +721,9 @@ setInterval(() => {
       if (!metaA || !metaA.state || !metaA._dirty) continue;
       metaA._dirty = false;
       const msg = { type: "state", from: metaA.id, name: metaA.name || metaA.id, s: metaA.state };
+      const data = JSON.stringify(msg);
       for (const [wsB] of metas) {
-        try { if (wsB && wsB.readyState === 1) wsB.send(JSON.stringify(msg)); } catch {}
+        try { if (wsB && wsB.readyState === 1) wsB.send(data); } catch {}
       }
     }
 
@@ -748,10 +731,15 @@ setInterval(() => {
     _accEnemy += TICK_MS;
     if (_accEnemy >= ENEMY_MS) {
       _accEnemy = 0;
+
       if (room.mission && room.mission.phase === "destroy" && Array.isArray(room.mission.entities) && room.mission.entities.length) {
-        const players = metas.map(([, m]) => (m && m.state) ? { x: m.state.x, y: m.state.y } : null).filter(Boolean);
+        const players = metas
+          .map(([, m]) => (m && m.state) ? { x: m.state.x, y: m.state.y } : null)
+          .filter(Boolean);
+
         if (players.length) {
           let moved = null;
+
           for (const e of room.mission.entities) {
             if (!e || e.type !== "enemy") continue;
             const ex = e.x, ey = e.y;
@@ -776,10 +764,10 @@ setInterval(() => {
             let nx = ex + vx * speed;
             let ny = ey + vy * speed;
 
-            // wall slide
-            if (isWallAZHA(room, nx, ny)) {
-              if (!isWallAZHA(room, nx, ey)) { ny = ey; }
-              else if (!isWallAZHA(room, ex, ny)) { nx = ex; }
+            // wall collision (slide)
+            if (azhaIsWall(room, nx, ny)) {
+              if (!azhaIsWall(room, nx, ey)) { ny = ey; }
+              else if (!azhaIsWall(room, ex, ny)) { nx = ex; }
               else { nx = ex; ny = ey; }
             }
 
@@ -793,13 +781,17 @@ setInterval(() => {
               (moved || (moved = [])).push({ id: e.id | 0, x: e.x, y: e.y, hp: e.hp | 0 });
             }
           }
-          if (moved && moved.length) broadcastAZHA(room, { type: "m_update", op: "pos", list: moved });
+
+          if (moved && moved.length) {
+            azhaBroadcast(room, { type: "m_update", op: "pos", list: moved });
+          }
         }
       }
     }
   }
 }, TICK_MS);
 
+// ------------------------------------------------------------
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("Merged WebSocket relay on port", PORT);
+  console.log("Merged relay (ECF + AZHA) on port", PORT);
 });
