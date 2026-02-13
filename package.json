@@ -1,7 +1,7 @@
 {
   "name": "nodejs-app",
   "version": "1.3",
-  "description": "Node.js server for Dorfwärter.",
+  "description": "Node.js server for Dedset Media use.",
   "main": "server.js",
   "author": "Dedset Media",
   "license": "©",
