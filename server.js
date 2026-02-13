@@ -93,4 +93,4 @@ wss.on("connection", (ws) => {
     if (room.clients.size === 0) rooms.delete(ws._room);
   });
 });
-console.log(`AZHA relay server listening on :${PORT}`);
+console.log(`ECF relay server listening on :${PORT}`);
