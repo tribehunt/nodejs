@@ -433,7 +433,7 @@ function isAZHAMessage(msg) {
     t === "m_hit" ||
     t === "m_collect" ||
     t === "m_update" ||
-    t === "state" // AZHA uses state with msg.s payload; SIMPLE uses state too, but we disambiguate by presence of msg.s
+    t === "state"
   );
 }
 
@@ -458,9 +458,7 @@ wss.on("connection", (ws) => {
     mode: null // 'ECF' | 'SIMPLE' | 'AZHA'
   };
 
-  // default: let clients that expect immediate welcome get it (ECF clients do)
-  // but do not force-join until a message arrives; we can still send a welcome early safely.
-  // If a client doesn't understand it, they'll ignore it.
+  // let ECF clients see a welcome immediately; others will ignore it safely
   try { ws.send(JSON.stringify({ t: "welcome", id: sess.ecfId, room: "brothers" })); } catch {}
 
   ws.on("message", (buf) => {
@@ -470,7 +468,6 @@ wss.on("connection", (ws) => {
     // ---------- ECF/BROTHERS protocol ----------
     if (msg.t) {
       if (sess.mode !== "ECF") {
-        // switch to ECF mode
         if (sess.mode === "SIMPLE") simpleClose(sess);
         if (sess.mode === "AZHA") azhaClose(sess);
         sess.mode = "ECF";
@@ -545,7 +542,7 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // ---------- type-protocol (SIMPLE or AZHA) ----------
+    // ---------- type-protocol (AZHA or SIMPLE) ----------
     if (!msg.type) return;
 
     // decide AZHA vs SIMPLE using message shape
@@ -556,14 +553,12 @@ wss.on("connection", (ws) => {
         if (sess.mode === "SIMPLE") simpleClose(sess);
         if (sess.mode === "ECF") ecfClose(ws, sess.ecfId);
         sess.mode = "AZHA";
-        // join default room
         sess.azhaRoomId = "global";
         sess.azhaRoom = getRoomAZHA(sess.azhaRoomId);
         sess.azhaRoom.clients.set(ws, sess.azhaMeta);
         broadcastAZHA(sess.azhaRoom, { type: "lobby", room: sess.azhaRoomId, users: lobbyStateAZHA(sess.azhaRoom), started: sess.azhaRoom.started });
       }
 
-      // AZHA handler
       let roomId = sess.azhaRoomId;
       let room = sess.azhaRoom;
       let meta = sess.azhaMeta;
