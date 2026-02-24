@@ -1,11 +1,10 @@
-// merged server.js - supports BOTH ECF (t:...) and AZHA (type:...)
+// merged server.js - supports EldritchCyberFront, Azha & Ethane Sea
 // One process, one port, isolated rooms by game.
+// by Dedset Media 02/24/2026
 
 const http = require("http");
 const WebSocket = require("ws");
-
 const PORT = process.env.PORT || 8080;
-
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "content-type": "text/plain" });
   res.end("OK\n");
@@ -13,63 +12,55 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ server });
 
-// ------------------------------------------------------------
+// --------------
 // Shared helpers
-// ------------------------------------------------------------
+// --------------
 function clamp(n, a, b) {
   n = Number(n);
   if (!Number.isFinite(n)) return a;
   return Math.max(a, Math.min(b, n));
 }
-
 function safeRoomId(s, fallback) {
   if (!s) return fallback;
   s = String(s).trim().toLowerCase();
   s = s.replace(/[^a-z0-9_-]/g, "");
   return s.slice(0, 32) || fallback;
 }
-
 function rid() {
   return Math.random().toString(36).slice(2, 10);
 }
-
 function nowSeed() {
   return (Date.now() ^ (Math.random() * 0xffffffff)) >>> 0;
 }
 
-// ------------------------------------------------------------
+// --------------------------------------
 // Room registry: key = `${game}:${room}`
 // game is "ECF" or "AZHA"
-// ------------------------------------------------------------
+// --------------------------------------
 const rooms = new Map();
-// ------------------------------------------------------------
+// ------------------------------------------------------------------------------------------------------------
 // ETHANE SEA PRISON protocol (p:...)
 // Simple prefix protocol so it won't collide with JSON-based games.
 // Clients send:  p:{"t":"hello","room":"ethane_prison","id":"P-XXXX","name":"P-XXXX"}
 // Chat send:     p:{"t":"chat","room":"ethane_prison","id":"P-XXXX","name":"P-XXXX","msg":"hello","mid":"..."} 
 // Server sends:  p:{"t":"chat","id":"...","name":"...","msg":"...","mid":"...","ts":...}
-// ------------------------------------------------------------
+// ------------------------------------------------------------------------------------------------------------
 const prisonRooms = new Map(); // roomName -> { name, clients:Set<ws> }
-
 function prisonGetRoom(roomName) {
   const rn = safeRoomId(roomName || "ethane_prison", "ethane_prison");
   if (!prisonRooms.has(rn)) prisonRooms.set(rn, { name: rn, clients: new Set() });
   return prisonRooms.get(rn);
 }
-
 function prisonMid() {
-  // short unique-ish message id
   return (
     Math.random().toString(16).slice(2, 10) +
     Date.now().toString(16).slice(-8)
   ).toUpperCase();
 }
-
 function prisonSend(ws, obj) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   try { ws.send("p:" + JSON.stringify(obj)); } catch {}
 }
-
 function prisonBroadcast(room, obj) {
   const msg = "p:" + JSON.stringify(obj);
   for (const ws of room.clients) {
@@ -78,7 +69,6 @@ function prisonBroadcast(room, obj) {
     }
   }
 }
-
 function prisonDetach(ws, announce = true) {
   if (!ws || !ws._prisonRoomName) return;
   const roomName = ws._prisonRoomName;
@@ -92,18 +82,13 @@ function prisonDetach(ws, announce = true) {
   }
   ws._prisonRoomName = null;
 }
-
 function prisonHandle(ws, payloadStr) {
   let s = "";
   try { s = String(payloadStr || "").trim(); } catch { s = ""; }
   if (!s) return;
-
   let m = null;
   try { m = JSON.parse(s); } catch { m = null; }
-
-  // If not JSON, treat as raw chat line
   if (!m || typeof m !== "object") {
-    // require a join first
     if (!ws._prisonRoomName) {
       const room = prisonGetRoom("ethane_prison");
       ws._prisonRoomName = room.name;
@@ -126,58 +111,42 @@ function prisonHandle(ws, payloadStr) {
     });
     return;
   }
-
   const t = String(m.t || m.type || "").toLowerCase();
   if (t === "hello" || t === "join") {
     const room = prisonGetRoom(m.room || "ethane_prison");
-
-    // move rooms if needed
     if (ws._prisonRoomName && ws._prisonRoomName !== room.name) {
       prisonDetach(ws, true);
     }
-
     ws._prisonRoomName = room.name;
     ws._prisonId = String(m.id || ws._prisonId || ("P-" + prisonMid().slice(0, 8))).slice(0, 32);
     ws._prisonName = String(m.name || ws._prisonId).slice(0, 24);
-
     room.clients.add(ws);
-
     prisonSend(ws, { t: "welcome", id: ws._prisonId, room: room.name, name: ws._prisonName });
     prisonBroadcast(room, { t: "sys", msg: `${ws._prisonName} entered cellblock.` });
     return;
   }
-
   if (t === "chat" || t === "msg") {
-    // must be joined
     if (!ws._prisonRoomName) {
       prisonHandle(ws, JSON.stringify({ t: "hello", room: m.room || "ethane_prison", id: m.id, name: m.name }));
     }
     const room = prisonRooms.get(ws._prisonRoomName);
     if (!room) return;
-
     const name = String(m.name || ws._prisonName || ws._prisonId || "PRISONER").slice(0, 24);
     const id = String(m.id || ws._prisonId || "").slice(0, 32);
     let msg = String(m.msg || m.message || "");
     msg = msg.replace(/\r?\n/g, " ").slice(0, 240);
-
-    // Server chooses mid if missing
     const mid = String(m.mid || prisonMid()).slice(0, 48);
-
     prisonBroadcast(room, { t: "chat", id, name, msg, mid, ts: Date.now() });
     return;
   }
-
   if (t === "ping") {
     prisonSend(ws, { t: "pong", ts: Date.now() });
     return;
   }
 }
-
-
 function roomKey(game, room) {
   return `${game}:${room}`;
 }
-
 function getRoom(game, roomName) {
   const key = roomKey(game, roomName);
   if (!rooms.has(key)) {
@@ -207,7 +176,6 @@ function getRoom(game, roomName) {
   }
   return rooms.get(key);
 }
-
 function deleteRoomIfEmpty(room) {
   if (!room) return;
   if (room.game === "ECF") {
@@ -217,9 +185,9 @@ function deleteRoomIfEmpty(room) {
   }
 }
 
-// ------------------------------------------------------------
-// ECF protocol (t:...)
-// ------------------------------------------------------------
+// ------------
+// ECF protocol
+// ------------
 function ecfBroadcast(room, obj, exceptId = null) {
   const msg = JSON.stringify(obj);
   for (const [id, ws] of room.clients) {
@@ -229,7 +197,6 @@ function ecfBroadcast(room, obj, exceptId = null) {
     }
   }
 }
-
 function ecfRoomState(room) {
   const r = {};
   for (const [id, val] of room.ready) r[id] = !!val;
@@ -237,10 +204,9 @@ function ecfRoomState(room) {
   return { t: "room_state", seed: room.seed, difficulty: room.difficulty, ready: r, missionActive: room.missionActive, players };
 }
 
-// ------------------------------------------------------------
-// AZHA protocol (type:...)
-// (ported from your AZHA server)
-// ------------------------------------------------------------
+// -------------
+// AZHA protocol
+// -------------
 function azhaBroadcast(room, msgObj) {
   const data = JSON.stringify(msgObj);
   for (const ws of room.clients.keys()) {
@@ -249,7 +215,6 @@ function azhaBroadcast(room, msgObj) {
     }
   }
 }
-
 function azhaLobbyState(room) {
   const users = [];
   for (const meta of room.clients.values()) {
@@ -257,17 +222,14 @@ function azhaLobbyState(room) {
   }
   return users;
 }
-
 function azhaSyncLobby(room, roomId) {
   azhaBroadcast(room, { type: "lobby", room: roomId, users: azhaLobbyState(room), started: room.started });
 }
-
 function rndInt(min, max) {
   min = Math.floor(min);
   max = Math.floor(max);
   return min + Math.floor(Math.random() * (max - min + 1));
 }
-
 function mulberry32(seed) {
   let t = (seed >>> 0);
   return function () {
@@ -277,7 +239,6 @@ function mulberry32(seed) {
     return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
   };
 }
-
 function genDuneMap(w, h, seed) {
   w = Math.max(24, Math.floor(w));
   h = Math.max(18, Math.floor(h));
@@ -291,10 +252,8 @@ function genDuneMap(w, h, seed) {
     }
     g[y] = row;
   }
-
   const duneCount = Math.max(6, Math.floor((w * h) / 700));
   const bumps = Math.max(8, Math.floor((w * h) / 500));
-
   function stampEllipse(cx, cy, rx, ry) {
     const x0 = Math.max(1, Math.floor(cx - rx));
     const x1 = Math.min(w - 2, Math.ceil(cx + rx));
@@ -309,7 +268,6 @@ function genDuneMap(w, h, seed) {
       g[yy] = row.join("");
     }
   }
-
   for (let i = 0; i < duneCount; i++) {
     const cx = 2 + Math.floor(rnd() * (w - 4));
     const cy = 2 + Math.floor(rnd() * (h - 4));
@@ -317,7 +275,6 @@ function genDuneMap(w, h, seed) {
     const ry = 2 + Math.floor(rnd() * 6);
     stampEllipse(cx + 0.5, cy + 0.5, rx, ry);
   }
-
   for (let i = 0; i < bumps; i++) {
     const cx = 2 + Math.floor(rnd() * (w - 4));
     const cy = 2 + Math.floor(rnd() * (h - 4));
@@ -325,7 +282,6 @@ function genDuneMap(w, h, seed) {
     const ry = 1 + Math.floor(rnd() * 3);
     stampEllipse(cx + 0.5, cy + 0.5, rx, ry);
   }
-
   function carve(cx, cy, r) {
     for (let yy = Math.max(1, cy - r); yy <= Math.min(h - 2, cy + r); yy++) {
       let row = g[yy].split("");
@@ -335,19 +291,16 @@ function genDuneMap(w, h, seed) {
       g[yy] = row.join("");
     }
   }
-
   carve(4, 4, 4);
   carve(w - 5, h - 5, 4);
   return g;
 }
-
 function azhaIsWall(room, x, y) {
   const xi = Math.floor(x), yi = Math.floor(y);
   if (xi < 0 || yi < 0 || xi >= room.mapW || yi >= room.mapH) return true;
   const row = room.mapGrid && room.mapGrid[yi];
   return row ? row[xi] === "1" : true;
 }
-
 function azhaFindNearestEmpty(room, x, y) {
   if (!azhaIsWall(room, x, y)) return { x, y };
   const bx = Math.floor(x) + 0.5, by = Math.floor(y) + 0.5;
@@ -368,11 +321,9 @@ function azhaFindNearestEmpty(room, x, y) {
   }
   return { x: 2.5, y: 2.5 };
 }
-
 function azhaJimboSay(room, text) {
   azhaBroadcast(room, { type: "chat", from: "JIMBO", name: "Jimbo", text: "@@JIMBO@@" + String(text || ""), ts: Date.now() });
 }
-
 function azhaPushMission(room) {
   azhaBroadcast(room, {
     type: "mission",
@@ -382,7 +333,6 @@ function azhaPushMission(room) {
     entities: room.mission.entities
   });
 }
-
 function azhaPickRallyTarget(room) {
   const w = room.mapW, h = room.mapH;
   const raw = {
@@ -391,7 +341,6 @@ function azhaPickRallyTarget(room) {
   };
   return azhaFindNearestEmpty(room, raw.x, raw.y);
 }
-
 function azhaSpawnLocalEntities(room, type, center, count) {
   const w = room.mapW, h = room.mapH;
   const out = [];
@@ -417,7 +366,6 @@ function azhaSpawnLocalEntities(room, type, center, count) {
   }
   return out;
 }
-
 function azhaStartMission(room) {
   room.mission.step = 0;
   room.mission.phase = "rally";
@@ -428,7 +376,6 @@ function azhaStartMission(room) {
   azhaJimboSay(room, `AZHA / MIL-AI ONLINE. Tankers, rally at the marked nav blip. (X:${room.mission.target.x.toFixed(1)} Y:${room.mission.target.y.toFixed(1)})`);
   azhaPushMission(room);
 }
-
 function azhaEnsureMission(room) {
   if (!room.started) return;
   if (!room.mission || !room.mission.target || !Number.isFinite(room.mission.target.x) || !Number.isFinite(room.mission.target.y)) {
@@ -445,23 +392,19 @@ function azhaEnsureMission(room) {
   room.mission.target = { x: Math.round(sn.x * 1000) / 1000, y: Math.round(sn.y * 1000) / 1000 };
   azhaPushMission(room);
 }
-
 function azhaWithin(a, b, r) {
   const dx = a.x - b.x;
   const dy = a.y - b.y;
   return (dx * dx + dy * dy) <= (r * r);
 }
-
 function azhaMaybeAdvanceMission(room) {
   if (!room.started) return;
   const metas = [...room.clients.values()];
   if (metas.length !== 2) return;
   if (!metas.every(m => m && m.state && Number.isFinite(m.state.x) && Number.isFinite(m.state.y))) return;
-
   const p0 = { x: metas[0].state.x, y: metas[0].state.y };
   const p1 = { x: metas[1].state.x, y: metas[1].state.y };
   const tgt = room.mission.target;
-
   if (room.mission.phase === "rally") {
     if (azhaWithin(p0, tgt, 1.25) && azhaWithin(p1, tgt, 1.25)) {
       room.mission.step++;
@@ -469,7 +412,6 @@ function azhaMaybeAdvanceMission(room) {
       room.mission.phase = pick;
       room.mission.entities = [];
       room.mission.nextId = Math.max(room.mission.nextId || 1, 1);
-
       if (pick === "destroy") {
         const count = rndInt(2, 7);
         room.mission.entities = azhaSpawnLocalEntities(room, "enemy", tgt, count);
@@ -483,7 +425,6 @@ function azhaMaybeAdvanceMission(room) {
     }
     return;
   }
-
   if (room.mission.phase === "destroy" || room.mission.phase === "retrieve") {
     if (room.mission.entities.length === 0) {
       azhaJimboSay(room, room.mission.phase === "destroy" ? `AREA SECURED. Stand by for next nav task.` : `DATA RECOVERED. Stand by for next nav task.`);
@@ -491,7 +432,6 @@ function azhaMaybeAdvanceMission(room) {
       room.mission.phase = "rally";
       room.mission.entities = [];
       room.mission.nextId = 1;
-
       const nt = azhaPickRallyTarget(room);
       room.mission.target = { x: Math.round(nt.x * 1000) / 1000, y: Math.round(nt.y * 1000) / 1000 };
       azhaJimboSay(room, `New nav blip uploaded. Rally at (X:${room.mission.target.x.toFixed(1)} Y:${room.mission.target.y.toFixed(1)}).`);
@@ -499,28 +439,23 @@ function azhaMaybeAdvanceMission(room) {
     }
   }
 }
-
 function azhaMaybeStart(room, roomId) {
   if (room.started) return;
   const metas = [...room.clients.values()];
   if (metas.length !== 2) return;
   if (!metas.every(m => m.ready)) return;
-
   room.started = true;
   room.seed = nowSeed();
   room.mapW = 80;
   room.mapH = 45;
   room.mapGrid = genDuneMap(room.mapW, room.mapH, room.seed);
-
   azhaBroadcast(room, { type: "start", room: roomId, seed: room.seed, mapW: room.mapW, mapH: room.mapH });
   azhaStartMission(room);
 }
-
-// ------------------------------------------------------------
+// -----------------------------------------
 // Connection handler (auto-detect protocol)
-// ------------------------------------------------------------
+// -----------------------------------------
 wss.on("connection", (ws) => {
-  // protocol is unknown until first valid message
   ws._proto = null; // "ECF" | "AZHA"
   ws._ecf_id = null;
   ws._roomGame = null; // "ECF"|"AZHA"
@@ -538,10 +473,8 @@ wss.on("connection", (ws) => {
     ready: false,
     state: null
   };
-
   function detachFromCurrentRoom() {
     if (!ws._roomGame || !ws._roomName) return;
-
     if (ws._roomGame === "ECF") {
       const room = getRoom("ECF", ws._roomName);
       if (ecf_id && room.clients.get(ecf_id) === ws) room.clients.delete(ecf_id);
@@ -558,15 +491,12 @@ wss.on("connection", (ws) => {
       azhaSyncLobby(room, ws._roomName);
       deleteRoomIfEmpty(room);
     }
-
     ws._roomGame = null;
     ws._roomName = null;
   }
-
   function attachToRoom(game, roomName) {
     ws._roomGame = game;
     ws._roomName = roomName;
-
     if (game === "ECF") {
       const room = getRoom("ECF", roomName);
       room.clients.set(ecf_id, ws);
@@ -578,39 +508,29 @@ wss.on("connection", (ws) => {
       return room;
     }
   }
-
-  // Attach nowhere until first protocol message, BUT:
-  // For compatibility with existing ECF clients expecting welcome immediately:
-  // We send nothing until we see a message. (ECF client typically sends "hello" right away)
-
   ws.on("message", (buf) => {
     let raw = "";
     try { raw = buf.toString("utf8"); } catch { raw = ""; }
 
-    // ETHANE SEA prison protocol: p:... (handled before JSON parse)
+    // ETHANE SEA prison protocol:
     if (raw && raw.startsWith("p:")) {
       try { prisonHandle(ws, raw.slice(2)); } catch {}
       return;
     }
-
     let m;
     try { m = JSON.parse(raw); } catch { return; }
     if (!m) return;
-
-    // Detect protocol once
     if (!ws._proto) {
       if (m.t) ws._proto = "ECF";
       else if (m.type) ws._proto = "AZHA";
       else return;
     }
 
-    // --------------------------------------------------------
+    // ------------
     // ECF handling
-    // --------------------------------------------------------
+    // ------------
     if (ws._proto === "ECF") {
       const t = m.t;
-
-      // ensure in an ECF room
       if (!ws._roomGame) {
         ws._roomGame = "ECF";
         ws._roomName = ecf_roomName;
@@ -619,28 +539,21 @@ wss.on("connection", (ws) => {
         ws.send(JSON.stringify({ t: "welcome", id: ecf_id, room: ecf_roomName }));
         ws.send(JSON.stringify(ecfRoomState(room)));
       }
-
       const room = getRoom("ECF", ws._roomName);
-
-      // hard guard: don't allow ECF traffic into AZHA room
       if (room.game !== "ECF") return;
-
       if (t === "hello") {
         const roomName = safeRoomId(m.room || "brothers", "brothers");
-        // move rooms
         const oldRoomName = ws._roomName;
         if (oldRoomName !== roomName) {
           detachFromCurrentRoom();
           ecf_roomName = roomName;
           attachToRoom("ECF", roomName);
         }
-
         ws.send(JSON.stringify({ t: "welcome", id: ecf_id, room: ws._roomName }));
         ws.send(JSON.stringify(ecfRoomState(getRoom("ECF", ws._roomName))));
         ecfBroadcast(getRoom("ECF", ws._roomName), { t: "msg", s: `${ecf_id} joined.` }, ecf_id);
         return;
       }
-
       if (t === "scan") {
         room.seed = (m.seed != null ? m.seed : room.seed);
         room.difficulty = (m.difficulty != null ? m.difficulty : room.difficulty);
@@ -650,11 +563,9 @@ wss.on("connection", (ws) => {
         ecfBroadcast(room, ecfRoomState(room));
         return;
       }
-
       if (t === "ready") {
         room.ready.set(ecf_id, !!m.ready);
         ecfBroadcast(room, ecfRoomState(room));
-
         const ids = [...room.clients.keys()].sort();
         if (room.seed != null && !room.missionActive) {
           if (ws._roomName === "solo") {
@@ -677,32 +588,26 @@ wss.on("connection", (ws) => {
         }
         return;
       }
-
       if (t === "state") {
         ecfBroadcast(room, { t: "state", id: ecf_id, x: m.x, y: m.y, a: m.a, hp: m.hp }, ecf_id);
         return;
       }
-
       if (t === "mission_exit") {
         ecfBroadcast(room, { t: "mission_exit", id: ecf_id, reason: m.reason, hp: m.hp }, ecf_id);
         return;
       }
-
       if (t === "shot") {
         ecfBroadcast(room, { t: "shot", id: ecf_id, x: m.x, y: m.y, vx: m.vx, vy: m.vy, dmg: m.dmg }, ecf_id);
         return;
       }
-
       if (t === "dmg") {
         ecfBroadcast(room, { t: "dmg", from: ecf_id, to: m.to, amt: m.amt }, ecf_id);
         return;
       }
-
       if (t === "obj_use") {
         ecfBroadcast(room, { t: "obj_use", id: ecf_id, i: m.i, on: !!m.on }, ecf_id);
         return;
       }
-
       if (t === "enemies") {
         ecfBroadcast(room, {
           t: "enemies",
@@ -713,74 +618,57 @@ wss.on("connection", (ws) => {
         }, ecf_id);
         return;
       }
-
       if (t === "msg") {
         const s = ((m.s != null ? m.s : "")).toString().slice(0, 240);
         if (s.length) ecfBroadcast(room, { t: "msg", s }, ecf_id);
         return;
       }
-
       return;
     }
 
-    // --------------------------------------------------------
+    // -------------
     // AZHA handling
-    // --------------------------------------------------------
+    // -------------
     if (ws._proto === "AZHA") {
       const type = m.type;
-
-      // ensure in an AZHA room
       if (!ws._roomGame) {
         ws._roomGame = "AZHA";
         ws._roomName = azha_roomName;
         const room = attachToRoom("AZHA", azha_roomName);
         azhaSyncLobby(room, ws._roomName);
       }
-
       let room = getRoom("AZHA", ws._roomName);
-
-      // hard guard: don't allow AZHA traffic into ECF room
       if (room.game !== "AZHA") return;
-
       if (type === "join") {
         const nextRoomId = safeRoomId(m.room || "global", "global");
         const nextRoom = getRoom("AZHA", nextRoomId);
-
-        // AZHA cap: 2 players max
         if (nextRoom.clients.size >= 2 && !nextRoom.clients.has(ws)) {
           try { ws.send(JSON.stringify({ type: "error", message: "Room is full (2 players max)." })); } catch {}
           return;
         }
-
-        // move rooms
         detachFromCurrentRoom();
         azha_roomName = nextRoomId;
         ws._roomGame = "AZHA";
         ws._roomName = nextRoomId;
         room = attachToRoom("AZHA", nextRoomId);
-
         azha_meta.id = String(m.id || azha_meta.id).slice(0, 32);
         azha_meta.name = String(m.name || "").slice(0, 24);
         azha_meta.ready = false;
         azha_meta.state = null;
         room.clients.set(ws, azha_meta);
-
         azhaSyncLobby(room, nextRoomId);
         return;
       }
-
       if (type === "ready") {
         azha_meta.ready = !!m.ready;
         azhaSyncLobby(room, ws._roomName);
         azhaMaybeStart(room, ws._roomName);
         return;
       }
-
       if (type === "mission_request") {
         azhaEnsureMission(room);
         return;
       }
-
       if (type === "chat") {
         const text = String(m.text || "").slice(0, 200).trim();
         if (!text) return;
@@ -790,9 +678,7 @@ wss.on("connection", (ws) => {
         azhaBroadcast(room, { type: "chat", from, name, text, ts: Date.now() });
         return;
       }
-
       if (!room.started) return;
-
       if (type === "state") {
         if (m.s && Number.isFinite(m.s.x) && Number.isFinite(m.s.y)) {
           azha_meta.state = { x: Number(m.s.x), y: Number(m.s.y), ang: Number(m.s.ang) };
@@ -802,7 +688,6 @@ wss.on("connection", (ws) => {
         }
         return;
       }
-
       if (type === "m_hit") {
         const eid = m.eid | 0;
         if (!eid) return;
@@ -819,7 +704,6 @@ wss.on("connection", (ws) => {
         azhaMaybeAdvanceMission(room);
         return;
       }
-
       if (type === "m_collect") {
         const eid = m.eid | 0;
         if (!eid) return;
@@ -830,34 +714,27 @@ wss.on("connection", (ws) => {
         azhaMaybeAdvanceMission(room);
         return;
       }
-
       return;
     }
   });
-
   ws.on("close", () => {
     try { prisonDetach(ws, true); } catch {}
     detachFromCurrentRoom();
   });
 });
 
-// ------------------------------------------------------------
+// ----------------------------------------
 // AZHA fixed-rate net sync & enemy AI tick
-// (runs ONLY for AZHA rooms)
-// ------------------------------------------------------------
+// ----------------------------------------
 const TICK_MS = 50;   // 20 Hz
 const ENEMY_MS = 100; // 10 Hz
 let _accEnemy = 0;
-
 setInterval(() => {
   for (const room of rooms.values()) {
     if (!room || room.game !== "AZHA") continue;
     if (!room.started) continue;
-
     const metas = [...room.clients.entries()];
     if (metas.length === 0) continue;
-
-    // relay player states at fixed rate (only when dirty)
     for (const [wsA, metaA] of metas) {
       if (!metaA || !metaA.state || !metaA._dirty) continue;
       metaA._dirty = false;
@@ -867,54 +744,40 @@ setInterval(() => {
         try { if (wsB && wsB.readyState === 1) wsB.send(data); } catch {}
       }
     }
-
-    // enemy sim
     _accEnemy += TICK_MS;
     if (_accEnemy >= ENEMY_MS) {
       _accEnemy = 0;
-
       if (room.mission && room.mission.phase === "destroy" && Array.isArray(room.mission.entities) && room.mission.entities.length) {
         const players = metas
           .map(([, m]) => (m && m.state) ? { x: m.state.x, y: m.state.y } : null)
           .filter(Boolean);
-
         if (players.length) {
           let moved = null;
-
           for (const e of room.mission.entities) {
             if (!e || e.type !== "enemy") continue;
             const ex = e.x, ey = e.y;
-
-            // nearest player
             let best = players[0], bestD2 = 1e9;
             for (const p of players) {
               const dx = p.x - ex, dy = p.y - ey;
               const d2 = dx * dx + dy * dy;
               if (d2 < bestD2) { bestD2 = d2; best = p; }
             }
-
             const hp = (e.hp | 0) || 2;
             const flee = hp <= 1 && bestD2 < 9.0;
             const speed = flee ? 0.020 : 0.028;
-
             let vx = best.x - ex, vy = best.y - ey;
             const mag = Math.hypot(vx, vy) || 1;
             vx /= mag; vy /= mag;
             if (flee) { vx = -vx; vy = -vy; }
-
             let nx = ex + vx * speed;
             let ny = ey + vy * speed;
-
-            // wall collision (slide)
             if (azhaIsWall(room, nx, ny)) {
               if (!azhaIsWall(room, nx, ey)) { ny = ey; }
               else if (!azhaIsWall(room, ex, ny)) { nx = ex; }
               else { nx = ex; ny = ey; }
             }
-
             nx = clamp(nx, 1.25, (room.mapW || 80) - 2.25);
             ny = clamp(ny, 1.25, (room.mapH || 45) - 2.25);
-
             const dxm = nx - ex, dym = ny - ey;
             if ((dxm * dxm + dym * dym) > 1e-6) {
               e.x = Math.round(nx * 1000) / 1000;
@@ -922,7 +785,6 @@ setInterval(() => {
               (moved || (moved = [])).push({ id: e.id | 0, x: e.x, y: e.y, hp: e.hp | 0 });
             }
           }
-
           if (moved && moved.length) {
             azhaBroadcast(room, { type: "m_update", op: "pos", list: moved });
           }
@@ -932,7 +794,7 @@ setInterval(() => {
   }
 }, TICK_MS);
 
-// ------------------------------------------------------------
+// ------------------------------------------------------
 server.listen(PORT, "0.0.0.0", () => {
   console.log("Merged relay (ECF + AZHA) on port", PORT);
 });
