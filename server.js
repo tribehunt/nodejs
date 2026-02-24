@@ -642,8 +642,8 @@ wss.on("connection", (ws) => {
       }
 
       if (t === "scan") {
-        room.seed = (m.seed ?? room.seed);
-        room.difficulty = (m.difficulty ?? room.difficulty);
+        room.seed = (m.seed != null ? m.seed : room.seed);
+        room.difficulty = (m.difficulty != null ? m.difficulty : room.difficulty);
         room.missionActive = false;
         for (const k of room.ready.keys()) room.ready.set(k, false);
         ecfBroadcast(room, { t: "scan", seed: room.seed, difficulty: room.difficulty });
@@ -715,7 +715,7 @@ wss.on("connection", (ws) => {
       }
 
       if (t === "msg") {
-        const s = (m.s ?? "").toString().slice(0, 240);
+        const s = ((m.s != null ? m.s : "")).toString().slice(0, 240);
         if (s.length) ecfBroadcast(room, { t: "msg", s }, ecf_id);
         return;
       }
