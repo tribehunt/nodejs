@@ -1,4 +1,4 @@
-// merged server.js - supports EldritchCyberFront, Azha & Ethane Sea
+// merged server.js - supports Eldritch Cyber Front, Ethane Sea, Azha & Gun of Agartha
 // One process, one port, isolated rooms by game.
 // by Dedset Media 02/24/2026
 
@@ -918,3 +918,4 @@ setInterval(() => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log("Merged relay (ECF + AZHA) on port", PORT);
 });
+
