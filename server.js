@@ -42,6 +42,137 @@ function nowSeed() {
 // game is "ECF" or "AZHA"
 // ------------------------------------------------------------
 const rooms = new Map();
+// ------------------------------------------------------------
+// ETHANE SEA PRISON protocol (p:...)
+// Simple prefix protocol so it won't collide with JSON-based games.
+// Clients send:  p:{"t":"hello","room":"ethane_prison","id":"P-XXXX","name":"P-XXXX"}
+// Chat send:     p:{"t":"chat","room":"ethane_prison","id":"P-XXXX","name":"P-XXXX","msg":"hello","mid":"..."} 
+// Server sends:  p:{"t":"chat","id":"...","name":"...","msg":"...","mid":"...","ts":...}
+// ------------------------------------------------------------
+const prisonRooms = new Map(); // roomName -> { name, clients:Set<ws> }
+
+function prisonGetRoom(roomName) {
+  const rn = safeRoomId(roomName || "ethane_prison", "ethane_prison");
+  if (!prisonRooms.has(rn)) prisonRooms.set(rn, { name: rn, clients: new Set() });
+  return prisonRooms.get(rn);
+}
+
+function prisonMid() {
+  // short unique-ish message id
+  return (
+    Math.random().toString(16).slice(2, 10) +
+    Date.now().toString(16).slice(-8)
+  ).toUpperCase();
+}
+
+function prisonSend(ws, obj) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  try { ws.send("p:" + JSON.stringify(obj)); } catch {}
+}
+
+function prisonBroadcast(room, obj) {
+  const msg = "p:" + JSON.stringify(obj);
+  for (const ws of room.clients) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try { ws.send(msg); } catch {}
+    }
+  }
+}
+
+function prisonDetach(ws, announce = true) {
+  if (!ws || !ws._prisonRoomName) return;
+  const roomName = ws._prisonRoomName;
+  const room = prisonRooms.get(roomName);
+  if (room) {
+    room.clients.delete(ws);
+    if (announce && ws._prisonName) {
+      prisonBroadcast(room, { t: "sys", msg: `${ws._prisonName} left cellblock.` });
+    }
+    if (room.clients.size === 0) prisonRooms.delete(roomName);
+  }
+  ws._prisonRoomName = null;
+}
+
+function prisonHandle(ws, payloadStr) {
+  let s = "";
+  try { s = String(payloadStr || "").trim(); } catch { s = ""; }
+  if (!s) return;
+
+  let m = null;
+  try { m = JSON.parse(s); } catch { m = null; }
+
+  // If not JSON, treat as raw chat line
+  if (!m || typeof m !== "object") {
+    // require a join first
+    if (!ws._prisonRoomName) {
+      const room = prisonGetRoom("ethane_prison");
+      ws._prisonRoomName = room.name;
+      ws._prisonId = ws._prisonId || ("P-" + prisonMid().slice(0, 8));
+      ws._prisonName = ws._prisonName || ws._prisonId;
+      room.clients.add(ws);
+      prisonSend(ws, { t: "welcome", id: ws._prisonId, room: room.name, name: ws._prisonName });
+      prisonBroadcast(room, { t: "sys", msg: `${ws._prisonName} entered cellblock.` });
+    }
+    const room = prisonRooms.get(ws._prisonRoomName);
+    if (!room) return;
+    const msg = s.slice(0, 240);
+    prisonBroadcast(room, {
+      t: "chat",
+      id: ws._prisonId,
+      name: ws._prisonName,
+      msg,
+      mid: prisonMid(),
+      ts: Date.now()
+    });
+    return;
+  }
+
+  const t = String(m.t || m.type || "").toLowerCase();
+  if (t === "hello" || t === "join") {
+    const room = prisonGetRoom(m.room || "ethane_prison");
+
+    // move rooms if needed
+    if (ws._prisonRoomName && ws._prisonRoomName !== room.name) {
+      prisonDetach(ws, true);
+    }
+
+    ws._prisonRoomName = room.name;
+    ws._prisonId = String(m.id || ws._prisonId || ("P-" + prisonMid().slice(0, 8))).slice(0, 32);
+    ws._prisonName = String(m.name || ws._prisonId).slice(0, 24);
+
+    room.clients.add(ws);
+
+    prisonSend(ws, { t: "welcome", id: ws._prisonId, room: room.name, name: ws._prisonName });
+    prisonBroadcast(room, { t: "sys", msg: `${ws._prisonName} entered cellblock.` });
+    return;
+  }
+
+  if (t === "chat" || t === "msg") {
+    // must be joined
+    if (!ws._prisonRoomName) {
+      prisonHandle(ws, JSON.stringify({ t: "hello", room: m.room || "ethane_prison", id: m.id, name: m.name }));
+    }
+    const room = prisonRooms.get(ws._prisonRoomName);
+    if (!room) return;
+
+    const name = String(m.name || ws._prisonName || ws._prisonId || "PRISONER").slice(0, 24);
+    const id = String(m.id || ws._prisonId || "").slice(0, 32);
+    let msg = String(m.msg || m.message || "");
+    msg = msg.replace(/\r?\n/g, " ").slice(0, 240);
+
+    // Server chooses mid if missing
+    const mid = String(m.mid || prisonMid()).slice(0, 48);
+
+    prisonBroadcast(room, { t: "chat", id, name, msg, mid, ts: Date.now() });
+    return;
+  }
+
+  if (t === "ping") {
+    prisonSend(ws, { t: "pong", ts: Date.now() });
+    return;
+  }
+}
+
 
 function roomKey(game, room) {
   return `${game}:${room}`;
@@ -60,7 +191,7 @@ function getRoom(game, roomName) {
         difficulty: 1,
         missionActive: false
       });
-    } else if (game === "AZHA") {
+    } else {
       rooms.set(key, {
         game: "AZHA",
         name: roomName,
@@ -72,14 +203,6 @@ function getRoom(game, roomName) {
         mapGrid: null,
         mission: { step: 0, phase: "rally", target: { x: 2.5, y: 2.5 }, entities: [], nextId: 1 }
       });
-    } else {
-      // SEA (Ethane Sea) prison chat rooms
-      rooms.set(key, {
-        game: "SEA",
-        name: roomName,
-        clients: new Map(),     // id -> ws
-        metas: new Map()        // id -> {id,name}
-      });
     }
   }
   return rooms.get(key);
@@ -87,8 +210,10 @@ function getRoom(game, roomName) {
 
 function deleteRoomIfEmpty(room) {
   if (!room) return;
-  if (room.clients && room.clients.size === 0) {
-    rooms.delete(roomKey(room.game, room.name));
+  if (room.game === "ECF") {
+    if (room.clients.size === 0) rooms.delete(roomKey("ECF", room.name));
+  } else {
+    if (room.clients.size === 0) rooms.delete(roomKey("AZHA", room.name));
   }
 }
 
@@ -136,51 +261,6 @@ function azhaLobbyState(room) {
 function azhaSyncLobby(room, roomId) {
   azhaBroadcast(room, { type: "lobby", room: roomId, users: azhaLobbyState(room), started: room.started });
 }
-
-// ------------------------------------------------------------
-// SEA (Ethane Sea) prison chat protocol (p:...)
-// ------------------------------------------------------------
-function seaSanitizeId(s, fallback) {
-  s = (s ?? "").toString().trim();
-  s = s.replace(/[^a-zA-Z0-9_-]/g, "");
-  s = s.slice(0, 32);
-  return s || fallback;
-}
-
-function seaSanitizeName(s, fallback) {
-  s = (s ?? "").toString().trim();
-  s = s.replace(/[\r\n\t]/g, " ");
-  s = s.replace(/\s+/g, " ").slice(0, 24);
-  return s || fallback;
-}
-
-function seaSanitizeMsg(s) {
-  s = (s ?? "").toString();
-  s = s.replace(/\r/g, "");
-  s = s.replace(/\n/g, " ").replace(/\t/g, " ");
-  s = s.replace(/\s+/g, " ").trim();
-  return s.slice(0, 240);
-}
-
-function seaBroadcast(room, obj, exceptId = null) {
-  const data = JSON.stringify(obj);
-  for (const [id, ws] of room.clients) {
-    if (exceptId && id === exceptId) continue;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try { ws.send(data); } catch {}
-    }
-  }
-}
-
-function seaRoster(room) {
-  const users = [];
-  for (const [id, meta] of room.metas.entries()) {
-    users.push({ id, name: meta && meta.name ? meta.name : id });
-  }
-  users.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
-  return users;
-}
-
 
 function rndInt(min, max) {
   min = Math.floor(min);
@@ -441,10 +521,9 @@ function azhaMaybeStart(room, roomId) {
 // ------------------------------------------------------------
 wss.on("connection", (ws) => {
   // protocol is unknown until first valid message
-  ws._proto = null; // "ECF" | "AZHA" | "SEA"
+  ws._proto = null; // "ECF" | "AZHA"
   ws._ecf_id = null;
-  ws._sea_id = null;
-  ws._roomGame = null; // "ECF"|"AZHA"|"SEA"
+  ws._roomGame = null; // "ECF"|"AZHA"
   ws._roomName = null;
 
   // ECF defaults
@@ -460,11 +539,6 @@ wss.on("connection", (ws) => {
     state: null
   };
 
-  // SEA defaults (Ethane Sea prison chat)
-  let sea_id = rid();
-  let sea_roomName = "cellblock";
-  let sea_name = "";
-
   function detachFromCurrentRoom() {
     if (!ws._roomGame || !ws._roomName) return;
 
@@ -474,7 +548,7 @@ wss.on("connection", (ws) => {
       room.ready.delete(ecf_id);
       ecfBroadcast(room, { t: "leave", id: ecf_id });
       deleteRoomIfEmpty(room);
-    } else if (ws._roomGame === "AZHA") {
+    } else {
       const room = getRoom("AZHA", ws._roomName);
       room.clients.delete(ws);
       room.started = false;
@@ -482,12 +556,6 @@ wss.on("connection", (ws) => {
       room.mapGrid = null;
       room.mission = { step: 0, phase: "rally", target: { x: 2.5, y: 2.5 }, entities: [], nextId: 1 };
       azhaSyncLobby(room, ws._roomName);
-      deleteRoomIfEmpty(room);
-    } else if (ws._roomGame === "SEA") {
-      const room = getRoom("SEA", ws._roomName);
-      if (sea_id && room.clients.get(sea_id) === ws) room.clients.delete(sea_id);
-      if (room.metas) room.metas.delete(sea_id);
-      if (sea_id) seaBroadcast(room, { p: "sys", msg: `${sea_name || sea_id} left cellblock.` });
       deleteRoomIfEmpty(room);
     }
 
@@ -504,14 +572,9 @@ wss.on("connection", (ws) => {
       room.clients.set(ecf_id, ws);
       if (!room.ready.has(ecf_id)) room.ready.set(ecf_id, false);
       return room;
-    } else if (game === "AZHA") {
+    } else {
       const room = getRoom("AZHA", roomName);
       room.clients.set(ws, azha_meta);
-      return room;
-    } else {
-      const room = getRoom("SEA", roomName);
-      room.clients.set(sea_id, ws);
-      if (room.metas) room.metas.set(sea_id, { id: sea_id, name: sea_name || sea_id });
       return room;
     }
   }
@@ -521,74 +584,24 @@ wss.on("connection", (ws) => {
   // We send nothing until we see a message. (ECF client typically sends "hello" right away)
 
   ws.on("message", (buf) => {
+    let raw = "";
+    try { raw = buf.toString("utf8"); } catch { raw = ""; }
+
+    // ETHANE SEA prison protocol: p:... (handled before JSON parse)
+    if (raw && raw.startsWith("p:")) {
+      try { prisonHandle(ws, raw.slice(2)); } catch {}
+      return;
+    }
+
     let m;
-    try { m = JSON.parse(buf.toString("utf8")); } catch { return; }
+    try { m = JSON.parse(raw); } catch { return; }
     if (!m) return;
 
     // Detect protocol once
     if (!ws._proto) {
       if (m.t) ws._proto = "ECF";
       else if (m.type) ws._proto = "AZHA";
-      else if (m.p) ws._proto = "SEA";
       else return;
-    }
-
-
-    // --------------------------------------------------------
-    // SEA handling (p:...)  [Ethane Sea prison chat]
-    // --------------------------------------------------------
-    if (ws._proto === "SEA") {
-      const p = String(m.p || "").toLowerCase();
-
-      if (p === "hello") {
-        const nextRoomId = safeRoomId(m.room || "cellblock", "cellblock");
-        const nextId = seaSanitizeId(m.id, rid());
-        const nextName = seaSanitizeName(m.name, nextId);
-
-        // move rooms
-        detachFromCurrentRoom();
-        sea_id = nextId;
-        sea_name = nextName;
-        sea_roomName = nextRoomId;
-
-        ws._roomGame = "SEA";
-        ws._roomName = nextRoomId;
-        ws._sea_id = sea_id;
-
-        const room = attachToRoom("SEA", nextRoomId);
-
-        try { ws.send(JSON.stringify({ p: "welcome", id: sea_id, room: nextRoomId, name: sea_name })); } catch {}
-        try { seaBroadcast(room, { p: "sys", msg: `${sea_name} entered cellblock.` }, sea_id); } catch {}
-        try { seaBroadcast(room, { p: "roster", room: nextRoomId, users: seaRoster(room) }); } catch {}
-        return;
-      }
-
-      // allow chat without explicit hello: join default
-      if (!ws._roomGame) {
-        ws._roomGame = "SEA";
-        ws._roomName = sea_roomName;
-        ws._sea_id = sea_id;
-        const room = attachToRoom("SEA", sea_roomName);
-        try { ws.send(JSON.stringify({ p: "welcome", id: sea_id, room: sea_roomName, name: sea_name || sea_id })); } catch {}
-        try { ws.send(JSON.stringify({ p: "roster", room: sea_roomName, users: seaRoster(room) })); } catch {}
-      }
-
-      const room = getRoom("SEA", ws._roomName);
-      if (room.game !== "SEA") return;
-
-      if (p === "chat") {
-        const msg = seaSanitizeMsg(m.msg);
-        if (!msg) return;
-        seaBroadcast(room, { p: "chat", id: sea_id, name: sea_name || sea_id, msg, ts: Date.now() });
-        return;
-      }
-
-      if (p === "ping") {
-        try { ws.send(JSON.stringify({ p: "pong", ts: Date.now() })); } catch {}
-        return;
-      }
-
-      return;
     }
 
     // --------------------------------------------------------
@@ -823,6 +836,7 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
+    try { prisonDetach(ws, true); } catch {}
     detachFromCurrentRoom();
   });
 });
