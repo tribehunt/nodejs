@@ -1,4 +1,4 @@
-// merged server.js - supports EldritchCyberFront, Azha, Ethane Sea & Gun of Agartha
+// merged server.js - supports EldritchCyberFront, Azha & Ethane Sea
 // One process, one port, isolated rooms by game.
 // by Dedset Media 02/24/2026
 
@@ -246,9 +246,7 @@ function agarthaHandle(ws, payloadStr) {
     const name = String(m.name || ws._agarthaName || ws._agarthaId || "PILOT").slice(0, 24);
     const id = String(m.id || ws._agarthaId || "").slice(0, 32);
     let msg = String(m.msg || m.message || "");
-    msg = msg.replace(/
-?
-/g, " ").slice(0, 240);
+    msg = msg.replace(/\r?\n/g, " ").slice(0, 240);
     const mid = String(m.mid || agarthaMid()).slice(0, 48);
     agarthaBroadcast(room, { t: "chat", id, name, msg, mid, ts: Date.now() });
     return;
@@ -841,7 +839,6 @@ let m;
   });
   ws.on("close", () => {
     try { prisonDetach(ws, true); } catch {}
-    try { agarthaDetach(ws, true); } catch {}
     detachFromCurrentRoom();
   });
 });
