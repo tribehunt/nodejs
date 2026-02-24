@@ -1,4 +1,4 @@
-// merged server.js - supports EldritchCyberFront, Azha & Ethane Sea
+// merged server.js - supports EldritchCyberFront, Azha, Ethane Sea & Gun of Agartha
 // One process, one port, isolated rooms by game.
 // by Dedset Media 02/24/2026
 
@@ -144,6 +144,122 @@ function prisonHandle(ws, payloadStr) {
     return;
   }
 }
+// ------------------------------------------------------------------------------------------------------------
+// GUN OF AGARTHA CHAT protocol (g:...)
+// Prefix protocol so it won't collide with JSON-based games.
+// Clients send:  g:{"t":"hello","room":"agartha","id":"G-XXXX","name":"G-XXXX"}
+// Chat send:     g:{"t":"chat","room":"agartha","id":"G-XXXX","name":"G-XXXX","msg":"hello","mid":"..."} 
+// Server sends:  g:{"t":"chat","id":"...","name":"...","msg":"...","mid":"...","ts":...}
+// ------------------------------------------------------------------------------------------------------------
+const agarthaRooms = new Map(); // roomName -> { name, clients:Set<ws> }
+function agarthaGetRoom(roomName) {
+  const rn = safeRoomId(roomName || "agartha", "agartha");
+  if (!agarthaRooms.has(rn)) agarthaRooms.set(rn, { name: rn, clients: new Set() });
+  return agarthaRooms.get(rn);
+}
+function agarthaMid() {
+  return (
+    Math.random().toString(16).slice(2, 10) +
+    Date.now().toString(16).slice(-8)
+  ).toUpperCase();
+}
+function agarthaSend(ws, obj) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  try { ws.send("g:" + JSON.stringify(obj)); } catch {}
+}
+function agarthaBroadcast(room, obj) {
+  const msg = "g:" + JSON.stringify(obj);
+  for (const ws of room.clients) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try { ws.send(msg); } catch {}
+    }
+  }
+}
+function agarthaDetach(ws, announce = true) {
+  if (!ws || !ws._agarthaRoomName) return;
+  const roomName = ws._agarthaRoomName;
+  const room = agarthaRooms.get(roomName);
+  if (room) {
+    room.clients.delete(ws);
+    if (announce && ws._agarthaName) {
+      agarthaBroadcast(room, { t: "sys", msg: `${ws._agarthaName} left void.` });
+    }
+    if (room.clients.size === 0) agarthaRooms.delete(roomName);
+  }
+  ws._agarthaRoomName = null;
+}
+function agarthaHandle(ws, payloadStr) {
+  let s = "";
+  try { s = String(payloadStr || "").trim(); } catch { s = ""; }
+  if (!s) return;
+
+  // Accept either JSON or plaintext (plaintext becomes chat)
+  let m = null;
+  try { m = JSON.parse(s); } catch { m = null; }
+
+  if (!m || typeof m !== "object") {
+    // plaintext chat auto-joins default room
+    if (!ws._agarthaRoomName) {
+      const room = agarthaGetRoom("agartha");
+      ws._agarthaRoomName = room.name;
+      ws._agarthaId = ws._agarthaId || ("G-" + agarthaMid().slice(0, 8));
+      ws._agarthaName = ws._agarthaName || ws._agarthaId;
+      room.clients.add(ws);
+      agarthaSend(ws, { t: "welcome", id: ws._agarthaId, room: room.name, name: ws._agarthaName });
+      agarthaBroadcast(room, { t: "sys", msg: `${ws._agarthaName} entered void.` });
+    }
+    const room = agarthaRooms.get(ws._agarthaRoomName);
+    if (!room) return;
+    const msg = s.slice(0, 240);
+    agarthaBroadcast(room, {
+      t: "chat",
+      id: ws._agarthaId,
+      name: ws._agarthaName,
+      msg,
+      mid: agarthaMid(),
+      ts: Date.now()
+    });
+    return;
+  }
+
+  const t = String(m.t || m.type || "").toLowerCase();
+  if (t === "hello" || t === "join") {
+    const room = agarthaGetRoom(m.room || "agartha");
+    if (ws._agarthaRoomName && ws._agarthaRoomName !== room.name) {
+      agarthaDetach(ws, true);
+    }
+    ws._agarthaRoomName = room.name;
+    ws._agarthaId = String(m.id || ws._agarthaId || ("G-" + agarthaMid().slice(0, 8))).slice(0, 32);
+    ws._agarthaName = String(m.name || ws._agarthaId).slice(0, 24);
+    room.clients.add(ws);
+    agarthaSend(ws, { t: "welcome", id: ws._agarthaId, room: room.name, name: ws._agarthaName });
+    agarthaBroadcast(room, { t: "sys", msg: `${ws._agarthaName} entered void.` });
+    return;
+  }
+
+  if (t === "chat" || t === "msg") {
+    if (!ws._agarthaRoomName) {
+      agarthaHandle(ws, JSON.stringify({ t: "hello", room: m.room || "agartha", id: m.id, name: m.name }));
+    }
+    const room = agarthaRooms.get(ws._agarthaRoomName);
+    if (!room) return;
+    const name = String(m.name || ws._agarthaName || ws._agarthaId || "PILOT").slice(0, 24);
+    const id = String(m.id || ws._agarthaId || "").slice(0, 32);
+    let msg = String(m.msg || m.message || "");
+    msg = msg.replace(/
+?
+/g, " ").slice(0, 240);
+    const mid = String(m.mid || agarthaMid()).slice(0, 48);
+    agarthaBroadcast(room, { t: "chat", id, name, msg, mid, ts: Date.now() });
+    return;
+  }
+
+  if (t === "ping") {
+    agarthaSend(ws, { t: "pong", ts: Date.now() });
+    return;
+  }
+}
+
 function roomKey(game, room) {
   return `${game}:${room}`;
 }
@@ -517,7 +633,13 @@ wss.on("connection", (ws) => {
       try { prisonHandle(ws, raw.slice(2)); } catch {}
       return;
     }
-    let m;
+    
+    // GUN OF AGARTHA chat protocol:
+    if (raw && raw.startsWith("g:")) {
+      try { agarthaHandle(ws, raw.slice(2)); } catch {}
+      return;
+    }
+let m;
     try { m = JSON.parse(raw); } catch { return; }
     if (!m) return;
     if (!ws._proto) {
@@ -719,6 +841,7 @@ wss.on("connection", (ws) => {
   });
   ws.on("close", () => {
     try { prisonDetach(ws, true); } catch {}
+    try { agarthaDetach(ws, true); } catch {}
     detachFromCurrentRoom();
   });
 });
