@@ -25,18 +25,40 @@ function normNameKey(s) {
     return "";
   }
 }
+function _cleanIP(raw) {
+  try {
+    let ip = String(raw || "").trim();
+    if (!ip) return "";
+    if (ip.startsWith("::ffff:")) ip = ip.slice(7);
+    // strip IPv4:port
+    const m = ip.match(/^(\d{1,3}(?:\.\d{1,3}){3})(?::\d{1,5})?$/);
+    if (m) return m[1];
+    return ip;
+  } catch {
+    return "";
+  }
+}
 function pickIP(req) {
   try {
-    const xf = req && req.headers ? req.headers["x-forwarded-for"] : null;
-    let ip = "";
-    if (typeof xf === "string" && xf.trim()) {
-      ip = xf.split(",")[0].trim();
+    const h = (req && req.headers) ? req.headers : {};
+    const cands = [];
+    const push = (v) => {
+      if (!v) return;
+      if (Array.isArray(v)) { for (const x of v) push(x); return; }
+      cands.push(String(v));
+    };
+    push(h["cf-connecting-ip"]);
+    push(h["x-real-ip"]);
+    push(h["x-forwarded-for"]);
+    for (const raw of cands) {
+      const parts = String(raw || "").split(",").map(s => s.trim()).filter(Boolean);
+      for (const p of parts) {
+        const ip = _cleanIP(p);
+        if (ip && ip !== "::1") return ip;
+      }
     }
-    if (!ip) {
-      ip = (req && req.socket && req.socket.remoteAddress) ? String(req.socket.remoteAddress) : "";
-    }
-    if (ip.startsWith("::ffff:")) ip = ip.slice(7);
-    return ip || "";
+    const ra = (req && req.socket && req.socket.remoteAddress) ? String(req.socket.remoteAddress) : "";
+    return _cleanIP(ra) || "";
   } catch {
     return "";
   }
@@ -78,13 +100,107 @@ function isValidIPv4(ip) {
   }
   return true;
 }
-function decodeSkeletonKey(b64) {
+function decodeSkeletonKey(body) {
   try {
-    const ip = Buffer.from(String(b64 || "").trim(), "base64").toString("utf8").trim();
+    const raw = String(body || "");
+    const tokMatch = raw.match(/[A-Za-z0-9+/=]{8,}/);
+    const tok = tokMatch ? tokMatch[0].trim() : "";
+    if (!tok) return "";
+    const ip = Buffer.from(tok, "base64").toString("utf8").trim();
     return isValidIPv4(ip) ? ip : "";
   } catch {
     return "";
   }
+}
+function _httpsGetFollow(url, redirectsLeft, cb) {
+  try {
+    https.get(url, (res) => {
+      const sc = Number(res.statusCode || 0);
+      const loc = res.headers ? res.headers.location : null;
+      if (sc >= 300 && sc < 400 && loc && redirectsLeft > 0) {
+        const next = String(loc);
+        try { res.resume(); } catch {}
+        _httpsGetFollow(next, redirectsLeft - 1, cb);
+        return;
+      }
+      let data = "";
+      res.on("data", (c) => { data += c; });
+      res.on("end", () => cb(null, data));
+    }).on("error", (e) => cb(e, ""));
+  } catch (e) {
+    cb(e, "");
+  }
+}
+function _sendReservedNameError(ws, proto, desired) {
+  try {
+    if (proto === "agartha") agarthaSend(ws, { t: "error", code: "reserved_name", message: `Name "${desired}" is reserved.` });
+    else if (proto === "prison") prisonSend(ws, { t: "error", code: "reserved_name", message: `Name "${desired}" is reserved.` });
+    else {
+      try { ws.send(JSON.stringify({ type: "error", message: `Name "${desired}" is reserved.` })); } catch {}
+    }
+  } catch {}
+}
+function _tryApplyPendingReserved(ws) {
+  try {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const pr = ws._pending_reserved;
+    if (!pr) return;
+    const desired = String(pr.desired || "").slice(0, 24);
+    const proto = String(pr.proto || "");
+    const started = Number(pr.at || 0);
+    if (!skeletonIP) {
+      if (Date.now() - started < 2500) {
+        ws._pending_reserved_timer = setTimeout(() => _tryApplyPendingReserved(ws), 250);
+        return;
+      }
+      _sendReservedNameError(ws, proto, desired);
+      ws._pending_reserved = null;
+      ws._pending_reserved_timer = null;
+      return;
+    }
+    const ip = ws && ws._ip ? String(ws._ip) : "";
+    if (!isSkeletonAuthorized(ip)) {
+      _sendReservedNameError(ws, proto, desired);
+      ws._pending_reserved = null;
+      ws._pending_reserved_timer = null;
+      return;
+    }
+    if (proto === "agartha") {
+      const room = ws._agarthaRoomName ? agarthaRooms.get(ws._agarthaRoomName) : null;
+      if (room) {
+        const old = String(ws._agarthaName || "");
+        if (room.nameMap && old) {
+          const ok = normNameKey(old);
+          if (ok && room.nameMap.get(ok) === ws) room.nameMap.delete(ok);
+        }
+        const newName = agarthaMakeUniqueName(room, desired, ws._agarthaId);
+        ws._agarthaName = newName;
+        if (room.nameMap) room.nameMap.set(normNameKey(newName), ws);
+        agarthaSend(ws, { t: "welcome", id: ws._agarthaId, room: room.name, name: newName });
+        if (old && normNameKey(old) !== normNameKey(newName)) {
+          agarthaBroadcast(room, { t: "sys", msg: `${old} is now ${newName}.` });
+        }
+      }
+    } else if (proto === "prison") {
+      const room = ws._prisonRoomName ? prisonRooms.get(ws._prisonRoomName) : null;
+      if (room) {
+        const old = String(ws._prisonName || "");
+        if (room.nameMap && old) {
+          const ok = normNameKey(old);
+          if (ok && room.nameMap.get(ok) === ws) room.nameMap.delete(ok);
+        }
+        const newName = prisonMakeUniqueName(room, desired, ws._prisonId);
+        ws._prisonName = newName;
+        if (room.nameMap) room.nameMap.set(normNameKey(newName), ws);
+        prisonSend(ws, { t: "welcome", id: ws._prisonId, room: room.name, name: newName });
+        if (old && normNameKey(old) !== normNameKey(newName)) {
+          prisonBroadcast(room, { t: "sys", msg: `${old} is now ${newName}.` });
+        }
+      }
+    }
+    ws._pending_reserved = null;
+    ws._pending_reserved_timer = null;
+  } catch {}
 }
 function fetchSkeletonIP() {
   if (skeletonFetchInFlight) return;
@@ -92,22 +208,23 @@ function fetchSkeletonIP() {
   if (now - (skeletonLastAttemptAt || 0) < 5000) return;
   skeletonFetchInFlight = true;
   skeletonLastAttemptAt = now;
-  try {
-    https.get(SKELETON_URL, (res) => {
-      let data = "";
-      res.on("data", (c) => { data += c; });
-      res.on("end", () => {
-        const ip = decodeSkeletonKey(data);
-        if (ip) {
-          skeletonIP = ip;
-          skeletonFetchedAt = Date.now();
-        }
-        skeletonFetchInFlight = false;
-      });
-    }).on("error", () => { skeletonFetchInFlight = false; });
-  } catch {
+  _httpsGetFollow(SKELETON_URL, 3, (err, body) => {
+    try {
+      const ip = err ? "" : decodeSkeletonKey(body);
+      if (ip) {
+        skeletonIP = ip;
+        skeletonFetchedAt = Date.now();
+      }
+    } catch {}
     skeletonFetchInFlight = false;
-  }
+    try {
+      if (wss && wss.clients) {
+        for (const c of wss.clients) {
+          if (c && c._pending_reserved) _tryApplyPendingReserved(c);
+        }
+      }
+    } catch {}
+  });
 }
 fetchSkeletonIP();
 try {
@@ -136,25 +253,25 @@ function enforceReservedName(ws, desired, currentName, fallbackId, proto) {
   if (isSkeletonAuthorized(ip)) {
     return { name: desired, blocked: false, reservedKey };
   }
-  const cur = String(currentName || "").slice(0, 24);
-  if (cur && !isReservedName(cur)) {
+  if (!skeletonIP) {
     try {
-      if (proto === "agartha") agarthaSend(ws, { t: "error", code: "reserved_name", message: `Name "${desired}" is reserved.` });
-      else if (proto === "prison") prisonSend(ws, { t: "error", code: "reserved_name", message: `Name "${desired}" is reserved.` });
-      else {
-        try { ws.send(JSON.stringify({ type: "error", message: `Name "${desired}" is reserved.` })); } catch {}
+      if (ws && !ws._pending_reserved) {
+        ws._pending_reserved = { desired: String(desired || "").slice(0, 24), proto: String(proto || ""), at: Date.now() };
+        ws._pending_reserved_timer = setTimeout(() => _tryApplyPendingReserved(ws), 250);
       }
     } catch {}
+    const cur = String(currentName || "").slice(0, 24);
+    if (cur && !isReservedName(cur)) return { name: cur, blocked: true, reservedKey };
+    const fb = String(fallbackId || "USER").slice(0, 24);
+    return { name: fb, blocked: true, reservedKey };
+  }
+  const cur = String(currentName || "").slice(0, 24);
+  if (cur && !isReservedName(cur)) {
+    _sendReservedNameError(ws, proto, desired);
     return { name: cur, blocked: true, reservedKey };
   }
   const fb = String(fallbackId || "USER").slice(0, 24);
-  try {
-    if (proto === "agartha") agarthaSend(ws, { t: "error", code: "reserved_name", message: `Name "${desired}" is reserved.` });
-    else if (proto === "prison") prisonSend(ws, { t: "error", code: "reserved_name", message: `Name "${desired}" is reserved.` });
-    else {
-      try { ws.send(JSON.stringify({ type: "error", message: `Name "${desired}" is reserved.` })); } catch {}
-    }
-  } catch {}
+  _sendReservedNameError(ws, proto, desired);
   return { name: fb, blocked: true, reservedKey };
 }
 
@@ -327,13 +444,13 @@ function prisonHandle(ws, payloadStr) {
   }
 }
 
-// ------------------------------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------------------------------------
 // GUN OF AGARTHA CHAT protocol (g:...)
 // Prefix protocol so it won't collide with JSON-based games.
 // Clients send:  g:{"t":"hello","room":"agartha","id":"G-XXXX","name":"G-XXXX"}
 // Chat send:     g:{"t":"chat","room":"agartha","id":"G-XXXX","name":"G-XXXX","msg":"hello","mid":"..."} 
 // Server sends:  g:{"t":"chat","id":"...","name":"...","msg":"...","mid":"...","ts":...}
-// ------------------------------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------------------------------------
 const agarthaRooms = new Map(); // roomName -> { name, clients:Set<ws> }
 function agarthaGetRoom(roomName) {
   const rn = safeRoomId(roomName || "agartha", "agartha");
@@ -847,6 +964,7 @@ wss.on("connection", (ws, req) => {
     ws._roomName = roomName;
     if (game === "ECF") {
       const room = getRoom("ECF", roomName);
+      // one session per IP per room
       if (ws._ip) {
         for (const [oid, ows] of room.clients) {
           if (!ows || ows === ws) continue;
@@ -863,6 +981,7 @@ wss.on("connection", (ws, req) => {
       return room;
     } else {
       const room = getRoom("AZHA", roomName);
+      // one session per IP per room
       if (ws._ip) {
         for (const [ows] of room.clients) {
           if (!ows || ows === ws) continue;
@@ -1027,6 +1146,7 @@ let m;
         ws._roomName = nextRoomId;
         room = attachToRoom("AZHA", nextRoomId);
         azha_meta.id = String(m.id || azha_meta.id).slice(0, 32);
+        // enforce per-room unique name (case-insensitive)
         let desired = String(m.name || "").replace(/\s+/g, " ").trim().slice(0, 24);
         const _aEnf = enforceReservedName(ws, desired, azha_meta.name, azha_meta.id, "azha");
         desired = _aEnf.name;
