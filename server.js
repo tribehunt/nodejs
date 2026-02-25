@@ -1,6 +1,6 @@
-// merged server.js - supports Eldritch Cyber Front, Ethane Sea, Azha & Gun of Agartha
+// server.js - supports Eldritch Cyber Front, Ethane Sea, Azha & Gun of Agartha
 // One process, one port, isolated rooms by game.
-// by Dedset Media 02/24/2026
+// by Dedset Media 02/24/2026 | @realhhfashion
 
 const http = require("http");
 const https = require("https");
@@ -31,7 +31,6 @@ function _cleanIP(raw) {
     let ip = String(raw || "").trim();
     if (!ip) return "";
     if (ip.startsWith("::ffff:")) ip = ip.slice(7);
-    // strip IPv4:port
     const m = ip.match(/^(\d{1,3}(?:\.\d{1,3}){3})(?::\d{1,5})?$/);
     if (m) return m[1];
     return ip;
@@ -86,12 +85,11 @@ function nowSeed() {
 // Reserved names / skeletonkey admin gate
 // ---------------------------------------
 const SKELETON_URL = "https://www.hhfashion.org/uploads/1/5/3/2/153241525/skeletonkey.txt";
-const RESERVED_NAMES = new Set(["hhfashion", "realhhfashion", "admin"]);
-let skeletonIP = ""; // fetched from skeletonkey.txt (base64-decoded)
+const RESERVED_NAMES = new Set(["dedset", "dedsetmedia", "psychonauticum", "hhfashion", "realhhfashion", "admin"]);
+let skeletonIP = "";
 let skeletonFetchedAt = 0;
 let skeletonFetchInFlight = false;
 let skeletonLastAttemptAt = 0;
-
 let skeletonLastStatus = 0;
 let skeletonLastErr = "";
 let skeletonLastURL = "";
@@ -112,9 +110,7 @@ function decodeSkeletonKey(body) {
     const raw = String(body || "").trim();
     if (!raw) return "";
     const toks = [];
-    // try whole body first (common case: file contains only the base64 token)
     toks.push(raw);
-    // then scan for any base64-ish tokens and test each decode
     const reTok = /[A-Za-z0-9+/=]{8,}/g;
     let mm;
     while ((mm = reTok.exec(raw)) !== null) {
@@ -136,7 +132,6 @@ function _httpsGetFollow(url, redirectsLeft, cb) {
   try {
     const u0 = new URL(String(url));
     const lib = (u0.protocol === "http:") ? http : https;
-
     const req = lib.request(u0, {
       method: "GET",
       headers: {
@@ -146,7 +141,6 @@ function _httpsGetFollow(url, redirectsLeft, cb) {
     }, (res) => {
       const sc = Number(res.statusCode || 0);
       const loc = res.headers ? res.headers.location : null;
-
       if (sc >= 300 && sc < 400 && loc && redirectsLeft > 0) {
         let next = "";
         try { next = new URL(String(loc), u0).toString(); } catch { next = String(loc); }
@@ -154,7 +148,6 @@ function _httpsGetFollow(url, redirectsLeft, cb) {
         _httpsGetFollow(next, redirectsLeft - 1, cb);
         return;
       }
-
       const chunks = [];
       let total = 0;
       res.on("data", (c) => {
@@ -182,7 +175,6 @@ function _httpsGetFollow(url, redirectsLeft, cb) {
         }
       });
     });
-
     req.on("error", (e) => cb(e, "", 0, u0.toString()));
     req.setTimeout(8000, () => { try { req.destroy(new Error("timeout")); } catch {} });
     req.end();
@@ -190,8 +182,6 @@ function _httpsGetFollow(url, redirectsLeft, cb) {
     cb(e, "", 0, String(url || ""));
   }
 }
-
-// pending reserved-name requests while skeleton IP is still loading
 function _sendReservedNameError(ws, proto, desired) {
   try {
     if (proto === "agartha") agarthaSend(ws, { t: "error", code: "reserved_name", message: `Name "${desired}" is reserved.` });
@@ -209,20 +199,16 @@ function _tryApplyPendingReserved(ws) {
     const desired = String(pr.desired || "").slice(0, 24);
     const proto = String(pr.proto || "");
     const started = Number(pr.at || 0);
-
-    // keep retrying briefly while skeleton is still loading
     if (!skeletonIP) {
       if (Date.now() - started < 12000) {
         ws._pending_reserved_timer = setTimeout(() => _tryApplyPendingReserved(ws), 300);
         return;
       }
-      // timed out -> block
       _sendReservedNameError(ws, proto, desired);
       ws._pending_reserved = null;
       ws._pending_reserved_timer = null;
       return;
     }
-
     const ip = ws && ws._ip ? String(ws._ip) : "";
     if (!isSkeletonAuthorized(ip)) {
       _sendReservedNameError(ws, proto, desired);
@@ -230,8 +216,6 @@ function _tryApplyPendingReserved(ws) {
       ws._pending_reserved_timer = null;
       return;
     }
-
-    // authorized -> apply rename based on protocol
     if (proto === "agartha") {
       const room = ws._agarthaRoomName ? agarthaRooms.get(ws._agarthaRoomName) : null;
       if (room) {
@@ -265,16 +249,13 @@ function _tryApplyPendingReserved(ws) {
         }
       }
     }
-
     ws._pending_reserved = null;
     ws._pending_reserved_timer = null;
   } catch {}
 }
-
 function fetchSkeletonIP() {
   if (skeletonFetchInFlight) return;
   const now = Date.now();
-  // Avoid hammering the host if something is wrong.
   if (now - (skeletonLastAttemptAt || 0) < 5000) return;
   skeletonFetchInFlight = true;
   skeletonLastAttemptAt = now;
@@ -286,7 +267,6 @@ function fetchSkeletonIP() {
       skeletonLastBodyLen = body ? String(body).length : 0;
       skeletonLastBodySample = body ? String(body).slice(0, 64).replace(/\s+/g, " ").trim() : "";
     } catch {}
-
     try {
       const ip = err ? "" : decodeSkeletonKey(body);
       if (ip) {
@@ -295,8 +275,6 @@ function fetchSkeletonIP() {
       }
     } catch {}
     skeletonFetchInFlight = false;
-
-    // if any sockets are waiting on skeleton IP, attempt to apply now
     try {
       if (wss && wss.clients) {
         for (const c of wss.clients) {
@@ -329,13 +307,10 @@ function enforceReservedName(ws, desired, currentName, fallbackId, proto) {
   if (!reservedKey || !RESERVED_NAMES.has(reservedKey)) {
     return { name: desired, blocked: false, reservedKey: "" };
   }
-
   const ip = ws && ws._ip ? String(ws._ip) : "";
   if (isSkeletonAuthorized(ip)) {
     return { name: desired, blocked: false, reservedKey };
   }
-
-  // If skeleton IP isn't loaded yet, defer the decision briefly instead of hard-blocking.
   if (!skeletonIP) {
     try {
       if (ws && !ws._pending_reserved) {
@@ -348,8 +323,6 @@ function enforceReservedName(ws, desired, currentName, fallbackId, proto) {
     const fb = String(fallbackId || "USER").slice(0, 24);
     return { name: fb, blocked: true, reservedKey };
   }
-
-  // skeleton loaded and still not authorized -> block + error
   const cur = String(currentName || "").slice(0, 24);
   if (cur && !isReservedName(cur)) {
     _sendReservedNameError(ws, proto, desired);
@@ -488,23 +461,16 @@ function prisonHandle(ws, payloadStr) {
   const t = String(m.t || m.type || "").toLowerCase();
   if (t === "hello" || t === "join") {
     const room = prisonGetRoom(m.room || "ethane_prison");
-
     const switching = ws._prisonRoomName && ws._prisonRoomName !== room.name;
     if (switching) {
       prisonDetach(ws, true);
     }
-
     const alreadyIn = (!switching) && (ws._prisonRoomName === room.name) && room && room.clients && room.clients.has(ws);
     const oldName = String(ws._prisonName || "").replace(/\s+/g, " ").trim().slice(0, 24);
-
     ws._prisonRoomName = room.name;
     ws._prisonId = String(m.id || ws._prisonId || ("P-" + prisonMid().slice(0, 8))).slice(0, 32);
     prisonKickSameIP(room, ws._ip, ws);
-
     let desired = String(m.name || ws._prisonId).replace(/\s+/g, " ").trim().slice(0, 24);
-
-    // Reserved-name request while skeleton IP is still loading:
-    // keep current name (no enter/leave spam), and apply later if authorized.
     const rk = normNameKey(desired);
     if (alreadyIn && oldName && rk && RESERVED_NAMES.has(rk) && !isSkeletonAuthorized(ws._ip) && !skeletonIP) {
       try {
@@ -515,25 +481,18 @@ function prisonHandle(ws, payloadStr) {
       prisonSend(ws, { t: "sys", msg: "Checking skeleton key..." });
       return;
     }
-
-    // remove old mapping if we were already in the room (rename/update)
     if (alreadyIn && room && room.nameMap && oldName) {
       const ok = normNameKey(oldName);
       if (ok && room.nameMap.get(ok) === ws) room.nameMap.delete(ok);
     }
-
     const _pEnf = enforceReservedName(ws, desired, ws._prisonName, ws._prisonId, "prison");
     desired = _pEnf.name;
-
     const newName = prisonMakeUniqueName(room, desired, ws._prisonId);
     ws._prisonName = newName;
-
     room.clients.add(ws);
     if (room.ipMap && ws._ip) room.ipMap.set(ws._ip, ws);
     if (room.nameMap) room.nameMap.set(normNameKey(newName), ws);
-
     prisonSend(ws, { t: "welcome", id: ws._prisonId, room: room.name, name: newName });
-
     if (!alreadyIn) {
       prisonBroadcast(room, { t: "sys", msg: `${newName} entered cellblock.` });
     } else if (oldName && normNameKey(oldName) !== normNameKey(newName)) {
@@ -570,13 +529,13 @@ function prisonHandle(ws, payloadStr) {
   }
 }
 
-// ------------------------------------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------------------------------
 // GUN OF AGARTHA CHAT protocol (g:...)
 // Prefix protocol so it won't collide with JSON-based games.
 // Clients send:  g:{"t":"hello","room":"agartha","id":"G-XXXX","name":"G-XXXX"}
 // Chat send:     g:{"t":"chat","room":"agartha","id":"G-XXXX","name":"G-XXXX","msg":"hello","mid":"..."} 
 // Server sends:  g:{"t":"chat","id":"...","name":"...","msg":"...","mid":"...","ts":...}
-// ------------------------------------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------------------------------
 const agarthaRooms = new Map(); // roomName -> { name, clients:Set<ws> }
 function agarthaGetRoom(roomName) {
   const rn = safeRoomId(roomName || "agartha", "agartha");
@@ -698,18 +657,12 @@ function agarthaHandle(ws, payloadStr) {
     if (switching) {
       agarthaDetach(ws, true);
     }
-
     const alreadyIn = (!switching) && (ws._agarthaRoomName === room.name) && room && room.clients && room.clients.has(ws);
     const oldName = String(ws._agarthaName || "").replace(/\s+/g, " ").trim().slice(0, 24);
-
     ws._agarthaRoomName = room.name;
     ws._agarthaId = String(m.id || ws._agarthaId || ("G-" + agarthaMid().slice(0, 8))).slice(0, 32);
     agarthaKickSameIP(room, ws._ip, ws);
-
     let desired = String(m.name || ws._agarthaId).replace(/\s+/g, " ").trim().slice(0, 24);
-
-    // Reserved-name request while skeleton IP is still loading:
-    // keep current name (no enter/leave spam), and apply later if authorized.
     const rk = normNameKey(desired);
     if (alreadyIn && oldName && rk && RESERVED_NAMES.has(rk) && !isSkeletonAuthorized(ws._ip) && !skeletonIP) {
       try {
@@ -720,25 +673,18 @@ function agarthaHandle(ws, payloadStr) {
       agarthaSend(ws, { t: "sys", msg: "Checking skeleton key..." });
       return;
     }
-
-    // remove old mapping if we were already in the room (rename/update)
     if (alreadyIn && room && room.nameMap && oldName) {
       const ok = normNameKey(oldName);
       if (ok && room.nameMap.get(ok) === ws) room.nameMap.delete(ok);
     }
-
     const _gEnf = enforceReservedName(ws, desired, ws._agarthaName, ws._agarthaId, "agartha");
     desired = _gEnf.name;
-
     const newName = agarthaMakeUniqueName(room, desired, ws._agarthaId);
     ws._agarthaName = newName;
-
     room.clients.add(ws);
     if (room.ipMap && ws._ip) room.ipMap.set(ws._ip, ws);
     if (room.nameMap) room.nameMap.set(normNameKey(newName), ws);
-
     agarthaSend(ws, { t: "welcome", id: ws._agarthaId, room: room.name, name: newName });
-
     if (!alreadyIn) {
       agarthaBroadcast(room, { t: "sys", msg: `${newName} entered void.` });
     } else if (oldName && normNameKey(oldName) !== normNameKey(newName)) {
@@ -1131,7 +1077,6 @@ wss.on("connection", (ws, req) => {
     ws._roomName = roomName;
     if (game === "ECF") {
       const room = getRoom("ECF", roomName);
-      // one session per IP per room
       if (ws._ip) {
         for (const [oid, ows] of room.clients) {
           if (!ows || ows === ws) continue;
@@ -1148,7 +1093,6 @@ wss.on("connection", (ws, req) => {
       return room;
     } else {
       const room = getRoom("AZHA", roomName);
-      // one session per IP per room
       if (ws._ip) {
         for (const [ows] of room.clients) {
           if (!ows || ows === ws) continue;
@@ -1313,7 +1257,6 @@ let m;
         ws._roomName = nextRoomId;
         room = attachToRoom("AZHA", nextRoomId);
         azha_meta.id = String(m.id || azha_meta.id).slice(0, 32);
-        // enforce per-room unique name (case-insensitive)
         let desired = String(m.name || "").replace(/\s+/g, " ").trim().slice(0, 24);
         const _aEnf = enforceReservedName(ws, desired, azha_meta.name, azha_meta.id, "azha");
         desired = _aEnf.name;
