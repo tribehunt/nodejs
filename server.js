@@ -4,6 +4,7 @@
 
 const http = require("http");
 const https = require("https");
+const zlib = require("zlib");
 const WebSocket = require("ws");
 const PORT = process.env.PORT || 8080;
 const server = http.createServer((req, res) => {
@@ -91,6 +92,11 @@ let skeletonFetchedAt = 0;
 let skeletonFetchInFlight = false;
 let skeletonLastAttemptAt = 0;
 
+let skeletonLastStatus = 0;
+let skeletonLastErr = "";
+let skeletonLastURL = "";
+let skeletonLastBodyLen = 0;
+let skeletonLastBodySample = "";
 function isValidIPv4(ip) {
   if (!ip) return false;
   const m = String(ip).trim().match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
@@ -103,33 +109,85 @@ function isValidIPv4(ip) {
 }
 function decodeSkeletonKey(body) {
   try {
-    const raw = String(body || "");
-    const tokMatch = raw.match(/[A-Za-z0-9+/=]{8,}/);
-    const tok = tokMatch ? tokMatch[0].trim() : "";
-    if (!tok) return "";
-    const ip = Buffer.from(tok, "base64").toString("utf8").trim();
-    return isValidIPv4(ip) ? ip : "";
+    const raw = String(body || "").trim();
+    if (!raw) return "";
+    const toks = [];
+    // try whole body first (common case: file contains only the base64 token)
+    toks.push(raw);
+    // then scan for any base64-ish tokens and test each decode
+    const reTok = /[A-Za-z0-9+/=]{8,}/g;
+    let mm;
+    while ((mm = reTok.exec(raw)) !== null) {
+      toks.push(mm[0]);
+      if (toks.length > 64) break;
+    }
+    for (const t of toks) {
+      try {
+        const ip = Buffer.from(String(t).trim(), "base64").toString("utf8").trim();
+        if (isValidIPv4(ip)) return ip;
+      } catch {}
+    }
+    return "";
   } catch {
     return "";
   }
 }
 function _httpsGetFollow(url, redirectsLeft, cb) {
   try {
-    https.get(url, (res) => {
+    const u0 = new URL(String(url));
+    const lib = (u0.protocol === "http:") ? http : https;
+
+    const req = lib.request(u0, {
+      method: "GET",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Railway/Node)",
+        "Accept": "text/plain,*/*"
+      }
+    }, (res) => {
       const sc = Number(res.statusCode || 0);
       const loc = res.headers ? res.headers.location : null;
+
       if (sc >= 300 && sc < 400 && loc && redirectsLeft > 0) {
-        const next = String(loc);
+        let next = "";
+        try { next = new URL(String(loc), u0).toString(); } catch { next = String(loc); }
         try { res.resume(); } catch {}
         _httpsGetFollow(next, redirectsLeft - 1, cb);
         return;
       }
-      let data = "";
-      res.on("data", (c) => { data += c; });
-      res.on("end", () => cb(null, data));
-    }).on("error", (e) => cb(e, ""));
+
+      const chunks = [];
+      let total = 0;
+      res.on("data", (c) => {
+        try {
+          chunks.push(c);
+          total += c.length || 0;
+          if (total > 65536) {
+            try { req.destroy(); } catch {}
+          }
+        } catch {}
+      });
+      res.on("end", () => {
+        try {
+          const buf = Buffer.concat(chunks);
+          let outBuf = buf;
+          const enc = String((res.headers && res.headers["content-encoding"]) || "").toLowerCase();
+          try {
+            if (enc.includes("gzip")) outBuf = zlib.gunzipSync(buf);
+            else if (enc.includes("deflate")) outBuf = zlib.inflateSync(buf);
+          } catch {}
+          const body = outBuf.toString("utf8");
+          cb(null, body, sc, u0.toString());
+        } catch (e) {
+          cb(e, "", sc, u0.toString());
+        }
+      });
+    });
+
+    req.on("error", (e) => cb(e, "", 0, u0.toString()));
+    req.setTimeout(8000, () => { try { req.destroy(new Error("timeout")); } catch {} });
+    req.end();
   } catch (e) {
-    cb(e, "");
+    cb(e, "", 0, String(url || ""));
   }
 }
 
@@ -220,7 +278,15 @@ function fetchSkeletonIP() {
   if (now - (skeletonLastAttemptAt || 0) < 5000) return;
   skeletonFetchInFlight = true;
   skeletonLastAttemptAt = now;
-  _httpsGetFollow(SKELETON_URL, 3, (err, body) => {
+  _httpsGetFollow(SKELETON_URL, 3, (err, body, status, finalUrl) => {
+    try {
+      skeletonLastStatus = Number(status || 0);
+      skeletonLastURL = String(finalUrl || SKELETON_URL);
+      skeletonLastErr = err ? String(err && err.message ? err.message : err) : "";
+      skeletonLastBodyLen = body ? String(body).length : 0;
+      skeletonLastBodySample = body ? String(body).slice(0, 64).replace(/\s+/g, " ").trim() : "";
+    } catch {}
+
     try {
       const ip = err ? "" : decodeSkeletonKey(body);
       if (ip) {
@@ -491,7 +557,7 @@ function prisonHandle(ws, payloadStr) {
       const sk = skeletonIP ? "loaded" : "not loaded";
       const age = skeletonFetchedAt ? Math.floor((Date.now() - skeletonFetchedAt) / 1000) : -1;
       const ok = isSkeletonAuthorized(ip) ? "YES" : "NO";
-      prisonSend(ws, { t: "sys", msg: `IP: ${ip} | skeleton: ${sk}${age >= 0 ? ` (${age}s ago)` : ``} | admin: ${ok}` });
+      prisonSend(ws, { t: "sys", msg: `IP: ${ip} | skeleton: ${sk}${age >= 0 ? ` (${age}s ago)` : ``} | last: ${skeletonLastStatus || 0}${skeletonLastErr ? ` err:${skeletonLastErr}` : ``} | admin: ${ok}` });
       return;
     }
     const mid = String(m.mid || prisonMid()).slice(0, 48);
@@ -696,7 +762,7 @@ function agarthaHandle(ws, payloadStr) {
       const sk = skeletonIP ? "loaded" : "not loaded";
       const age = skeletonFetchedAt ? Math.floor((Date.now() - skeletonFetchedAt) / 1000) : -1;
       const ok = isSkeletonAuthorized(ip) ? "YES" : "NO";
-      agarthaSend(ws, { t: "sys", msg: `IP: ${ip} | skeleton: ${sk}${age >= 0 ? ` (${age}s ago)` : ``} | admin: ${ok}` });
+      agarthaSend(ws, { t: "sys", msg: `IP: ${ip} | skeleton: ${sk}${age >= 0 ? ` (${age}s ago)` : ``} | last: ${skeletonLastStatus || 0}${skeletonLastErr ? ` err:${skeletonLastErr}` : ``} | admin: ${ok}` });
       return;
     }
     const mid = String(m.mid || agarthaMid()).slice(0, 48);
