@@ -15,6 +15,32 @@ const wss = new WebSocket.Server({ server });
 // --------------
 // Shared helpers
 // --------------
+function normNameKey(s) {
+  try {
+    return String(s || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+  } catch {
+    return "";
+  }
+}
+function pickIP(req) {
+  try {
+    const xf = req && req.headers ? req.headers["x-forwarded-for"] : null;
+    let ip = "";
+    if (typeof xf === "string" && xf.trim()) {
+      ip = xf.split(",")[0].trim();
+    }
+    if (!ip) {
+      ip = (req && req.socket && req.socket.remoteAddress) ? String(req.socket.remoteAddress) : "";
+    }
+    if (ip.startsWith("::ffff:")) ip = ip.slice(7);
+    return ip || "";
+  } catch {
+    return "";
+  }
+}
 function clamp(n, a, b) {
   n = Number(n);
   if (!Number.isFinite(n)) return a;
@@ -48,8 +74,11 @@ const rooms = new Map();
 const prisonRooms = new Map(); // roomName -> { name, clients:Set<ws> }
 function prisonGetRoom(roomName) {
   const rn = safeRoomId(roomName || "ethane_prison", "ethane_prison");
-  if (!prisonRooms.has(rn)) prisonRooms.set(rn, { name: rn, clients: new Set() });
-  return prisonRooms.get(rn);
+  if (!prisonRooms.has(rn)) prisonRooms.set(rn, { name: rn, clients: new Set(), nameMap: new Map(), ipMap: new Map() });
+  const room = prisonRooms.get(rn);
+  if (!room.nameMap) room.nameMap = new Map();
+  if (!room.ipMap) room.ipMap = new Map();
+  return room;
 }
 function prisonMid() {
   return (
@@ -75,12 +104,51 @@ function prisonDetach(ws, announce = true) {
   const room = prisonRooms.get(roomName);
   if (room) {
     room.clients.delete(ws);
+    if (room.nameMap && ws._prisonName) {
+      const k = normNameKey(ws._prisonName);
+      if (k && room.nameMap.get(k) === ws) room.nameMap.delete(k);
+    }
+    if (room.ipMap && ws._ip) {
+      if (room.ipMap.get(ws._ip) === ws) room.ipMap.delete(ws._ip);
+    }
     if (announce && ws._prisonName) {
       prisonBroadcast(room, { t: "sys", msg: `${ws._prisonName} left cellblock.` });
     }
     if (room.clients.size === 0) prisonRooms.delete(roomName);
   }
   ws._prisonRoomName = null;
+}
+function prisonKickSameIP(room, ip, exceptWs) {
+  if (!room || !ip) return;
+  for (const ows of [...room.clients]) {
+    if (!ows || ows === exceptWs) continue;
+    if (ows._ip && ows._ip === ip) {
+      prisonSend(ows, { t: "error", code: "dup_ip", message: "Duplicate session from same IP; closing old." });
+      try { prisonDetach(ows, false); } catch {}
+      try { ows.close(); } catch {}
+    }
+  }
+}
+function prisonMakeUniqueName(room, desired, fallback) {
+  const base = String(desired || fallback || "PRISONER").replace(/\s+/g, " ").trim().slice(0, 24) || "PRISONER";
+  const has = (nm) => {
+    const k = normNameKey(nm);
+    if (!k) return false;
+    if (room && room.nameMap && room.nameMap.has(k)) return true;
+    for (const ws of (room && room.clients ? room.clients : [])) {
+      if (ws && normNameKey(ws._prisonName) === k) return true;
+    }
+    return false;
+  };
+  if (!has(base)) return base;
+  for (let i = 0; i < 12; i++) {
+    const suf = "-" + Math.random().toString(36).slice(2, 5).toUpperCase();
+    const cut = Math.max(1, 24 - suf.length);
+    const cand = base.slice(0, cut) + suf;
+    if (!has(cand)) return cand;
+  }
+  const suf = "-" + rid().slice(0, 3).toUpperCase();
+  return (base.slice(0, Math.max(1, 24 - suf.length)) + suf).slice(0, 24);
 }
 function prisonHandle(ws, payloadStr) {
   let s = "";
@@ -93,8 +161,11 @@ function prisonHandle(ws, payloadStr) {
       const room = prisonGetRoom("ethane_prison");
       ws._prisonRoomName = room.name;
       ws._prisonId = ws._prisonId || ("P-" + prisonMid().slice(0, 8));
-      ws._prisonName = ws._prisonName || ws._prisonId;
+      prisonKickSameIP(room, ws._ip, ws);
+      ws._prisonName = prisonMakeUniqueName(room, ws._prisonName || ws._prisonId, ws._prisonId);
       room.clients.add(ws);
+      if (room.ipMap && ws._ip) room.ipMap.set(ws._ip, ws);
+      if (room.nameMap) room.nameMap.set(normNameKey(ws._prisonName), ws);
       prisonSend(ws, { t: "welcome", id: ws._prisonId, room: room.name, name: ws._prisonName });
       prisonBroadcast(room, { t: "sys", msg: `${ws._prisonName} entered cellblock.` });
     }
@@ -117,10 +188,19 @@ function prisonHandle(ws, payloadStr) {
     if (ws._prisonRoomName && ws._prisonRoomName !== room.name) {
       prisonDetach(ws, true);
     }
+    // renaming within same room: clear old name mapping
+    if (ws._prisonRoomName === room.name && room && room.nameMap && ws._prisonName) {
+      const ok = normNameKey(ws._prisonName);
+      if (ok && room.nameMap.get(ok) === ws) room.nameMap.delete(ok);
+    }
     ws._prisonRoomName = room.name;
     ws._prisonId = String(m.id || ws._prisonId || ("P-" + prisonMid().slice(0, 8))).slice(0, 32);
-    ws._prisonName = String(m.name || ws._prisonId).slice(0, 24);
+    prisonKickSameIP(room, ws._ip, ws);
+    const desired = String(m.name || ws._prisonId).slice(0, 24);
+    ws._prisonName = prisonMakeUniqueName(room, desired, ws._prisonId);
     room.clients.add(ws);
+    if (room.ipMap && ws._ip) room.ipMap.set(ws._ip, ws);
+    if (room.nameMap) room.nameMap.set(normNameKey(ws._prisonName), ws);
     prisonSend(ws, { t: "welcome", id: ws._prisonId, room: room.name, name: ws._prisonName });
     prisonBroadcast(room, { t: "sys", msg: `${ws._prisonName} entered cellblock.` });
     return;
@@ -131,8 +211,8 @@ function prisonHandle(ws, payloadStr) {
     }
     const room = prisonRooms.get(ws._prisonRoomName);
     if (!room) return;
-    const name = String(m.name || ws._prisonName || ws._prisonId || "PRISONER").slice(0, 24);
-    const id = String(m.id || ws._prisonId || "").slice(0, 32);
+    const name = String(ws._prisonName || ws._prisonId || "PRISONER").slice(0, 24);
+    const id = String(ws._prisonId || "").slice(0, 32);
     let msg = String(m.msg || m.message || "");
     msg = msg.replace(/\r?\n/g, " ").slice(0, 240);
     const mid = String(m.mid || prisonMid()).slice(0, 48);
@@ -154,8 +234,11 @@ function prisonHandle(ws, payloadStr) {
 const agarthaRooms = new Map(); // roomName -> { name, clients:Set<ws> }
 function agarthaGetRoom(roomName) {
   const rn = safeRoomId(roomName || "agartha", "agartha");
-  if (!agarthaRooms.has(rn)) agarthaRooms.set(rn, { name: rn, clients: new Set() });
-  return agarthaRooms.get(rn);
+  if (!agarthaRooms.has(rn)) agarthaRooms.set(rn, { name: rn, clients: new Set(), nameMap: new Map(), ipMap: new Map() });
+  const room = agarthaRooms.get(rn);
+  if (!room.nameMap) room.nameMap = new Map();
+  if (!room.ipMap) room.ipMap = new Map();
+  return room;
 }
 function agarthaMid() {
   return (
@@ -181,12 +264,51 @@ function agarthaDetach(ws, announce = true) {
   const room = agarthaRooms.get(roomName);
   if (room) {
     room.clients.delete(ws);
+    if (room.nameMap && ws._agarthaName) {
+      const k = normNameKey(ws._agarthaName);
+      if (k && room.nameMap.get(k) === ws) room.nameMap.delete(k);
+    }
+    if (room.ipMap && ws._ip) {
+      if (room.ipMap.get(ws._ip) === ws) room.ipMap.delete(ws._ip);
+    }
     if (announce && ws._agarthaName) {
       agarthaBroadcast(room, { t: "sys", msg: `${ws._agarthaName} left void.` });
     }
     if (room.clients.size === 0) agarthaRooms.delete(roomName);
   }
   ws._agarthaRoomName = null;
+}
+function agarthaKickSameIP(room, ip, exceptWs) {
+  if (!room || !ip) return;
+  for (const ows of [...room.clients]) {
+    if (!ows || ows === exceptWs) continue;
+    if (ows._ip && ows._ip === ip) {
+      agarthaSend(ows, { t: "error", code: "dup_ip", message: "Duplicate session from same IP; closing old." });
+      try { agarthaDetach(ows, false); } catch {}
+      try { ows.close(); } catch {}
+    }
+  }
+}
+function agarthaMakeUniqueName(room, desired, fallback) {
+  const base = String(desired || fallback || "PILOT").replace(/\s+/g, " ").trim().slice(0, 24) || "PILOT";
+  const has = (nm) => {
+    const k = normNameKey(nm);
+    if (!k) return false;
+    if (room && room.nameMap && room.nameMap.has(k)) return true;
+    for (const ws of (room && room.clients ? room.clients : [])) {
+      if (ws && normNameKey(ws._agarthaName) === k) return true;
+    }
+    return false;
+  };
+  if (!has(base)) return base;
+  for (let i = 0; i < 12; i++) {
+    const suf = "-" + Math.random().toString(36).slice(2, 5).toUpperCase();
+    const cut = Math.max(1, 24 - suf.length);
+    const cand = base.slice(0, cut) + suf;
+    if (!has(cand)) return cand;
+  }
+  const suf = "-" + rid().slice(0, 3).toUpperCase();
+  return (base.slice(0, Math.max(1, 24 - suf.length)) + suf).slice(0, 24);
 }
 function agarthaHandle(ws, payloadStr) {
   let s = "";
@@ -203,8 +325,11 @@ function agarthaHandle(ws, payloadStr) {
       const room = agarthaGetRoom("agartha");
       ws._agarthaRoomName = room.name;
       ws._agarthaId = ws._agarthaId || ("G-" + agarthaMid().slice(0, 8));
-      ws._agarthaName = ws._agarthaName || ws._agarthaId;
+      agarthaKickSameIP(room, ws._ip, ws);
+      ws._agarthaName = agarthaMakeUniqueName(room, ws._agarthaName || ws._agarthaId, ws._agarthaId);
       room.clients.add(ws);
+      if (room.ipMap && ws._ip) room.ipMap.set(ws._ip, ws);
+      if (room.nameMap) room.nameMap.set(normNameKey(ws._agarthaName), ws);
       agarthaSend(ws, { t: "welcome", id: ws._agarthaId, room: room.name, name: ws._agarthaName });
       agarthaBroadcast(room, { t: "sys", msg: `${ws._agarthaName} entered void.` });
     }
@@ -228,10 +353,19 @@ function agarthaHandle(ws, payloadStr) {
     if (ws._agarthaRoomName && ws._agarthaRoomName !== room.name) {
       agarthaDetach(ws, true);
     }
+    // renaming within same room: clear old name mapping
+    if (ws._agarthaRoomName === room.name && room && room.nameMap && ws._agarthaName) {
+      const ok = normNameKey(ws._agarthaName);
+      if (ok && room.nameMap.get(ok) === ws) room.nameMap.delete(ok);
+    }
     ws._agarthaRoomName = room.name;
     ws._agarthaId = String(m.id || ws._agarthaId || ("G-" + agarthaMid().slice(0, 8))).slice(0, 32);
-    ws._agarthaName = String(m.name || ws._agarthaId).slice(0, 24);
+    agarthaKickSameIP(room, ws._ip, ws);
+    const desired = String(m.name || ws._agarthaId).slice(0, 24);
+    ws._agarthaName = agarthaMakeUniqueName(room, desired, ws._agarthaId);
     room.clients.add(ws);
+    if (room.ipMap && ws._ip) room.ipMap.set(ws._ip, ws);
+    if (room.nameMap) room.nameMap.set(normNameKey(ws._agarthaName), ws);
     agarthaSend(ws, { t: "welcome", id: ws._agarthaId, room: room.name, name: ws._agarthaName });
     agarthaBroadcast(room, { t: "sys", msg: `${ws._agarthaName} entered void.` });
     return;
@@ -243,8 +377,8 @@ function agarthaHandle(ws, payloadStr) {
     }
     const room = agarthaRooms.get(ws._agarthaRoomName);
     if (!room) return;
-    const name = String(m.name || ws._agarthaName || ws._agarthaId || "PILOT").slice(0, 24);
-    const id = String(m.id || ws._agarthaId || "").slice(0, 32);
+    const name = String(ws._agarthaName || ws._agarthaId || "PILOT").slice(0, 24);
+    const id = String(ws._agarthaId || "").slice(0, 32);
     let msg = String(m.msg || m.message || "");
     msg = msg.replace(/\r?\n/g, " ").slice(0, 240);
     const mid = String(m.mid || agarthaMid()).slice(0, 48);
@@ -569,7 +703,8 @@ function azhaMaybeStart(room, roomId) {
 // -----------------------------------------
 // Connection handler (auto-detect protocol)
 // -----------------------------------------
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
+  ws._ip = pickIP(req);
   ws._proto = null; // "ECF" | "AZHA"
   ws._ecf_id = null;
   ws._roomGame = null; // "ECF"|"AZHA"
@@ -613,11 +748,34 @@ wss.on("connection", (ws) => {
     ws._roomName = roomName;
     if (game === "ECF") {
       const room = getRoom("ECF", roomName);
+      // one session per IP per room
+      if (ws._ip) {
+        for (const [oid, ows] of room.clients) {
+          if (!ows || ows === ws) continue;
+          if (ows._ip && ows._ip === ws._ip) {
+            room.clients.delete(oid);
+            room.ready.delete(oid);
+            try { ows.send(JSON.stringify({ t: "error", code: "dup_ip", message: "Duplicate session from same IP; closing old." })); } catch {}
+            try { ows.close(); } catch {}
+          }
+        }
+      }
       room.clients.set(ecf_id, ws);
       if (!room.ready.has(ecf_id)) room.ready.set(ecf_id, false);
       return room;
     } else {
       const room = getRoom("AZHA", roomName);
+      // one session per IP per room
+      if (ws._ip) {
+        for (const [ows] of room.clients) {
+          if (!ows || ows === ws) continue;
+          if (ows._ip && ows._ip === ws._ip) {
+            room.clients.delete(ows);
+            try { ows.send(JSON.stringify({ type: "error", message: "Duplicate session from same IP; closing old." })); } catch {}
+            try { ows.close(); } catch {}
+          }
+        }
+      }
       room.clients.set(ws, azha_meta);
       return room;
     }
@@ -772,7 +930,22 @@ let m;
         ws._roomName = nextRoomId;
         room = attachToRoom("AZHA", nextRoomId);
         azha_meta.id = String(m.id || azha_meta.id).slice(0, 32);
-        azha_meta.name = String(m.name || "").slice(0, 24);
+        // enforce per-room unique name (case-insensitive)
+        const desired = String(m.name || "").replace(/\s+/g, " ").trim().slice(0, 24);
+        const used = new Set();
+        for (const meta of nextRoom.clients.values()) {
+          if (meta && meta.name) used.add(normNameKey(meta.name));
+        }
+        let finalName = desired;
+        if (finalName && used.has(normNameKey(finalName))) {
+          for (let i = 0; i < 12; i++) {
+            const suf = "-" + Math.random().toString(36).slice(2, 5).toUpperCase();
+            const cut = Math.max(1, 24 - suf.length);
+            const cand = finalName.slice(0, cut) + suf;
+            if (!used.has(normNameKey(cand))) { finalName = cand; break; }
+          }
+        }
+        azha_meta.name = finalName;
         azha_meta.ready = false;
         azha_meta.state = null;
         room.clients.set(ws, azha_meta);
@@ -839,6 +1012,7 @@ let m;
   });
   ws.on("close", () => {
     try { prisonDetach(ws, true); } catch {}
+    try { agarthaDetach(ws, true); } catch {}
     detachFromCurrentRoom();
   });
 });
@@ -918,4 +1092,3 @@ setInterval(() => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log("Merged relay (ECF + AZHA) on port", PORT);
 });
-
