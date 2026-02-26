@@ -1,7 +1,6 @@
 // server.js - supports Eldritch Cyber Front, Ethane Sea, Azha & Gun of Agartha
 // One process, one port, isolated rooms by game.
 // by Dedset Media 02/24/2026 | @realhhfashion
-
 const http = require("http");
 const https = require("https");
 const zlib = require("zlib");
@@ -12,7 +11,21 @@ const server = http.createServer((req, res) => {
   res.end("OK\n");
 });
 const wss = new WebSocket.Server({ server });
-
+const HEARTBEAT_MS = 30000;
+const _hb = setInterval(() => {
+  try {
+    for (const c of wss.clients) {
+      if (!c) continue;
+      if (c.isAlive === false) {
+        try { c.terminate(); } catch {}
+        continue;
+      }
+      c.isAlive = false;
+      try { c.ping(); } catch {}
+    }
+  } catch {}
+}, HEARTBEAT_MS);
+try { if (_hb && typeof _hb.unref === "function") _hb.unref(); } catch {}
 // --------------
 // Shared helpers
 // --------------
@@ -80,7 +93,6 @@ function rid() {
 function nowSeed() {
   return (Date.now() ^ (Math.random() * 0xffffffff)) >>> 0;
 }
-
 // ---------------------------------------
 // Reserved names / skeletonkey admin gate
 // ---------------------------------------
@@ -332,7 +344,6 @@ function enforceReservedName(ws, desired, currentName, fallbackId, proto) {
   _sendReservedNameError(ws, proto, desired);
   return { name: fb, blocked: true, reservedKey };
 }
-
 // --------------------------------------
 // Room registry: key = `${game}:${room}`
 // game is "ECF" or "AZHA"
@@ -528,7 +539,6 @@ function prisonHandle(ws, payloadStr) {
     return;
   }
 }
-
 // ------------------------------------------------------------------------------------------------------
 // GUN OF AGARTHA CHAT protocol (g:...)
 // Prefix protocol so it won't collide with JSON-based games.
@@ -760,7 +770,6 @@ function deleteRoomIfEmpty(room) {
     if (room.clients.size === 0) rooms.delete(roomKey("AZHA", room.name));
   }
 }
-
 // ------------
 // ECF protocol
 // ------------
@@ -779,7 +788,6 @@ function ecfRoomState(room) {
   const players = [...room.clients.keys()].sort();
   return { t: "room_state", seed: room.seed, difficulty: room.difficulty, ready: r, missionActive: room.missionActive, players };
 }
-
 // -------------
 // AZHA protocol
 // -------------
@@ -1028,21 +1036,20 @@ function azhaMaybeStart(room, roomId) {
   azhaBroadcast(room, { type: "start", room: roomId, seed: room.seed, mapW: room.mapW, mapH: room.mapH });
   azhaStartMission(room);
 }
-
 // -----------------------------------------
 // Connection handler (auto-detect protocol)
 // -----------------------------------------
 wss.on("connection", (ws, req) => {
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
   ws._ip = pickIP(req);
   ws._proto = null; // "ECF" | "AZHA"
   ws._ecf_id = null;
   ws._roomGame = null; // "ECF"|"AZHA"
   ws._roomName = null;
-
   // ECF defaults
   let ecf_id = rid();
   let ecf_roomName = "brothers";
-
   // AZHA defaults
   let azha_roomName = "global";
   let azha_meta = {
@@ -1110,13 +1117,11 @@ wss.on("connection", (ws, req) => {
   ws.on("message", (buf) => {
     let raw = "";
     try { raw = buf.toString("utf8"); } catch { raw = ""; }
-
     // ETHANE SEA prison protocol:
     if (raw && raw.startsWith("p:")) {
       try { prisonHandle(ws, raw.slice(2)); } catch {}
       return;
     }
-    
     // GUN OF AGARTHA chat protocol:
     if (raw && raw.startsWith("g:")) {
       try { agarthaHandle(ws, raw.slice(2)); } catch {}
@@ -1130,7 +1135,6 @@ let m;
       else if (m.type) ws._proto = "AZHA";
       else return;
     }
-
     // ------------
     // ECF handling
     // ------------
@@ -1230,7 +1234,6 @@ let m;
       }
       return;
     }
-
     // -------------
     // AZHA handling
     // -------------
@@ -1348,7 +1351,6 @@ let m;
     detachFromCurrentRoom();
   });
 });
-
 // ----------------------------------------
 // AZHA fixed-rate net sync & enemy AI tick
 // ----------------------------------------
@@ -1419,8 +1421,7 @@ setInterval(() => {
     }
   }
 }, TICK_MS);
-
 // ------------------------------------------------------
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("Merged relay (ECF + AZHA) on port", PORT);
+  console.log("Merged relay (Dedset App) on port", PORT);
 });
