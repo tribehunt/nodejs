@@ -1,4 +1,5 @@
-// server.js - supports Eldritch Cyber Front, Ethane Sea, Azha & Gun of Agartha, Belvara
+// server.js - supports Eldritch Cyber Front,
+// Ethane Sea, Azha, Gun of Agartha & Belvara
 // One process, one port, isolated rooms by game.
 // by Dedset Media 02/24/2026 | @realhhfashion
 const http = require("http");
@@ -605,6 +606,24 @@ function belvaraKickSameIP(room, ip, exceptWs) {
     }
   }
 }
+function belvaraMakeUniqueId(room, desired, exceptWs = null) {
+  const base0 = String(desired || ("B-" + belvaraMid().slice(0, 8))).replace(/\s+/g, " ").trim();
+  const base = base0.slice(0, 32) || ("B-" + belvaraMid().slice(0, 8));
+  const used = new Set();
+  for (const ws of (room && room.clients ? room.clients : [])) {
+    if (!ws) continue;
+    if (exceptWs && ws === exceptWs) continue;
+    if (ws._belvaraId) used.add(String(ws._belvaraId).slice(0, 32));
+  }
+  if (!used.has(base)) return base;
+  for (let i = 0; i < 12; i++) {
+    const suf = "-" + rid().slice(0, 4).toUpperCase();
+    const cut = Math.max(1, 32 - suf.length);
+    const cand = (base.slice(0, cut) + suf).slice(0, 32);
+    if (!used.has(cand)) return cand;
+  }
+  return ("B-" + belvaraMid().slice(0, 8)).slice(0, 32);
+}
 function belvaraMakeUniqueName(room, desired, fallback) {
   const base = String(desired || fallback || "CAPTAIN").replace(/\s+/g, " ").trim().slice(0, 24) || "CAPTAIN";
   const has = (nm) => {
@@ -636,7 +655,7 @@ function belvaraHandle(ws, payloadStr) {
     const room = belvaraRooms.get(ws._belvaraRoomName || "") || belvaraGetRoom("belvara");
     if (!ws._belvaraRoomName) {
       ws._belvaraRoomName = room.name;
-      ws._belvaraId = ws._belvaraId || ("B-" + belvaraMid().slice(0, 8));
+      ws._belvaraId = belvaraMakeUniqueId(room, ws._belvaraId || ("B-" + belvaraMid().slice(0, 8)), ws);
       belvaraKickSameIP(room, ws._ip, ws);
       const desired0 = String(ws._belvaraName || ws._belvaraId).slice(0, 24);
       const enf0 = enforceReservedName(ws, desired0, ws._belvaraName, ws._belvaraId, "belvara");
@@ -661,6 +680,7 @@ function belvaraHandle(ws, payloadStr) {
     ws._belvaraRoomName = room.name;
     ws._belvaraId = String(m.id || ws._belvaraId || ("B-" + belvaraMid().slice(0, 8))).slice(0, 32);
     belvaraKickSameIP(room, ws._ip, ws);
+    ws._belvaraId = belvaraMakeUniqueId(room, ws._belvaraId, ws);
     let desired = String(m.name || ws._belvaraId).replace(/\s+/g, " ").trim().slice(0, 24);
     const enf = enforceReservedName(ws, desired, ws._belvaraName, ws._belvaraId, "belvara");
     desired = enf.name;
