@@ -575,6 +575,31 @@ function belvaraBroadcast(room, obj, exceptWs = null) {
     try { ws.send(msg); } catch {}
   }
 }
+
+function belvaraIsDupChat(room, key) {
+  try {
+    if (!room) return false;
+    if (!room._chatSeen) room._chatSeen = new Map();
+    const now = Date.now();
+    const k = String(key || "");
+    if (!k) return false;
+    const last = Number(room._chatSeen.get(k) || 0);
+    if (last && (now - last) < 800) return true;
+    room._chatSeen.set(k, now);
+    if (room._chatSeen.size > 512) {
+      for (const [kk, vv] of room._chatSeen) {
+        if ((now - Number(vv || 0)) > 60000) room._chatSeen.delete(kk);
+      }
+      if (room._chatSeen.size > 768) {
+        let n = 0;
+        for (const kk of room._chatSeen.keys()) { room._chatSeen.delete(kk); if (++n >= 256) break; }
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
 function belvaraDetach(ws, announce = true) {
   if (!ws || !ws._belvaraRoomName) return;
   const roomName = ws._belvaraRoomName;
@@ -652,7 +677,12 @@ function belvaraHandle(ws, payloadStr) {
       belvaraBroadcast(room, { t: "sys", msg: `${ws._belvaraName} joined Belvara waters.`, ts: Date.now() }, ws);
     }
     const msg = s.slice(0, 240);
-    belvaraBroadcast(room, { t: "chat", id: ws._belvaraId, name: ws._belvaraName, msg, mid: belvaraMid(), ts: Date.now() });
+    const _sig = String(ws._belvaraId || "") + "|" + String(msg || "");
+    if (belvaraIsDupChat(room, _sig)) return;
+    
+    const _sig = String(id || "") + "|" + String(msg || "");
+    if (belvaraIsDupChat(room, _sig)) return;
+belvaraBroadcast(room, { t: "chat", id: ws._belvaraId, name: ws._belvaraName, msg, mid: belvaraMid(), ts: Date.now() });
     return;
   }
 
