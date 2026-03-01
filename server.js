@@ -1,4 +1,4 @@
-// server.js - supports Eldritch Cyber Front, Ethane Sea, Azha & Gun of Agartha
+// server.js - supports Eldritch Cyber Front, Ethane Sea, Azha & Gun of Agartha, Belvara
 // One process, one port, isolated rooms by game.
 // by Dedset Media 02/24/2026 | @realhhfashion
 const http = require("http");
@@ -539,6 +539,218 @@ function prisonHandle(ws, payloadStr) {
     return;
   }
 }
+
+// ------------------------------------------------------------------------------------------------------
+// BELVARA trade protocol (b:...)
+// Prefix protocol so it won't collide with JSON-based games.
+// Clients send:  b:{"t":"join","room":"belvara","id":"B-XXXX","name":"CAPTAIN"}
+// State send:    b:{"t":"state","room":"belvara","id":"B-XXXX","name":"CAPTAIN","x":0,"y":0,"a":0,"hub":"Neo-Jericho","credits":0,"rail_tier":1,"drones":0,"ts":...}
+// Shot send:     b:{"t":"shot","room":"belvara","id":"B-XXXX","x":..,"y":..,"vx":..,"vy":..,"dmg":..,"ts":..}
+// Chat send:     b:{"t":"chat","room":"belvara","id":"B-XXXX","name":"CAPTAIN","msg":"...","mid":"...","ts":...}
+// Server sends:  b:{"t":"welcome","id":"...","room":"...","name":"..."}
+//                b:{"t":"state",...} / b:{"t":"shot",...} / b:{"t":"chat",...} / b:{"t":"sys",...} / b:{"t":"leave",...}
+// ------------------------------------------------------------------------------------------------------
+const belvaraRooms = new Map(); // roomName -> { name, clients:Set<ws>, nameMap:Map, ipMap:Map }
+
+function belvaraGetRoom(roomName) {
+  const rn = safeRoomId(roomName || "belvara", "belvara");
+  if (!belvaraRooms.has(rn)) belvaraRooms.set(rn, { name: rn, clients: new Set(), nameMap: new Map(), ipMap: new Map() });
+  const room = belvaraRooms.get(rn);
+  if (!room.nameMap) room.nameMap = new Map();
+  if (!room.ipMap) room.ipMap = new Map();
+  return room;
+}
+function belvaraMid() {
+  return (Math.random().toString(16).slice(2, 10) + Date.now().toString(16).slice(-8)).toUpperCase();
+}
+function belvaraSend(ws, obj) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  try { ws.send("b:" + JSON.stringify(obj)); } catch {}
+}
+function belvaraBroadcast(room, obj, exceptWs = null) {
+  const msg = "b:" + JSON.stringify(obj);
+  for (const ws of room.clients) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) continue;
+    if (exceptWs && ws === exceptWs) continue;
+    try { ws.send(msg); } catch {}
+  }
+}
+function belvaraDetach(ws, announce = true) {
+  if (!ws || !ws._belvaraRoomName) return;
+  const roomName = ws._belvaraRoomName;
+  const room = belvaraRooms.get(roomName);
+  if (room) {
+    room.clients.delete(ws);
+    if (room.nameMap && ws._belvaraName) {
+      const k = normNameKey(ws._belvaraName);
+      if (k && room.nameMap.get(k) === ws) room.nameMap.delete(k);
+    }
+    if (room.ipMap && ws._ip) {
+      if (room.ipMap.get(ws._ip) === ws) room.ipMap.delete(ws._ip);
+    }
+    if (announce && ws._belvaraId) {
+      belvaraBroadcast(room, { t: "leave", id: ws._belvaraId, ts: Date.now() }, ws);
+      if (ws._belvaraName) belvaraBroadcast(room, { t: "sys", msg: `${ws._belvaraName} left Belvara waters.`, ts: Date.now() });
+    }
+    if (room.clients.size === 0) belvaraRooms.delete(roomName);
+  }
+  ws._belvaraRoomName = null;
+}
+function belvaraKickSameIP(room, ip, exceptWs) {
+  if (!room || !ip) return;
+  for (const ows of [...room.clients]) {
+    if (!ows || ows === exceptWs) continue;
+    if (ows._ip && ows._ip === ip) {
+      belvaraSend(ows, { t: "error", code: "dup_ip", message: "Duplicate session from same IP; closing old." });
+      try { belvaraDetach(ows, false); } catch {}
+      try { ows.close(); } catch {}
+    }
+  }
+}
+function belvaraMakeUniqueName(room, desired, fallback) {
+  const base = String(desired || fallback || "CAPTAIN").replace(/\s+/g, " ").trim().slice(0, 24) || "CAPTAIN";
+  const has = (nm) => {
+    const k = normNameKey(nm);
+    if (!k) return false;
+    if (room && room.nameMap && room.nameMap.has(k)) return true;
+    for (const ws of (room && room.clients ? room.clients : [])) {
+      if (ws && normNameKey(ws._belvaraName) === k) return true;
+    }
+    return false;
+  };
+  if (!has(base)) return base;
+  for (let i = 0; i < 12; i++) {
+    const suf = "-" + Math.random().toString(36).slice(2, 5).toUpperCase();
+    const cut = Math.max(1, 24 - suf.length);
+    const cand = base.slice(0, cut) + suf;
+    if (!has(cand)) return cand;
+  }
+  const suf = "-" + rid().slice(0, 3).toUpperCase();
+  return (base.slice(0, Math.max(1, 24 - suf.length)) + suf).slice(0, 24);
+}
+function belvaraHandle(ws, payloadStr) {
+  let s = "";
+  try { s = String(payloadStr || "").trim(); } catch { s = ""; }
+  if (!s) return;
+  let m = null;
+  try { m = JSON.parse(s); } catch { m = null; }
+
+  // If not JSON, treat as plain chat.
+  if (!m || typeof m !== "object") {
+    const room = belvaraRooms.get(ws._belvaraRoomName || "") || belvaraGetRoom("belvara");
+    if (!ws._belvaraRoomName) {
+      ws._belvaraRoomName = room.name;
+      ws._belvaraId = ws._belvaraId || ("B-" + belvaraMid().slice(0, 8));
+      belvaraKickSameIP(room, ws._ip, ws);
+      const desired0 = String(ws._belvaraName || ws._belvaraId).slice(0, 24);
+      const enf0 = enforceReservedName(ws, desired0, ws._belvaraName, ws._belvaraId, "belvara");
+      ws._belvaraName = belvaraMakeUniqueName(room, enf0.name, ws._belvaraId);
+      room.clients.add(ws);
+      if (room.ipMap && ws._ip) room.ipMap.set(ws._ip, ws);
+      if (room.nameMap) room.nameMap.set(normNameKey(ws._belvaraName), ws);
+      belvaraSend(ws, { t: "welcome", id: ws._belvaraId, room: room.name, name: ws._belvaraName, ts: Date.now() });
+      belvaraBroadcast(room, { t: "sys", msg: `${ws._belvaraName} joined Belvara waters.`, ts: Date.now() }, ws);
+    }
+    const msg = s.slice(0, 240);
+    belvaraBroadcast(room, { t: "chat", id: ws._belvaraId, name: ws._belvaraName, msg, mid: belvaraMid(), ts: Date.now() });
+    return;
+  }
+
+  const t = String(m.t || m.type || "").toLowerCase();
+
+  if (t === "hello" || t === "join") {
+    const room = belvaraGetRoom(m.room || "belvara");
+    const switching = ws._belvaraRoomName && ws._belvaraRoomName !== room.name;
+    if (switching) belvaraDetach(ws, true);
+
+    const alreadyIn = (!switching) && (ws._belvaraRoomName === room.name) && room && room.clients && room.clients.has(ws);
+    const oldName = String(ws._belvaraName || "").replace(/\s+/g, " ").trim().slice(0, 24);
+
+    ws._belvaraRoomName = room.name;
+    ws._belvaraId = String(m.id || ws._belvaraId || ("B-" + belvaraMid().slice(0, 8))).slice(0, 32);
+
+    belvaraKickSameIP(room, ws._ip, ws);
+
+    let desired = String(m.name || ws._belvaraId).replace(/\s+/g, " ").trim().slice(0, 24);
+    const enf = enforceReservedName(ws, desired, ws._belvaraName, ws._belvaraId, "belvara");
+    desired = enf.name;
+
+    if (alreadyIn && room && room.nameMap && oldName) {
+      const ok = normNameKey(oldName);
+      if (ok && room.nameMap.get(ok) === ws) room.nameMap.delete(ok);
+    }
+
+    const newName = belvaraMakeUniqueName(room, desired, ws._belvaraId);
+    ws._belvaraName = newName;
+
+    room.clients.add(ws);
+    if (room.ipMap && ws._ip) room.ipMap.set(ws._ip, ws);
+    if (room.nameMap) room.nameMap.set(normNameKey(newName), ws);
+
+    belvaraSend(ws, { t: "welcome", id: ws._belvaraId, room: room.name, name: newName, ts: Date.now() });
+    if (!alreadyIn) belvaraBroadcast(room, { t: "sys", msg: `${newName} joined Belvara waters.`, ts: Date.now() }, ws);
+    else if (oldName && normNameKey(oldName) !== normNameKey(newName)) belvaraBroadcast(room, { t: "sys", msg: `${oldName} is now ${newName}.`, ts: Date.now() });
+    return;
+  }
+
+  if (t === "chat" || t === "msg") {
+    if (!ws._belvaraRoomName) belvaraHandle(ws, JSON.stringify({ t: "join", room: m.room || "belvara", id: m.id, name: m.name }));
+    const room = belvaraRooms.get(ws._belvaraRoomName);
+    if (!room) return;
+    const name = String(ws._belvaraName || ws._belvaraId || "CAPTAIN").slice(0, 24);
+    const id = String(ws._belvaraId || "").slice(0, 32);
+    let msg = String(m.msg || m.message || "");
+    msg = msg.replace(/\r?\n/g, " ").slice(0, 240);
+    const mid = String(m.mid || belvaraMid()).slice(0, 48);
+    belvaraBroadcast(room, { t: "chat", id, name, msg, mid, ts: Date.now() });
+    return;
+  }
+
+  if (t === "state") {
+    if (!ws._belvaraRoomName) belvaraHandle(ws, JSON.stringify({ t: "join", room: m.room || "belvara", id: m.id, name: m.name }));
+    const room = belvaraRooms.get(ws._belvaraRoomName);
+    if (!room) return;
+    const out = {
+      t: "state",
+      id: String(ws._belvaraId || m.id || "").slice(0, 32),
+      name: String(ws._belvaraName || m.name || "").slice(0, 24),
+      x: clamp(Number(m.x || 0), -1e9, 1e9),
+      y: clamp(Number(m.y || 0), -1e9, 1e9),
+      a: clamp(Number(m.a || 0), -1000, 1000),
+      hub: String(m.hub || "").slice(0, 32),
+      credits: (m.credits | 0) || 0,
+      rail_tier: (m.rail_tier | 0) || 1,
+      drones: (m.drones | 0) || 0,
+      ts: Date.now()
+    };
+    belvaraBroadcast(room, out, ws);
+    return;
+  }
+
+  if (t === "shot") {
+    if (!ws._belvaraRoomName) belvaraHandle(ws, JSON.stringify({ t: "join", room: m.room || "belvara", id: m.id, name: m.name }));
+    const room = belvaraRooms.get(ws._belvaraRoomName);
+    if (!room) return;
+    const out = {
+      t: "shot",
+      id: String(ws._belvaraId || m.id || "").slice(0, 32),
+      x: clamp(Number(m.x || 0), -1e9, 1e9),
+      y: clamp(Number(m.y || 0), -1e9, 1e9),
+      vx: clamp(Number(m.vx || 0), -1e6, 1e6),
+      vy: clamp(Number(m.vy || 0), -1e6, 1e6),
+      dmg: clamp(Number(m.dmg || 0), -1e6, 1e6),
+      ts: Date.now()
+    };
+    belvaraBroadcast(room, out, ws);
+    return;
+  }
+
+  if (t === "ping") {
+    belvaraSend(ws, { t: "pong", ts: Date.now() });
+    return;
+  }
+}
+
 // ------------------------------------------------------------------------------------------------------
 // GUN OF AGARTHA CHAT protocol (g:...)
 // Prefix protocol so it won't collide with JSON-based games.
@@ -1125,6 +1337,12 @@ wss.on("connection", (ws, req) => {
     // GUN OF AGARTHA chat protocol:
     if (raw && raw.startsWith("g:")) {
       try { agarthaHandle(ws, raw.slice(2)); } catch {}
+      return;
+    }
+
+    // BELVARA trade protocol:
+    if (raw && raw.startsWith("b:")) {
+      try { belvaraHandle(ws, raw.slice(2)); } catch {}
       return;
     }
 let m;
