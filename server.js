@@ -539,7 +539,6 @@ function prisonHandle(ws, payloadStr) {
     return;
   }
 }
-
 // ------------------------------------------------------------------------------------------------------
 // BELVARA trade protocol (b:...)
 // Prefix protocol so it won't collide with JSON-based games.
@@ -551,7 +550,6 @@ function prisonHandle(ws, payloadStr) {
 //                b:{"t":"state",...} / b:{"t":"shot",...} / b:{"t":"chat",...} / b:{"t":"sys",...} / b:{"t":"leave",...}
 // ------------------------------------------------------------------------------------------------------
 const belvaraRooms = new Map(); // roomName -> { name, clients:Set<ws>, nameMap:Map, ipMap:Map }
-
 function belvaraGetRoom(roomName) {
   const rn = safeRoomId(roomName || "belvara", "belvara");
   if (!belvaraRooms.has(rn)) belvaraRooms.set(rn, { name: rn, clients: new Set(), nameMap: new Map(), ipMap: new Map() });
@@ -573,31 +571,6 @@ function belvaraBroadcast(room, obj, exceptWs = null) {
     if (!ws || ws.readyState !== WebSocket.OPEN) continue;
     if (exceptWs && ws === exceptWs) continue;
     try { ws.send(msg); } catch {}
-  }
-}
-
-function belvaraIsDupChat(room, key) {
-  try {
-    if (!room) return false;
-    if (!room._chatSeen) room._chatSeen = new Map();
-    const now = Date.now();
-    const k = String(key || "");
-    if (!k) return false;
-    const last = Number(room._chatSeen.get(k) || 0);
-    if (last && (now - last) < 800) return true;
-    room._chatSeen.set(k, now);
-    if (room._chatSeen.size > 512) {
-      for (const [kk, vv] of room._chatSeen) {
-        if ((now - Number(vv || 0)) > 60000) room._chatSeen.delete(kk);
-      }
-      if (room._chatSeen.size > 768) {
-        let n = 0;
-        for (const kk of room._chatSeen.keys()) { room._chatSeen.delete(kk); if (++n >= 256) break; }
-      }
-    }
-    return false;
-  } catch {
-    return false;
   }
 }
 function belvaraDetach(ws, announce = true) {
@@ -659,8 +632,6 @@ function belvaraHandle(ws, payloadStr) {
   if (!s) return;
   let m = null;
   try { m = JSON.parse(s); } catch { m = null; }
-
-  // If not JSON, treat as plain chat.
   if (!m || typeof m !== "object") {
     const room = belvaraRooms.get(ws._belvaraRoomName || "") || belvaraGetRoom("belvara");
     if (!ws._belvaraRoomName) {
@@ -677,52 +648,36 @@ function belvaraHandle(ws, payloadStr) {
       belvaraBroadcast(room, { t: "sys", msg: `${ws._belvaraName} joined Belvara waters.`, ts: Date.now() }, ws);
     }
     const msg = s.slice(0, 240);
-    const _sig = String(ws._belvaraId || "") + "|" + String(msg || "");
-    if (belvaraIsDupChat(room, _sig)) return;
-    
-    const _sig = String(id || "") + "|" + String(msg || "");
-    if (belvaraIsDupChat(room, _sig)) return;
-belvaraBroadcast(room, { t: "chat", id: ws._belvaraId, name: ws._belvaraName, msg, mid: belvaraMid(), ts: Date.now() });
+    belvaraBroadcast(room, { t: "chat", id: ws._belvaraId, name: ws._belvaraName, msg, mid: belvaraMid(), ts: Date.now() }, ws);
     return;
   }
-
   const t = String(m.t || m.type || "").toLowerCase();
-
   if (t === "hello" || t === "join") {
     const room = belvaraGetRoom(m.room || "belvara");
     const switching = ws._belvaraRoomName && ws._belvaraRoomName !== room.name;
     if (switching) belvaraDetach(ws, true);
-
     const alreadyIn = (!switching) && (ws._belvaraRoomName === room.name) && room && room.clients && room.clients.has(ws);
     const oldName = String(ws._belvaraName || "").replace(/\s+/g, " ").trim().slice(0, 24);
-
     ws._belvaraRoomName = room.name;
     ws._belvaraId = String(m.id || ws._belvaraId || ("B-" + belvaraMid().slice(0, 8))).slice(0, 32);
-
     belvaraKickSameIP(room, ws._ip, ws);
-
     let desired = String(m.name || ws._belvaraId).replace(/\s+/g, " ").trim().slice(0, 24);
     const enf = enforceReservedName(ws, desired, ws._belvaraName, ws._belvaraId, "belvara");
     desired = enf.name;
-
     if (alreadyIn && room && room.nameMap && oldName) {
       const ok = normNameKey(oldName);
       if (ok && room.nameMap.get(ok) === ws) room.nameMap.delete(ok);
     }
-
     const newName = belvaraMakeUniqueName(room, desired, ws._belvaraId);
     ws._belvaraName = newName;
-
     room.clients.add(ws);
     if (room.ipMap && ws._ip) room.ipMap.set(ws._ip, ws);
     if (room.nameMap) room.nameMap.set(normNameKey(newName), ws);
-
     belvaraSend(ws, { t: "welcome", id: ws._belvaraId, room: room.name, name: newName, ts: Date.now() });
     if (!alreadyIn) belvaraBroadcast(room, { t: "sys", msg: `${newName} joined Belvara waters.`, ts: Date.now() }, ws);
     else if (oldName && normNameKey(oldName) !== normNameKey(newName)) belvaraBroadcast(room, { t: "sys", msg: `${oldName} is now ${newName}.`, ts: Date.now() });
     return;
   }
-
   if (t === "chat" || t === "msg") {
     if (!ws._belvaraRoomName) belvaraHandle(ws, JSON.stringify({ t: "join", room: m.room || "belvara", id: m.id, name: m.name }));
     const room = belvaraRooms.get(ws._belvaraRoomName);
@@ -732,10 +687,9 @@ belvaraBroadcast(room, { t: "chat", id: ws._belvaraId, name: ws._belvaraName, ms
     let msg = String(m.msg || m.message || "");
     msg = msg.replace(/\r?\n/g, " ").slice(0, 240);
     const mid = String(m.mid || belvaraMid()).slice(0, 48);
-    belvaraBroadcast(room, { t: "chat", id, name, msg, mid, ts: Date.now() });
+    belvaraBroadcast(room, { t: "chat", id, name, msg, mid, ts: Date.now() }, ws);
     return;
   }
-
   if (t === "state") {
     if (!ws._belvaraRoomName) belvaraHandle(ws, JSON.stringify({ t: "join", room: m.room || "belvara", id: m.id, name: m.name }));
     const room = belvaraRooms.get(ws._belvaraRoomName);
@@ -756,7 +710,6 @@ belvaraBroadcast(room, { t: "chat", id: ws._belvaraId, name: ws._belvaraName, ms
     belvaraBroadcast(room, out, ws);
     return;
   }
-
   if (t === "shot") {
     if (!ws._belvaraRoomName) belvaraHandle(ws, JSON.stringify({ t: "join", room: m.room || "belvara", id: m.id, name: m.name }));
     const room = belvaraRooms.get(ws._belvaraRoomName);
@@ -774,13 +727,11 @@ belvaraBroadcast(room, { t: "chat", id: ws._belvaraId, name: ws._belvaraName, ms
     belvaraBroadcast(room, out, ws);
     return;
   }
-
   if (t === "ping") {
     belvaraSend(ws, { t: "pong", ts: Date.now() });
     return;
   }
 }
-
 // ------------------------------------------------------------------------------------------------------
 // GUN OF AGARTHA CHAT protocol (g:...)
 // Prefix protocol so it won't collide with JSON-based games.
