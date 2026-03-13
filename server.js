@@ -1,5 +1,5 @@
 // server.js - supports Eldritch Cyber Front,
-// Ethane Sea, Azha, Gun of Agartha & Belvara
+// Ethane Sea, Azha, Gun of Agartha, Belvara & STUG
 // One process, one port, isolated rooms by game.
 // by Dedset Media 02/24/2026 | @realhhfashion
 const http = require("http");
@@ -752,6 +752,384 @@ function belvaraHandle(ws, payloadStr) {
     return;
   }
 }
+
+// ------------------------------------------------------------------------------------------------------
+// STUG fleet-autobattle protocol (s:...)
+// Relaxed co-op bridge chat + fleet order relay for the endless war theater.
+// Clients send:  s:{"t":"join","room":"stug","id":"S-XXXX","name":"COMMANDER"}
+// State send:    s:{"t":"state","anchor":{"x":0,"y":0},"hp":100,"energy":100,"escorts_alive":8,...}
+// Order send:    s:{"t":"order","order":"focus","target":{"x":0,"y":0},"slot":0}
+// Chat send:     s:{"t":"chat","msg":"..."}
+// Story send:    s:{"t":"story","text":"AI director/story bit"}
+// Server sends:  s:{"t":"welcome"} / s:{"t":"roster"} / s:{"t":"pulse"} / s:{"t":"state"}
+//                s:{"t":"order"} / s:{"t":"chat"} / s:{"t":"story"} / s:{"t":"sys"}
+// ------------------------------------------------------------------------------------------------------
+const stugRooms = new Map(); // roomName -> { name, clients:Set<ws>, nameMap:Map, ipMap:Map, clock, theater, ... }
+function stugGetRoom(roomName) {
+  const rn = safeRoomId(roomName || "stug", "stug");
+  if (!stugRooms.has(rn)) {
+    stugRooms.set(rn, {
+      name: rn,
+      clients: new Set(),
+      nameMap: new Map(),
+      ipMap: new Map(),
+      clock: 0,
+      pulseAt: 0,
+      seed: nowSeed(),
+      theater: {
+        phase: "holding",
+        humanPressure: 58,
+        aiPressure: 42,
+        threat: 26,
+        salvage: 12,
+        nebulaDrift: Math.random() * Math.PI * 2,
+        front: 0.0,
+        storySeq: 0,
+        battleTick: 0
+      }
+    });
+  }
+  const room = stugRooms.get(rn);
+  if (!room.nameMap) room.nameMap = new Map();
+  if (!room.ipMap) room.ipMap = new Map();
+  if (!room.theater) {
+    room.theater = {
+      phase: "holding",
+      humanPressure: 58,
+      aiPressure: 42,
+      threat: 26,
+      salvage: 12,
+      nebulaDrift: Math.random() * Math.PI * 2,
+      front: 0.0,
+      storySeq: 0,
+      battleTick: 0
+    };
+  }
+  return room;
+}
+function stugMid() {
+  return (Math.random().toString(16).slice(2, 10) + Date.now().toString(16).slice(-8)).toUpperCase();
+}
+function stugSend(ws, obj) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  try { ws.send("s:" + JSON.stringify(obj)); } catch {}
+}
+function stugBroadcast(room, obj, exceptWs = null) {
+  const msg = "s:" + JSON.stringify(obj);
+  for (const ws of room.clients) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) continue;
+    if (exceptWs && ws === exceptWs) continue;
+    try { ws.send(msg); } catch {}
+  }
+}
+function stugRoster(room) {
+  const commanders = [];
+  for (const ws of room.clients) {
+    commanders.push({
+      id: String(ws._stugId || "").slice(0, 32),
+      name: String(ws._stugName || ws._stugId || "COMMANDER").slice(0, 24),
+      ready: !!ws._stugReady,
+      fleet: ws._stugState ? {
+        hp: clamp(Number(ws._stugState.hp || 100), 0, 100),
+        energy: clamp(Number(ws._stugState.energy || 100), 0, 100),
+        escorts_alive: clamp(Number(ws._stugState.escorts_alive || 0), 0, 8),
+        morale: clamp(Number(ws._stugState.morale || 50), 0, 100)
+      } : null
+    });
+  }
+  commanders.sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id)));
+  return commanders;
+}
+function stugSyncRoster(room) {
+  stugBroadcast(room, {
+    t: "roster",
+    room: room.name,
+    seed: room.seed >>> 0,
+    theater: room.theater,
+    commanders: stugRoster(room),
+    ts: Date.now()
+  });
+}
+function stugDetach(ws, announce = true) {
+  if (!ws || !ws._stugRoomName) return;
+  const roomName = ws._stugRoomName;
+  const room = stugRooms.get(roomName);
+  if (room) {
+    room.clients.delete(ws);
+    if (room.nameMap && ws._stugName) {
+      const k = normNameKey(ws._stugName);
+      if (k && room.nameMap.get(k) === ws) room.nameMap.delete(k);
+    }
+    if (room.ipMap && ws._ip) {
+      if (room.ipMap.get(ws._ip) === ws) room.ipMap.delete(ws._ip);
+    }
+    if (announce && ws._stugId) {
+      stugBroadcast(room, { t: "leave", id: ws._stugId, name: ws._stugName, ts: Date.now() }, ws);
+      if (ws._stugName) stugBroadcast(room, { t: "sys", msg: `${ws._stugName} left the bridge net.`, ts: Date.now() });
+    }
+    stugSyncRoster(room);
+    if (room.clients.size === 0) stugRooms.delete(roomName);
+  }
+  ws._stugRoomName = null;
+}
+function stugKickSameIP(room, ip, exceptWs) {
+  if (!room || !ip) return;
+  for (const ows of [...room.clients]) {
+    if (!ows || ows === exceptWs) continue;
+    if (ows._ip && ows._ip === ip) {
+      stugSend(ows, { t: "error", code: "dup_ip", message: "Duplicate session from same IP; closing old." });
+      try { stugDetach(ows, false); } catch {}
+      try { ows.close(); } catch {}
+    }
+  }
+}
+function stugMakeUniqueId(room, desired, exceptWs = null) {
+  const base0 = String(desired || ("S-" + stugMid().slice(0, 8))).replace(/\s+/g, " ").trim();
+  const base = base0.slice(0, 32) || ("S-" + stugMid().slice(0, 8));
+  const used = new Set();
+  for (const ws of (room && room.clients ? room.clients : [])) {
+    if (!ws || (exceptWs && ws === exceptWs)) continue;
+    if (ws._stugId) used.add(String(ws._stugId).slice(0, 32));
+  }
+  if (!used.has(base)) return base;
+  for (let i = 0; i < 12; i++) {
+    const suf = "-" + rid().slice(0, 4).toUpperCase();
+    const cut = Math.max(1, 32 - suf.length);
+    const cand = (base.slice(0, cut) + suf).slice(0, 32);
+    if (!used.has(cand)) return cand;
+  }
+  return ("S-" + stugMid().slice(0, 8)).slice(0, 32);
+}
+function stugMakeUniqueName(room, desired, fallback) {
+  const base = String(desired || fallback || "COMMANDER").replace(/\s+/g, " ").trim().slice(0, 24) || "COMMANDER";
+  const has = (nm) => {
+    const k = normNameKey(nm);
+    if (!k) return false;
+    if (room && room.nameMap && room.nameMap.has(k)) return true;
+    for (const ws of (room && room.clients ? room.clients : [])) {
+      if (ws && normNameKey(ws._stugName) === k) return true;
+    }
+    return false;
+  };
+  if (!has(base)) return base;
+  for (let i = 0; i < 12; i++) {
+    const suf = "-" + Math.random().toString(36).slice(2, 5).toUpperCase();
+    const cut = Math.max(1, 24 - suf.length);
+    const cand = base.slice(0, cut) + suf;
+    if (!has(cand)) return cand;
+  }
+  const suf = "-" + rid().slice(0, 3).toUpperCase();
+  return (base.slice(0, Math.max(1, 24 - suf.length)) + suf).slice(0, 24);
+}
+function stugDefaultState() {
+  return {
+    anchor: { x: 0, y: 0 },
+    hp: 100,
+    energy: 100,
+    escorts_alive: 8,
+    morale: 72,
+    mode: "screen",
+    target: null,
+    selection: -1,
+    ts: Date.now()
+  };
+}
+function stugTickRoom(room, dt) {
+  if (!room || !room.theater) return;
+  const th = room.theater;
+  room.clock = (room.clock || 0) + dt;
+  room.pulseAt = (room.pulseAt || 0) + dt;
+  th.battleTick = (th.battleTick | 0) + 1;
+  th.nebulaDrift = (Number(th.nebulaDrift || 0) + dt * 0.00011) % (Math.PI * 2);
+  const commanderCount = room.clients.size;
+  const readiness = [...room.clients].reduce((acc, ws) => acc + (ws._stugReady ? 1 : 0), 0);
+  const fleetScore = [...room.clients].reduce((acc, ws) => {
+    const s = ws._stugState || {};
+    return acc + clamp(Number(s.hp || 0), 0, 100) + clamp(Number(s.escorts_alive || 0), 0, 8) * 5 + clamp(Number(s.energy || 0), 0, 100) * 0.2;
+  }, 0);
+  const readinessBoost = readiness * 0.04;
+  const commanderBoost = commanderCount * 0.025;
+  const fleetBoost = fleetScore * 0.00032;
+  const threatWave = Math.sin(room.clock * 0.00023 + room.seed * 0.000001) * 0.18 + Math.cos(room.clock * 0.00011) * 0.09;
+  th.threat = clamp((Number(th.threat || 0) + threatWave + 0.06 - readinessBoost - commanderBoost - fleetBoost), 0, 100);
+  th.humanPressure = clamp((Number(th.humanPressure || 50) + 0.035 + readinessBoost + commanderBoost + fleetBoost - th.threat * 0.0065), 0, 100);
+  th.aiPressure = clamp((Number(th.aiPressure || 50) + 0.028 + th.threat * 0.009 - readinessBoost * 0.35), 0, 100);
+  th.salvage = clamp((Number(th.salvage || 0) + 0.012 + commanderCount * 0.018 + Math.max(0, 55 - th.threat) * 0.002), 0, 9999);
+  th.front = clamp((Number(th.front || 0) + (th.humanPressure - th.aiPressure) * 0.00055), -100, 100);
+  if (th.threat >= 72) th.phase = "surge";
+  else if (th.front >= 20) th.phase = "advance";
+  else if (th.front <= -20) th.phase = "fallback";
+  else th.phase = "holding";
+  if (room.pulseAt >= 1000) {
+    room.pulseAt = 0;
+    stugBroadcast(room, {
+      t: "pulse",
+      room: room.name,
+      seed: room.seed >>> 0,
+      theater: {
+        phase: th.phase,
+        humanPressure: Math.round(th.humanPressure * 10) / 10,
+        aiPressure: Math.round(th.aiPressure * 10) / 10,
+        threat: Math.round(th.threat * 10) / 10,
+        salvage: Math.round(th.salvage * 10) / 10,
+        front: Math.round(th.front * 100) / 100,
+        nebulaDrift: Math.round(th.nebulaDrift * 100000) / 100000,
+        battleTick: th.battleTick | 0,
+        storySeq: th.storySeq | 0
+      },
+      ts: Date.now()
+    });
+  }
+}
+function stugHandle(ws, payloadStr) {
+  let s = "";
+  try { s = String(payloadStr || "").trim(); } catch { s = ""; }
+  if (!s) return;
+  let m = null;
+  try { m = JSON.parse(s); } catch { m = null; }
+  if (!m || typeof m !== "object") {
+    const room = stugRooms.get(ws._stugRoomName || "") || stugGetRoom("stug");
+    if (!ws._stugRoomName) {
+      ws._stugRoomName = room.name;
+      ws._stugId = stugMakeUniqueId(room, ws._stugId || ("S-" + stugMid().slice(0, 8)), ws);
+      stugKickSameIP(room, ws._ip, ws);
+      const desired0 = String(ws._stugName || ws._stugId).slice(0, 24);
+      const enf0 = enforceReservedName(ws, desired0, ws._stugName, ws._stugId, "stug");
+      ws._stugName = stugMakeUniqueName(room, enf0.name, ws._stugId);
+      ws._stugReady = false;
+      ws._stugState = stugDefaultState();
+      room.clients.add(ws);
+      if (room.ipMap && ws._ip) room.ipMap.set(ws._ip, ws);
+      if (room.nameMap) room.nameMap.set(normNameKey(ws._stugName), ws);
+      stugSend(ws, { t: "welcome", id: ws._stugId, room: room.name, name: ws._stugName, seed: room.seed >>> 0, theater: room.theater, ts: Date.now() });
+      stugBroadcast(room, { t: "sys", msg: `${ws._stugName} linked into the STUG net.`, ts: Date.now() }, ws);
+      stugSyncRoster(room);
+    }
+    const msg = s.slice(0, 240);
+    stugBroadcast(room, { t: "chat", id: ws._stugId, name: ws._stugName, msg, mid: stugMid(), ts: Date.now() }, ws);
+    return;
+  }
+  const t = String(m.t || m.type || "").toLowerCase();
+  if (t === "hello" || t === "join") {
+    const room = stugGetRoom(m.room || "stug");
+    const switching = ws._stugRoomName && ws._stugRoomName !== room.name;
+    if (switching) stugDetach(ws, true);
+    const alreadyIn = (!switching) && (ws._stugRoomName === room.name) && room && room.clients && room.clients.has(ws);
+    const oldName = String(ws._stugName || "").replace(/\s+/g, " ").trim().slice(0, 24);
+    ws._stugRoomName = room.name;
+    ws._stugId = String(m.id || ws._stugId || ("S-" + stugMid().slice(0, 8))).slice(0, 32);
+    stugKickSameIP(room, ws._ip, ws);
+    ws._stugId = stugMakeUniqueId(room, ws._stugId, ws);
+    let desired = String(m.name || ws._stugId).replace(/\s+/g, " ").trim().slice(0, 24);
+    const enf = enforceReservedName(ws, desired, ws._stugName, ws._stugId, "stug");
+    desired = enf.name;
+    if (alreadyIn && room && room.nameMap && oldName) {
+      const ok = normNameKey(oldName);
+      if (ok && room.nameMap.get(ok) === ws) room.nameMap.delete(ok);
+    }
+    const newName = stugMakeUniqueName(room, desired, ws._stugId);
+    ws._stugName = newName;
+    ws._stugReady = !!(m.ready != null ? m.ready : ws._stugReady);
+    if (!ws._stugState) ws._stugState = stugDefaultState();
+    room.clients.add(ws);
+    if (room.ipMap && ws._ip) room.ipMap.set(ws._ip, ws);
+    if (room.nameMap) room.nameMap.set(normNameKey(newName), ws);
+    stugSend(ws, { t: "welcome", id: ws._stugId, room: room.name, name: newName, seed: room.seed >>> 0, theater: room.theater, ts: Date.now() });
+    if (!alreadyIn) stugBroadcast(room, { t: "sys", msg: `${newName} linked into the STUG net.`, ts: Date.now() }, ws);
+    else if (oldName && normNameKey(oldName) !== normNameKey(newName)) stugBroadcast(room, { t: "sys", msg: `${oldName} is now ${newName}.`, ts: Date.now() });
+    stugSyncRoster(room);
+    return;
+  }
+  if (!ws._stugRoomName) stugHandle(ws, JSON.stringify({ t: "join", room: m.room || "stug", id: m.id, name: m.name }));
+  const room = stugRooms.get(ws._stugRoomName);
+  if (!room) return;
+  if (t === "ready") {
+    ws._stugReady = !!m.ready;
+    stugBroadcast(room, { t: "ready", id: ws._stugId, name: ws._stugName, ready: ws._stugReady, ts: Date.now() });
+    stugSyncRoster(room);
+    return;
+  }
+  if (t === "chat" || t === "msg") {
+    let msg = String(m.msg || m.message || "");
+    msg = msg.replace(/\r?\n/g, " ").slice(0, 240);
+    const mid = String(m.mid || stugMid()).slice(0, 48);
+    stugBroadcast(room, { t: "chat", id: ws._stugId, name: ws._stugName, msg, mid, ts: Date.now() });
+    return;
+  }
+  if (t === "state") {
+    const prev = ws._stugState || stugDefaultState();
+    const anchor = m.anchor || prev.anchor || { x: 0, y: 0 };
+    ws._stugState = {
+      anchor: {
+        x: clamp(Number(anchor.x || 0), -1e9, 1e9),
+        y: clamp(Number(anchor.y || 0), -1e9, 1e9)
+      },
+      hp: clamp(Number(m.hp != null ? m.hp : prev.hp), 0, 100),
+      energy: clamp(Number(m.energy != null ? m.energy : prev.energy), 0, 100),
+      escorts_alive: clamp(Number(m.escorts_alive != null ? m.escorts_alive : prev.escorts_alive), 0, 8),
+      morale: clamp(Number(m.morale != null ? m.morale : prev.morale), 0, 100),
+      mode: String(m.mode || prev.mode || "screen").slice(0, 16),
+      target: (m.target && Number.isFinite(Number(m.target.x)) && Number.isFinite(Number(m.target.y))) ? {
+        x: clamp(Number(m.target.x), -1e9, 1e9),
+        y: clamp(Number(m.target.y), -1e9, 1e9)
+      } : null,
+      selection: clamp(Number(m.selection != null ? m.selection : prev.selection), -1, 8),
+      ts: Date.now()
+    };
+    const out = {
+      t: "state",
+      id: String(ws._stugId || "").slice(0, 32),
+      name: String(ws._stugName || ws._stugId || "COMMANDER").slice(0, 24),
+      state: ws._stugState,
+      ts: Date.now()
+    };
+    stugBroadcast(room, out, ws);
+    return;
+  }
+  if (t === "order") {
+    const order = String(m.order || "screen").slice(0, 24);
+    const out = {
+      t: "order",
+      id: String(ws._stugId || "").slice(0, 32),
+      name: String(ws._stugName || ws._stugId || "COMMANDER").slice(0, 24),
+      order,
+      slot: clamp(Number(m.slot != null ? m.slot : -1), -1, 8),
+      target: (m.target && Number.isFinite(Number(m.target.x)) && Number.isFinite(Number(m.target.y))) ? {
+        x: clamp(Number(m.target.x), -1e9, 1e9),
+        y: clamp(Number(m.target.y), -1e9, 1e9)
+      } : null,
+      ts: Date.now()
+    };
+    stugBroadcast(room, out, ws);
+    return;
+  }
+  if (t === "story") {
+    const text = String(m.text || "").replace(/\r?\n/g, " ").slice(0, 500).trim();
+    if (!text) return;
+    room.theater.storySeq = ((room.theater.storySeq | 0) + 1) | 0;
+    stugBroadcast(room, { t: "story", id: ws._stugId, name: ws._stugName, text, seq: room.theater.storySeq, ts: Date.now() });
+    return;
+  }
+  if (t === "request_state" || t === "sync") {
+    stugSend(ws, { t: "roster", room: room.name, seed: room.seed >>> 0, theater: room.theater, commanders: stugRoster(room), ts: Date.now() });
+    for (const ows of room.clients) {
+      if (!ows || ows === ws || !ows._stugState) continue;
+      stugSend(ws, {
+        t: "state",
+        id: String(ows._stugId || "").slice(0, 32),
+        name: String(ows._stugName || ows._stugId || "COMMANDER").slice(0, 24),
+        state: ows._stugState,
+        ts: Date.now()
+      });
+    }
+    return;
+  }
+  if (t === "ping") {
+    stugSend(ws, { t: "pong", ts: Date.now(), theater: room.theater });
+    return;
+  }
+}
+
 // ------------------------------------------------------------------------------------------------------
 // GUN OF AGARTHA CHAT protocol (g:...)
 // Prefix protocol so it won't collide with JSON-based games.
@@ -1346,6 +1724,11 @@ wss.on("connection", (ws, req) => {
       try { belvaraHandle(ws, raw.slice(2)); } catch {}
       return;
     }
+    // STUG fleet-autobattle protocol:
+    if (raw && raw.startsWith("s:")) {
+      try { stugHandle(ws, raw.slice(2)); } catch {}
+      return;
+    }
 let m;
     try { m = JSON.parse(raw); } catch { return; }
     if (!m) return;
@@ -1567,6 +1950,8 @@ let m;
   ws.on("close", () => {
     try { prisonDetach(ws, true); } catch {}
     try { agarthaDetach(ws, true); } catch {}
+    try { belvaraDetach(ws, true); } catch {}
+    try { stugDetach(ws, true); } catch {}
     detachFromCurrentRoom();
   });
 });
@@ -1640,6 +2025,18 @@ setInterval(() => {
     }
   }
 }, TICK_MS);
+
+// ----------------------------------------
+// STUG shared theater pulse
+// ----------------------------------------
+const STUG_TICK_MS = 250;
+setInterval(() => {
+  for (const room of stugRooms.values()) {
+    if (!room) continue;
+    stugTickRoom(room, STUG_TICK_MS);
+  }
+}, STUG_TICK_MS);
+
 // ------------------------------------------------------
 server.listen(PORT, "0.0.0.0", () => {
   console.log("Merged relay (Dedset App) on port", PORT);
