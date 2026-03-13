@@ -777,8 +777,8 @@ function stugGetRoom(roomName) {
       pulseAt: 0,
       seed: nowSeed(),
       waveIndex: 0,
-      waveEveryMs: 9000,
-      nextWaveAt: 9000,
+      waveEveryMs: 18000,
+      nextWaveAt: 18000,
       theater: {
         phase: "holding",
         humanPressure: 58,
@@ -790,7 +790,7 @@ function stugGetRoom(roomName) {
         storySeq: 0,
         battleTick: 0,
         waveIndex: 0,
-        nextWaveIn: 9.0,
+        nextWaveIn: 18.0,
         lastWaveCount: 0
       }
     });
@@ -962,7 +962,7 @@ function stugTickRoom(room, dt) {
   else if (th.front <= -20) th.phase = "fallback";
   else th.phase = "holding";
 
-  room.waveEveryMs = clamp(Number(room.waveEveryMs || 9000), 5000, 15000);
+  room.waveEveryMs = clamp(Number(room.waveEveryMs || 18000), 12000, 24000);
   room.nextWaveAt = Number(room.nextWaveAt || room.waveEveryMs);
   while (room.clock >= room.nextWaveAt) {
     room.waveIndex = (room.waveIndex | 0) + 1;
@@ -978,7 +978,7 @@ function stugTickRoom(room, dt) {
       threat: Math.round(threat * 10) / 10,
       ts: Date.now()
     });
-    room.waveEveryMs = Math.round(clamp(10000 - threat * 32, 5000, 12000));
+    room.waveEveryMs = Math.round(clamp(19000 - threat * 45, 12000, 24000));
     room.nextWaveAt += room.waveEveryMs;
   }
   th.waveIndex = room.waveIndex | 0;
@@ -1103,6 +1103,7 @@ function stugHandle(ws, payloadStr) {
       selection: clamp(Number(m.selection != null ? m.selection : prev.selection), -1, 8),
       escorts: Array.isArray(m.escorts) ? m.escorts.slice(0, 16) : (Array.isArray(prev.escorts) ? prev.escorts : []),
       enemies: Array.isArray(m.enemies) ? m.enemies.slice(0, 64) : (Array.isArray(prev.enemies) ? prev.enemies : []),
+      bolts: Array.isArray(m.bolts) ? m.bolts.slice(0, 160) : (Array.isArray(prev.bolts) ? prev.bolts : []),
       ts: Date.now()
     };
     const out = {
