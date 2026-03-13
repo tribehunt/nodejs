@@ -932,6 +932,7 @@ function stugDefaultState() {
     mode: "screen",
     target: null,
     selection: -1,
+    routes: null,
     ts: Date.now()
   };
 }
@@ -1106,6 +1107,7 @@ function stugHandle(ws, payloadStr) {
       escorts: Array.isArray(m.escorts) ? m.escorts.slice(0, 16) : (Array.isArray(prev.escorts) ? prev.escorts : []),
       enemies: Array.isArray(m.enemies) ? m.enemies.slice(0, 64) : (Array.isArray(prev.enemies) ? prev.enemies : []),
       bolts: Array.isArray(m.bolts) ? m.bolts.slice(0, 160) : (Array.isArray(prev.bolts) ? prev.bolts : []),
+      routes: (m.routes && typeof m.routes === "object") ? m.routes : ((prev.routes && typeof prev.routes === "object") ? prev.routes : null),
       ts: Date.now()
     };
     const out = {
