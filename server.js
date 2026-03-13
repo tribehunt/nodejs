@@ -1088,7 +1088,9 @@ function stugHandle(ws, payloadStr) {
     ws._stugState = {
       anchor: {
         x: clamp(Number(anchor.x || 0), -1e9, 1e9),
-        y: clamp(Number(anchor.y || 0), -1e9, 1e9)
+        y: clamp(Number(anchor.y || 0), -1e9, 1e9),
+        vx: clamp(Number(anchor.vx || 0), -1e6, 1e6),
+        vy: clamp(Number(anchor.vy || 0), -1e6, 1e6)
       },
       hp: clamp(Number(m.hp != null ? m.hp : prev.hp), 0, 100),
       energy: clamp(Number(m.energy != null ? m.energy : prev.energy), 0, 100),
