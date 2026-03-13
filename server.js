@@ -810,6 +810,14 @@ function stugGetRoom(roomName) {
 function stugMid() {
   return (Math.random().toString(16).slice(2, 10) + Date.now().toString(16).slice(-8)).toUpperCase();
 }
+
+function stugDirectorId(room) {
+  if (!room || !room.clients || !room.clients.size) return "";
+  for (const ws of room.clients) {
+    if (ws && ws._stugId) return String(ws._stugId).slice(0, 32);
+  }
+  return "";
+}
 function stugSend(ws, obj) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   try { ws.send("s:" + JSON.stringify(obj)); } catch {}
@@ -845,6 +853,7 @@ function stugSyncRoster(room) {
     t: "roster",
     room: room.name,
     seed: room.seed >>> 0,
+    director_id: stugDirectorId(room),
     theater: room.theater,
     commanders: stugRoster(room),
     ts: Date.now()
@@ -924,6 +933,7 @@ function stugMakeUniqueName(room, desired, fallback) {
 function stugDefaultState() {
   return {
     anchor: { x: 0, y: 0 },
+    heading: 0,
     hp: 100,
     energy: 100,
     escorts_alive: 8,
@@ -931,6 +941,8 @@ function stugDefaultState() {
     mode: "screen",
     target: null,
     selection: -1,
+    escorts: [],
+    enemies: [],
     ts: Date.now()
   };
 }
@@ -1001,7 +1013,7 @@ function stugHandle(ws, payloadStr) {
       room.clients.add(ws);
       if (room.ipMap && ws._ip) room.ipMap.set(ws._ip, ws);
       if (room.nameMap) room.nameMap.set(normNameKey(ws._stugName), ws);
-      stugSend(ws, { t: "welcome", id: ws._stugId, room: room.name, name: ws._stugName, seed: room.seed >>> 0, theater: room.theater, ts: Date.now() });
+      stugSend(ws, { t: "welcome", id: ws._stugId, room: room.name, name: ws._stugName, seed: room.seed >>> 0, director_id: stugDirectorId(room), theater: room.theater, ts: Date.now() });
       stugBroadcast(room, { t: "sys", msg: `${ws._stugName} linked into the STUG net.`, ts: Date.now() }, ws);
       stugSyncRoster(room);
     }
@@ -1034,7 +1046,7 @@ function stugHandle(ws, payloadStr) {
     room.clients.add(ws);
     if (room.ipMap && ws._ip) room.ipMap.set(ws._ip, ws);
     if (room.nameMap) room.nameMap.set(normNameKey(newName), ws);
-    stugSend(ws, { t: "welcome", id: ws._stugId, room: room.name, name: newName, seed: room.seed >>> 0, theater: room.theater, ts: Date.now() });
+    stugSend(ws, { t: "welcome", id: ws._stugId, room: room.name, name: newName, seed: room.seed >>> 0, director_id: stugDirectorId(room), theater: room.theater, ts: Date.now() });
     if (!alreadyIn) stugBroadcast(room, { t: "sys", msg: `${newName} linked into the STUG net.`, ts: Date.now() }, ws);
     else if (oldName && normNameKey(oldName) !== normNameKey(newName)) stugBroadcast(room, { t: "sys", msg: `${oldName} is now ${newName}.`, ts: Date.now() });
     stugSyncRoster(room);
@@ -1064,6 +1076,7 @@ function stugHandle(ws, payloadStr) {
         x: clamp(Number(anchor.x || 0), -1e9, 1e9),
         y: clamp(Number(anchor.y || 0), -1e9, 1e9)
       },
+      heading: clamp(Number(m.heading != null ? m.heading : prev.heading), -3600, 3600),
       hp: clamp(Number(m.hp != null ? m.hp : prev.hp), 0, 100),
       energy: clamp(Number(m.energy != null ? m.energy : prev.energy), 0, 100),
       escorts_alive: clamp(Number(m.escorts_alive != null ? m.escorts_alive : prev.escorts_alive), 0, 8),
@@ -1074,6 +1087,34 @@ function stugHandle(ws, payloadStr) {
         y: clamp(Number(m.target.y), -1e9, 1e9)
       } : null,
       selection: clamp(Number(m.selection != null ? m.selection : prev.selection), -1, 8),
+      escorts: Array.isArray(m.escorts) ? m.escorts.slice(0, 8).map((e) => ({
+        x: clamp(Number(e && e.x != null ? e.x : 0), -1e9, 1e9),
+        y: clamp(Number(e && e.y != null ? e.y : 0), -1e9, 1e9),
+        vx: clamp(Number(e && e.vx != null ? e.vx : 0), -1e6, 1e6),
+        vy: clamp(Number(e && e.vy != null ? e.vy : 0), -1e6, 1e6),
+        hp: clamp(Number(e && e.hp != null ? e.hp : 100), 0, 100),
+        energy: clamp(Number(e && e.energy != null ? e.energy : 100), 0, 100),
+        size: clamp(Number(e && e.size != null ? e.size : 8), 2, 40),
+        role: String((e && e.role) || "escort").slice(0, 16),
+        morale: clamp(Number(e && e.morale != null ? e.morale : 70), 0, 100),
+        alive: !!(e && e.alive),
+        heading: clamp(Number(e && e.heading != null ? e.heading : 0), -3600, 3600),
+        orbit_angle: clamp(Number(e && e.orbit_angle != null ? e.orbit_angle : 0), -1e6, 1e6),
+        orbit_radius: clamp(Number(e && e.orbit_radius != null ? e.orbit_radius : 0), 0, 1e6)
+      })) : (Array.isArray(prev.escorts) ? prev.escorts : []),
+      enemies: Array.isArray(m.enemies) ? m.enemies.slice(0, 64).map((e) => ({
+        x: clamp(Number(e && e.x != null ? e.x : 0), -1e9, 1e9),
+        y: clamp(Number(e && e.y != null ? e.y : 0), -1e9, 1e9),
+        vx: clamp(Number(e && e.vx != null ? e.vx : 0), -1e6, 1e6),
+        vy: clamp(Number(e && e.vy != null ? e.vy : 0), -1e6, 1e6),
+        hp: clamp(Number(e && e.hp != null ? e.hp : 100), 0, 100),
+        energy: clamp(Number(e && e.energy != null ? e.energy : 100), 0, 100),
+        size: clamp(Number(e && e.size != null ? e.size : 8), 2, 40),
+        role: String((e && e.role) || "raider").slice(0, 16),
+        morale: clamp(Number(e && e.morale != null ? e.morale : 55), 0, 100),
+        alive: !!(e && e.alive),
+        heading: clamp(Number(e && e.heading != null ? e.heading : 0), -3600, 3600)
+      })) : (Array.isArray(prev.enemies) ? prev.enemies : []),
       ts: Date.now()
     };
     const out = {
@@ -1111,7 +1152,7 @@ function stugHandle(ws, payloadStr) {
     return;
   }
   if (t === "request_state" || t === "sync") {
-    stugSend(ws, { t: "roster", room: room.name, seed: room.seed >>> 0, theater: room.theater, commanders: stugRoster(room), ts: Date.now() });
+    stugSend(ws, { t: "roster", room: room.name, seed: room.seed >>> 0, director_id: stugDirectorId(room), theater: room.theater, commanders: stugRoster(room), ts: Date.now() });
     for (const ows of room.clients) {
       if (!ows || ows === ws || !ows._stugState) continue;
       stugSend(ws, {
