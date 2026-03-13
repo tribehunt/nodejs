@@ -776,6 +776,9 @@ function stugGetRoom(roomName) {
       clock: 0,
       pulseAt: 0,
       seed: nowSeed(),
+      waveIndex: 0,
+      waveEveryMs: 9000,
+      nextWaveAt: 9000,
       theater: {
         phase: "holding",
         humanPressure: 58,
@@ -785,7 +788,10 @@ function stugGetRoom(roomName) {
         nebulaDrift: Math.random() * Math.PI * 2,
         front: 0.0,
         storySeq: 0,
-        battleTick: 0
+        battleTick: 0,
+        waveIndex: 0,
+        nextWaveIn: 9.0,
+        lastWaveCount: 0
       }
     });
   }
@@ -802,7 +808,10 @@ function stugGetRoom(roomName) {
       nebulaDrift: Math.random() * Math.PI * 2,
       front: 0.0,
       storySeq: 0,
-      battleTick: 0
+      battleTick: 0,
+      waveIndex: 0,
+      nextWaveIn: 9.0,
+      lastWaveCount: 0
     };
   }
   return room;
@@ -952,6 +961,28 @@ function stugTickRoom(room, dt) {
   else if (th.front >= 20) th.phase = "advance";
   else if (th.front <= -20) th.phase = "fallback";
   else th.phase = "holding";
+
+  room.waveEveryMs = clamp(Number(room.waveEveryMs || 9000), 5000, 15000);
+  room.nextWaveAt = Number(room.nextWaveAt || room.waveEveryMs);
+  while (room.clock >= room.nextWaveAt) {
+    room.waveIndex = (room.waveIndex | 0) + 1;
+    const threat = clamp(Number(th.threat || 0), 0, 100);
+    const count = 1 + (threat >= 35 ? 1 : 0) + (threat >= 60 ? 1 : 0) + (threat >= 82 ? 1 : 0);
+    th.waveIndex = room.waveIndex | 0;
+    th.lastWaveCount = count | 0;
+    stugBroadcast(room, {
+      t: "wave",
+      room: room.name,
+      wave: room.waveIndex | 0,
+      count: count | 0,
+      threat: Math.round(threat * 10) / 10,
+      ts: Date.now()
+    });
+    room.waveEveryMs = Math.round(clamp(10000 - threat * 32, 5000, 12000));
+    room.nextWaveAt += room.waveEveryMs;
+  }
+  th.waveIndex = room.waveIndex | 0;
+  th.nextWaveIn = Math.max(0, Math.round((room.nextWaveAt - room.clock) / 100) / 10);
   if (room.pulseAt >= 1000) {
     room.pulseAt = 0;
     stugBroadcast(room, {
@@ -967,7 +998,10 @@ function stugTickRoom(room, dt) {
         front: Math.round(th.front * 100) / 100,
         nebulaDrift: Math.round(th.nebulaDrift * 100000) / 100000,
         battleTick: th.battleTick | 0,
-        storySeq: th.storySeq | 0
+        storySeq: th.storySeq | 0,
+        waveIndex: th.waveIndex | 0,
+        nextWaveIn: Number(th.nextWaveIn || 0),
+        lastWaveCount: th.lastWaveCount | 0
       },
       ts: Date.now()
     });
@@ -1045,7 +1079,7 @@ function stugHandle(ws, payloadStr) {
     let msg = String(m.msg || m.message || "");
     msg = msg.replace(/\r?\n/g, " ").slice(0, 240);
     const mid = String(m.mid || stugMid()).slice(0, 48);
-    stugBroadcast(room, { t: "chat", id: ws._stugId, name: ws._stugName, msg, mid, ts: Date.now() });
+    stugBroadcast(room, { t: "chat", id: ws._stugId, name: ws._stugName, msg, mid, kind: "player", ts: Date.now() });
     return;
   }
   if (t === "state") {
@@ -1061,11 +1095,14 @@ function stugHandle(ws, payloadStr) {
       escorts_alive: clamp(Number(m.escorts_alive != null ? m.escorts_alive : prev.escorts_alive), 0, 8),
       morale: clamp(Number(m.morale != null ? m.morale : prev.morale), 0, 100),
       mode: String(m.mode || prev.mode || "screen").slice(0, 16),
+      heading: clamp(Number(m.heading != null ? m.heading : prev.heading || 0), -360000, 360000),
       target: (m.target && Number.isFinite(Number(m.target.x)) && Number.isFinite(Number(m.target.y))) ? {
         x: clamp(Number(m.target.x), -1e9, 1e9),
         y: clamp(Number(m.target.y), -1e9, 1e9)
       } : null,
       selection: clamp(Number(m.selection != null ? m.selection : prev.selection), -1, 8),
+      escorts: Array.isArray(m.escorts) ? m.escorts.slice(0, 16) : (Array.isArray(prev.escorts) ? prev.escorts : []),
+      enemies: Array.isArray(m.enemies) ? m.enemies.slice(0, 64) : (Array.isArray(prev.enemies) ? prev.enemies : []),
       ts: Date.now()
     };
     const out = {
