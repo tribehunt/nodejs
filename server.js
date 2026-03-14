@@ -1,7 +1,7 @@
 // server.js - supports Eldritch Cyber Front,
 // Ethane Sea, Azha, Gun of Agartha, Belvara & STUG
 // One process, one port, isolated rooms by game.
-// by Dedset Media 02/24/2026 | @realhhfashion
+// by Dedset Media 02/24/2026
 const http = require("http");
 const https = require("https");
 const zlib = require("zlib");
@@ -540,7 +540,7 @@ function prisonHandle(ws, payloadStr) {
     return;
   }
 }
-// ------------------------------------------------------------------------------------------------------
+// ----------------------------------------------------------------------------------------------------------------------
 // BELVARA trade protocol (b:...)
 // Prefix protocol so it won't collide with JSON-based games.
 // Clients send:  b:{"t":"join","room":"belvara","id":"B-XXXX","name":"CAPTAIN"}
@@ -549,7 +549,7 @@ function prisonHandle(ws, payloadStr) {
 // Chat send:     b:{"t":"chat","room":"belvara","id":"B-XXXX","name":"CAPTAIN","msg":"...","mid":"...","ts":...}
 // Server sends:  b:{"t":"welcome","id":"...","room":"...","name":"..."}
 //                b:{"t":"state",...} / b:{"t":"shot",...} / b:{"t":"chat",...} / b:{"t":"sys",...} / b:{"t":"leave",...}
-// ------------------------------------------------------------------------------------------------------
+// ----------------------------------------------------------------------------------------------------------------------
 const belvaraRooms = new Map(); // roomName -> { name, clients:Set<ws>, nameMap:Map, ipMap:Map }
 function belvaraGetRoom(roomName) {
   const rn = safeRoomId(roomName || "belvara", "belvara");
@@ -752,8 +752,7 @@ function belvaraHandle(ws, payloadStr) {
     return;
   }
 }
-
-// ------------------------------------------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
 // STUG fleet-autobattle protocol (s:...)
 // Relaxed co-op bridge chat + fleet order relay for the endless war theater.
 // Clients send:  s:{"t":"join","room":"stug","id":"S-XXXX","name":"COMMANDER"}
@@ -763,7 +762,7 @@ function belvaraHandle(ws, payloadStr) {
 // Story send:    s:{"t":"story","text":"AI director/story bit"}
 // Server sends:  s:{"t":"welcome"} / s:{"t":"roster"} / s:{"t":"pulse"} / s:{"t":"state"}
 //                s:{"t":"order"} / s:{"t":"chat"} / s:{"t":"story"} / s:{"t":"sys"}
-// ------------------------------------------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
 const stugRooms = new Map(); // roomName -> { name, clients:Set<ws>, nameMap:Map, ipMap:Map, clock, theater, ... }
 function stugGetRoom(roomName) {
   const rn = safeRoomId(roomName || "stug", "stug");
@@ -962,7 +961,6 @@ function stugTickRoom(room, dt) {
   else if (th.front >= 20) th.phase = "advance";
   else if (th.front <= -20) th.phase = "fallback";
   else th.phase = "holding";
-
   room.waveEveryMs = clamp(Number(room.waveEveryMs || 18000), 12000, 24000);
   room.nextWaveAt = Number(room.nextWaveAt || room.waveEveryMs);
   while (room.clock >= room.nextWaveAt) {
@@ -1163,7 +1161,6 @@ function stugHandle(ws, payloadStr) {
     return;
   }
 }
-
 // ------------------------------------------------------------------------------------------------------
 // GUN OF AGARTHA CHAT protocol (g:...)
 // Prefix protocol so it won't collide with JSON-based games.
@@ -1287,7 +1284,6 @@ function agarthaHandle(ws, payloadStr) {
   const t = String(m.t || m.type || "").toLowerCase();
   if (t === "hello" || t === "join") {
     const room = agarthaGetRoom(m.room || "agartha");
-
     const switching = ws._agarthaRoomName && ws._agarthaRoomName !== room.name;
     if (switching) {
       agarthaDetach(ws, true);
@@ -1752,7 +1748,6 @@ wss.on("connection", (ws, req) => {
       try { agarthaHandle(ws, raw.slice(2)); } catch {}
       return;
     }
-
     // BELVARA trade protocol:
     if (raw && raw.startsWith("b:")) {
       try { belvaraHandle(ws, raw.slice(2)); } catch {}
@@ -2059,10 +2054,9 @@ setInterval(() => {
     }
   }
 }, TICK_MS);
-
-// ----------------------------------------
+// -------------------------
 // STUG shared theater pulse
-// ----------------------------------------
+// -------------------------
 const STUG_TICK_MS = 250;
 setInterval(() => {
   for (const room of stugRooms.values()) {
