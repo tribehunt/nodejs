@@ -931,6 +931,7 @@ function stugDefaultState() {
     mode: "screen",
     target: null,
     selection: -1,
+    cannon: null,
     routes: null,
     ts: Date.now()
   };
@@ -1105,6 +1106,13 @@ function stugHandle(ws, payloadStr) {
       escorts: Array.isArray(m.escorts) ? m.escorts.slice(0, 16) : (Array.isArray(prev.escorts) ? prev.escorts : []),
       enemies: Array.isArray(m.enemies) ? m.enemies.slice(0, 64) : (Array.isArray(prev.enemies) ? prev.enemies : []),
       bolts: Array.isArray(m.bolts) ? m.bolts.slice(0, 160) : (Array.isArray(prev.bolts) ? prev.bolts : []),
+      cannon: (m.cannon && typeof m.cannon === "object") ? {
+        mounted: !!m.cannon.mounted,
+        aim: clamp(Number(m.cannon.aim != null ? m.cannon.aim : 0), -360000, 360000),
+        retract: clamp(Number(m.cannon.retract != null ? m.cannon.retract : 0), 0, 1),
+        recoil: clamp(Number(m.cannon.recoil != null ? m.cannon.recoil : 0), 0, 1),
+        flash: clamp(Number(m.cannon.flash != null ? m.cannon.flash : 0), 0, 1)
+      } : ((prev.cannon && typeof prev.cannon === "object") ? prev.cannon : null),
       routes: (m.routes && typeof m.routes === "object") ? m.routes : ((prev.routes && typeof prev.routes === "object") ? prev.routes : null),
       ts: Date.now()
     };
