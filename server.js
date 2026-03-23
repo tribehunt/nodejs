@@ -1082,6 +1082,73 @@ function stugHandle(ws, payloadStr) {
     stugBroadcast(room, { t: "chat", id: ws._stugId, name: ws._stugName, msg, mid, kind: "player", ts: Date.now() });
     return;
   }
+  if (t === "gift") {
+    const giftId = String(m.gift_id || stugMid()).slice(0, 64);
+    const amount = Math.floor(Number(m.amount || 0));
+    const senderId = String(ws._stugId || "").slice(0, 32);
+    const senderName = String(ws._stugName || ws._stugId || "COMMANDER").slice(0, 24);
+    const wantedId = String(m.to_id || m.recipient_id || "").slice(0, 32);
+    const wantedName = String(m.to_name || m.recipient_name || "").replace(/\s+/g, " ").trim().slice(0, 24);
+    if (!(amount > 0)) {
+      stugSend(ws, { t: "gift_result", ok: false, gift_id: giftId, amount: 0, to_id: wantedId, to_name: wantedName, reason: "BAD_AMOUNT", ts: Date.now() });
+      return;
+    }
+    let recipient = null;
+    if (wantedId) {
+      for (const ows of room.clients) {
+        if (!ows) continue;
+        if (String(ows._stugId || "") === wantedId) {
+          recipient = ows;
+          break;
+        }
+      }
+    }
+    if (!recipient && wantedName) {
+      const key = normNameKey(wantedName);
+      if (key && room.nameMap && room.nameMap.get(key)) recipient = room.nameMap.get(key);
+      if (!recipient) {
+        for (const ows of room.clients) {
+          if (!ows) continue;
+          if (normNameKey(ows._stugName || "") === key) {
+            recipient = ows;
+            break;
+          }
+        }
+      }
+    }
+    if (!recipient || recipient.readyState !== WebSocket.OPEN || !room.clients.has(recipient)) {
+      stugSend(ws, { t: "gift_result", ok: false, gift_id: giftId, amount, to_id: wantedId, to_name: wantedName, reason: "TARGET_OFFLINE", ts: Date.now() });
+      return;
+    }
+    if (recipient === ws || String(recipient._stugId || "") === senderId) {
+      stugSend(ws, { t: "gift_result", ok: false, gift_id: giftId, amount, to_id: String(recipient._stugId || wantedId || "").slice(0, 32), to_name: String(recipient._stugName || wantedName || "").slice(0, 24), reason: "SELF_GIFT", ts: Date.now() });
+      return;
+    }
+    const recipientId = String(recipient._stugId || wantedId || "").slice(0, 32);
+    const recipientName = String(recipient._stugName || wantedName || recipientId || "COMMANDER").slice(0, 24);
+    stugSend(recipient, {
+      t: "gift",
+      gift_id: giftId,
+      from_id: senderId,
+      from_name: senderName,
+      to_id: recipientId,
+      to_name: recipientName,
+      amount,
+      ts: Date.now()
+    });
+    stugSend(ws, {
+      t: "gift_result",
+      ok: true,
+      gift_id: giftId,
+      from_id: senderId,
+      from_name: senderName,
+      to_id: recipientId,
+      to_name: recipientName,
+      amount,
+      ts: Date.now()
+    });
+    return;
+  }
   if (t === "state") {
     const prev = ws._stugState || stugDefaultState();
     const anchor = m.anchor || prev.anchor || { x: 0, y: 0 };
