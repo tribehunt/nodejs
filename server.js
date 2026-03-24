@@ -931,6 +931,7 @@ function stugDefaultState() {
     mode: "screen",
     target: null,
     selection: -1,
+    progression: { level: 1, rank: "" },
     cannon: null,
     routes: null,
     ts: Date.now()
@@ -1170,6 +1171,10 @@ function stugHandle(ws, payloadStr) {
         y: clamp(Number(m.target.y), -1e9, 1e9)
       } : null,
       selection: clamp(Number(m.selection != null ? m.selection : prev.selection), -1, 8),
+      progression: (m.progression && typeof m.progression === "object") ? {
+        level: clamp(Number(m.progression.level != null ? m.progression.level : ((prev.progression && prev.progression.level) || 1)), 1, 9999),
+        rank: String(m.progression.rank != null ? m.progression.rank : ((prev.progression && prev.progression.rank) || "")).slice(0, 64)
+      } : ((prev.progression && typeof prev.progression === "object") ? prev.progression : { level: 1, rank: "" }),
       escorts: Array.isArray(m.escorts) ? m.escorts.slice(0, 16) : (Array.isArray(prev.escorts) ? prev.escorts : []),
       enemies: Array.isArray(m.enemies) ? m.enemies.slice(0, 64) : (Array.isArray(prev.enemies) ? prev.enemies : []),
       bolts: Array.isArray(m.bolts) ? m.bolts.slice(0, 160) : (Array.isArray(prev.bolts) ? prev.bolts : []),
@@ -1180,6 +1185,11 @@ function stugHandle(ws, payloadStr) {
         recoil: clamp(Number(m.cannon.recoil != null ? m.cannon.recoil : 0), 0, 1),
         flash: clamp(Number(m.cannon.flash != null ? m.cannon.flash : 0), 0, 1)
       } : ((prev.cannon && typeof prev.cannon === "object") ? prev.cannon : null),
+      rare_item_bonuses: (m.rare_item_bonuses && typeof m.rare_item_bonuses === "object") ? m.rare_item_bonuses : ((prev.rare_item_bonuses && typeof prev.rare_item_bonuses === "object") ? prev.rare_item_bonuses : null),
+      hive_guardian_beams: Array.isArray(m.hive_guardian_beams) ? m.hive_guardian_beams.slice(0, 24) : (Array.isArray(prev.hive_guardian_beams) ? prev.hive_guardian_beams : []),
+      inside_hive: (m.inside_hive && typeof m.inside_hive === "object") ? m.inside_hive : ((prev.inside_hive && typeof prev.inside_hive === "object") ? prev.inside_hive : { active: false }),
+      inside_hive_shared: (m.inside_hive_shared && typeof m.inside_hive_shared === "object") ? m.inside_hive_shared : ((prev.inside_hive_shared && typeof prev.inside_hive_shared === "object") ? prev.inside_hive_shared : null),
+      hive_aftermath: (m.hive_aftermath && typeof m.hive_aftermath === "object") ? m.hive_aftermath : ((prev.hive_aftermath && typeof prev.hive_aftermath === "object") ? prev.hive_aftermath : null),
       routes: (m.routes && typeof m.routes === "object") ? m.routes : ((prev.routes && typeof prev.routes === "object") ? prev.routes : null),
       ts: Date.now()
     };
