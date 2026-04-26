@@ -1752,7 +1752,7 @@ function azhaMaybeStart(room, roomId) {
 // Server sends:  gf:{"t":"welcome",...} / gf:{"t":"hosts",...} / gf:{"t":"host_ok",...}
 //                gf:{"t":"joined_home","host":{...}} / gf:{"t":"visitor_arrived","visitor_name":"..."}
 // ----------------------------------------------------------------------------------------------------------------------
-const growthHosts = new Map(); // id -> { id, name, home_name, world_seed, x, y, ws, updatedAt }
+const growthHosts = new Map(); // id -> { id, name, home_name, world_seed, x, y, ws, visitors, snapshot, updatedAt }
 function growthSafeName(s, fb) {
   try {
     const out = String(s || "").replace(/\s+/g, " ").trim().slice(0, 48);
@@ -1765,8 +1765,8 @@ function growthSafeId(s) {
     return out || ("GF-" + rid());
   } catch { return "GF-" + rid(); }
 }
-function growthHostPublic(h, viewerWs) {
-  return {
+function growthHostPublic(h, viewerWs, includeSnapshot = false) {
+  const out = {
     id: String(h.id || ""),
     name: growthSafeName(h.name, "Bloatfrog"),
     home_name: growthSafeName(h.home_name, "Frog-Hole"),
@@ -1776,6 +1776,8 @@ function growthHostPublic(h, viewerWs) {
     age: Math.max(0, Math.floor((Date.now() - Number(h.updatedAt || 0)) / 1000)),
     you: !!(viewerWs && h.ws === viewerWs)
   };
+  if (includeSnapshot && h.snapshot && typeof h.snapshot === "object") out.snapshot = h.snapshot;
+  return out;
 }
 function growthSend(ws, obj) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -1807,11 +1809,46 @@ function growthBroadcastHosts() {
     }
   } catch {}
 }
+
+function growthVisitorSockets(host) {
+  const out = [];
+  try {
+    if (!host || !host.visitors) return out;
+    for (const v of [...host.visitors]) {
+      if (v && v.readyState === WebSocket.OPEN) out.push(v);
+      else host.visitors.delete(v);
+    }
+  } catch {}
+  return out;
+}
+function growthDetachVisitor(ws, silent = false) {
+  if (!ws) return;
+  const hostId = String(ws._growthHostId || "");
+  if (!hostId) return;
+  const host = growthHosts.get(hostId);
+  ws._growthHostId = "";
+  if (!host || !host.visitors) return;
+  host.visitors.delete(ws);
+  if (!silent && host.ws && host.ws.readyState === WebSocket.OPEN) {
+    growthSend(host.ws, { t: "visitor_left", visitor_id: String(ws._growthId || ""), visitor_name: growthSafeName(ws._growthName, "A visitor"), ts: Date.now() });
+  }
+  for (const v of growthVisitorSockets(host)) {
+    if (v !== ws) growthSend(v, { t: "visitor_left", visitor_id: String(ws._growthId || ""), visitor_name: growthSafeName(ws._growthName, "A visitor"), ts: Date.now() });
+  }
+}
 function growthDetach(ws) {
   if (!ws) return;
   let changed = false;
+  growthDetachVisitor(ws, false);
   for (const [id, h] of [...growthHosts.entries()]) {
-    if (h && h.ws === ws) { growthHosts.delete(id); changed = true; }
+    if (h && h.ws === ws) {
+      for (const v of growthVisitorSockets(h)) {
+        growthSend(v, { t: "host_left", host_id: id, ts: Date.now() });
+        try { v._growthHostId = ""; } catch {}
+      }
+      growthHosts.delete(id);
+      changed = true;
+    }
   }
   ws._growthSeen = false;
   if (changed) growthBroadcastHosts();
@@ -1846,6 +1883,8 @@ function growthHandle(ws, payloadStr) {
       x: clamp(Number(m.x || 0) || 0, -100000000, 100000000),
       y: clamp(Number(m.y || 0) || 0, -100000000, 100000000),
       ws,
+      visitors: (growthHosts.get(id) && growthHosts.get(id).visitors) ? growthHosts.get(id).visitors : new Set(),
+      snapshot: (m.snapshot && typeof m.snapshot === "object") ? m.snapshot : ((growthHosts.get(id) && growthHosts.get(id).snapshot) || null),
       updatedAt: Date.now()
     };
     growthHosts.set(id, entry);
@@ -1865,9 +1904,48 @@ function growthHandle(ws, payloadStr) {
     const visitorName = growthSafeName(m.visitor_name || ws._growthName, "A visitor");
     ws._growthId = growthSafeId(m.visitor_id || ws._growthId);
     ws._growthName = visitorName;
-    growthSend(ws, { t: "joined_home", host: growthHostPublic(host, ws), ts: Date.now() });
+    growthDetachVisitor(ws, true);
+    ws._growthHostId = hostId;
+    if (!host.visitors) host.visitors = new Set();
+    if (host.ws !== ws) host.visitors.add(ws);
+    growthSend(ws, { t: "joined_home", host: growthHostPublic(host, ws, true), snapshot: host.snapshot || null, ts: Date.now() });
+    if (host.snapshot && typeof host.snapshot === "object") growthSend(ws, { t: "director_world", snapshot: host.snapshot, ts: Date.now() });
     if (host.ws !== ws) {
       growthSend(host.ws, { t: "visitor_arrived", visitor_name: visitorName, visitor_id: ws._growthId, ts: Date.now() });
+      for (const v of growthVisitorSockets(host)) {
+        if (v !== ws) growthSend(v, { t: "visitor_arrived", visitor_name: visitorName, visitor_id: ws._growthId, ts: Date.now() });
+      }
+    }
+    return;
+  }
+  if (t === "world_update") {
+    const id = growthSafeId(m.id || ws._growthId);
+    const host = growthHosts.get(id);
+    if (!host || host.ws !== ws) return;
+    if (m.snapshot && typeof m.snapshot === "object") {
+      host.snapshot = m.snapshot;
+      host.updatedAt = Date.now();
+      try {
+        host.world_seed = Number(m.snapshot.world_seed || host.world_seed || 0) || host.world_seed || 0;
+        host.x = clamp(Number(m.snapshot.home_x || host.x || 0) || 0, -100000000, 100000000);
+        host.y = clamp(Number(m.snapshot.home_y || host.y || 0) || 0, -100000000, 100000000);
+      } catch {}
+      for (const v of growthVisitorSockets(host)) growthSend(v, { t: "director_world", host_id: id, snapshot: host.snapshot, ts: Date.now() });
+    }
+    return;
+  }
+  if (t === "player_update") {
+    const player = (m.player && typeof m.player === "object") ? m.player : {};
+    const fromId = growthSafeId(m.id || player.id || ws._growthId);
+    ws._growthId = fromId;
+    ws._growthName = growthSafeName(m.name || player.name || ws._growthName, "Bloatfrog");
+    const hostId = String(ws._growthHostId || "");
+    const host = hostId ? growthHosts.get(hostId) : null;
+    if (!host) return;
+    const packet = { t: "remote_player", from_id: fromId, name: ws._growthName, player, ts: Date.now() };
+    if (host.ws && host.ws !== ws) growthSend(host.ws, packet);
+    for (const v of growthVisitorSockets(host)) {
+      if (v !== ws) growthSend(v, packet);
     }
     return;
   }
