@@ -1915,16 +1915,57 @@ function growthHandle(ws, payloadStr) {
     if (!host.visitors) host.visitors = new Set();
     host.visitors.add(ws);
     growthSend(ws, { t: "joined_home", host: growthHostPublic(host, ws, true), snapshot: host.snapshot || null, ts: Date.now() });
-    if (host.snapshot && typeof host.snapshot === "object") growthSend(ws, { t: "director_world", host_id: hostId, snapshot: host.snapshot, ts: Date.now() });
-    // Force an immediate fresh director packet. This fixes the case where the
-    // visitor has the correct seed/terrain but no live object layer yet.
-    growthSend(host.ws, { t: "request_world", visitor_name: visitorName, visitor_id: ws._growthId, ts: Date.now() });
+    if (host.snapshot && typeof host.snapshot === "object") growthSend(ws, { t: "director_world", snapshot: host.snapshot, ts: Date.now() });
     growthSend(host.ws, { t: "visitor_arrived", visitor_name: visitorName, visitor_id: ws._growthId, ts: Date.now() });
+    growthSend(host.ws, { t: "request_world", visitor_name: visitorName, visitor_id: ws._growthId, ts: Date.now() });
     for (const v of growthVisitorSockets(host)) {
       if (v !== ws) growthSend(v, { t: "visitor_arrived", visitor_name: visitorName, visitor_id: ws._growthId, ts: Date.now() });
     }
     return;
   }
+  if (t === "request_world") {
+    const hostId = growthSafeId(m.host_id || ws._growthHostId || m.id || "");
+    const host = hostId ? growthHosts.get(hostId) : null;
+    if (host && host.ws && host.ws.readyState === WebSocket.OPEN) {
+      if (host.ws !== ws) {
+        growthSend(host.ws, { t: "request_world", visitor_id: growthSafeId(m.visitor_id || ws._growthId), visitor_name: growthSafeName(m.visitor_name || ws._growthName, "A visitor"), ts: Date.now() });
+      }
+      if (host.snapshot && typeof host.snapshot === "object") {
+        growthSend(ws, { t: "director_world", host_id: hostId, snapshot: host.snapshot, ts: Date.now() });
+      }
+    }
+    return;
+  }
+
+  if (t === "director_player") {
+    const id = growthSafeId(m.id || ws._growthId);
+    const host = growthHosts.get(id);
+    if (!host || host.ws !== ws) return;
+    ws._growthId = id;
+    ws._growthName = growthSafeName(m.name || ws._growthName, "Bloatfrog");
+    const player = (m.player && typeof m.player === "object") ? m.player : {};
+    const packet = { t: "director_player", host_id: id, from_id: id, name: ws._growthName, player, ts: Date.now() };
+    for (const v of growthVisitorSockets(host)) growthSend(v, packet);
+    return;
+  }
+
+  if (t === "entity_update") {
+    const id = growthSafeId(m.id || ws._growthId);
+    const host = growthHosts.get(id);
+    if (!host || host.ws !== ws) return;
+    if (m.layer && typeof m.layer === "object") {
+      host.snapshot = Object.assign({}, host.snapshot || {}, m.layer);
+      host.updatedAt = Date.now();
+      try {
+        host.world_seed = Number(m.layer.world_seed || host.world_seed || 0) || host.world_seed || 0;
+        host.x = clamp(Number(m.layer.home_x || host.x || 0) || 0, -100000000, 100000000);
+        host.y = clamp(Number(m.layer.home_y || host.y || 0) || 0, -100000000, 100000000);
+      } catch {}
+      for (const v of growthVisitorSockets(host)) growthSend(v, { t: "director_entities", host_id: id, layer: m.layer, ts: Date.now() });
+    }
+    return;
+  }
+
   if (t === "world_update") {
     const id = growthSafeId(m.id || ws._growthId);
     const host = growthHosts.get(id);
@@ -1939,24 +1980,6 @@ function growthHandle(ws, payloadStr) {
       } catch {}
       for (const v of growthVisitorSockets(host)) growthSend(v, { t: "director_world", host_id: id, snapshot: host.snapshot, ts: Date.now() });
     }
-    return;
-  }
-  if (t === "request_world") {
-    const hostId = growthSafeId(m.host_id || ws._growthHostId || "");
-    const host = growthHosts.get(hostId);
-    if (!host || !host.ws || host.ws.readyState !== WebSocket.OPEN) {
-      growthSend(ws, { t: "error", code: "host_missing", message: "That Frog-Hole is no longer broadcasting." });
-      return;
-    }
-    if (host.snapshot && typeof host.snapshot === "object") {
-      growthSend(ws, { t: "director_world", host_id: hostId, snapshot: host.snapshot, ts: Date.now() });
-    }
-    growthSend(host.ws, {
-      t: "request_world",
-      visitor_name: growthSafeName(m.visitor_name || ws._growthName, "A visitor"),
-      visitor_id: growthSafeId(m.visitor_id || ws._growthId),
-      ts: Date.now()
-    });
     return;
   }
   if (t === "player_update") {
