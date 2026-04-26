@@ -1997,6 +1997,67 @@ function growthHandle(ws, payloadStr) {
     }
     return;
   }
+
+  if (t === "visitor_tongue") {
+    const hostId = growthSafeId(m.host_id || ws._growthHostId || "");
+    const host = hostId ? growthHosts.get(hostId) : null;
+    if (!host || !host.ws || host.ws.readyState !== WebSocket.OPEN) {
+      growthSend(ws, { t: "error", code: "host_missing", message: "Director Frog-Hole is no longer available." });
+      return;
+    }
+    const player = (m.player && typeof m.player === "object") ? m.player : {};
+    const visitorId = growthSafeId(m.visitor_id || player.id || ws._growthId);
+    ws._growthId = visitorId;
+    ws._growthName = growthSafeName(m.visitor_name || m.name || player.name || ws._growthName, "A visitor");
+    if (!host.visitors) host.visitors = new Set();
+    host.visitors.add(ws);
+    ws._growthHostId = hostId;
+    growthSend(host.ws, {
+      t: "visitor_tongue",
+      host_id: hostId,
+      visitor_id: visitorId,
+      visitor_name: ws._growthName,
+      player,
+      sx: Number(m.sx || 0) || 0,
+      sy: Number(m.sy || 0) || 0,
+      target_x: Number(m.target_x || 0) || 0,
+      target_y: Number(m.target_y || 0) || 0,
+      max_range: Number(m.max_range || 0) || 0,
+      kinetic: Number(m.kinetic || 0) || 0,
+      toxicity: Number(m.toxicity || 0) || 0,
+      chaos: Number(m.chaos || 0) || 0,
+      client_hit_uid: String(m.client_hit_uid || "").slice(0, 96),
+      client_hit_type: String(m.client_hit_type || "").slice(0, 16),
+      request_id: String(m.request_id || "").slice(0, 96),
+      ts: Date.now()
+    });
+    return;
+  }
+
+  if (t === "visitor_action_result") {
+    const hostId = growthSafeId(m.host_id || ws._growthId || "");
+    const host = hostId ? growthHosts.get(hostId) : null;
+    if (!host || host.ws !== ws) return;
+    const visitorId = growthSafeId(m.visitor_id || "");
+    const packet = {
+      t: "visitor_action_result",
+      host_id: hostId,
+      visitor_id: visitorId,
+      result: (m.result && typeof m.result === "object") ? m.result : {},
+      ts: Date.now()
+    };
+    let delivered = false;
+    for (const v of growthVisitorSockets(host)) {
+      if (growthSafeId(v._growthId || "") === visitorId) {
+        growthSend(v, packet);
+        delivered = true;
+      }
+    }
+    if (!delivered) {
+      for (const v of growthVisitorSockets(host)) growthSend(v, packet);
+    }
+    return;
+  }
   if (t === "ping") {
     growthSend(ws, { t: "pong", ts: Date.now() });
     return;
