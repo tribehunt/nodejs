@@ -1,5 +1,5 @@
 // server.js - supports Eldritch Cyber Front,
-// Ethane Sea, Azha, Gun of Agartha, Belvara & STUG
+// Ethane Sea, Azha, Gun of Agartha, Belvara, STUG & GROWTH
 // One process, one port, isolated rooms by game.
 // by Dedset Media 02/24/2026
 const http = require("http");
@@ -1742,6 +1742,141 @@ function azhaMaybeStart(room, roomId) {
   azhaBroadcast(room, { type: "start", room: roomId, seed: room.seed, mapW: room.mapW, mapH: room.mapH });
   azhaStartMission(room);
 }
+// ----------------------------------------------------------------------------------------------------------------------
+// GROWTH Frog-Hole / Croakline protocol (gf:...)
+// Isolated section for the Bloatfrog home-hosting tutorial.
+// Clients send:  gf:{"t":"hello","id":"GF-XXXX","name":"Peatwater Frog-Hole"}
+//                gf:{"t":"host","id":"GF-XXXX","name":"...","home_name":"...","world_seed":123,"x":0,"y":0}
+//                gf:{"t":"list"}
+//                gf:{"t":"join_home","host_id":"GF-XXXX","visitor_id":"GF-YYYY","visitor_name":"..."}
+// Server sends:  gf:{"t":"welcome",...} / gf:{"t":"hosts",...} / gf:{"t":"host_ok",...}
+//                gf:{"t":"joined_home","host":{...}} / gf:{"t":"visitor_arrived","visitor_name":"..."}
+// ----------------------------------------------------------------------------------------------------------------------
+const growthHosts = new Map(); // id -> { id, name, home_name, world_seed, x, y, ws, updatedAt }
+function growthSafeName(s, fb) {
+  try {
+    const out = String(s || "").replace(/\s+/g, " ").trim().slice(0, 48);
+    return out || fb;
+  } catch { return fb; }
+}
+function growthSafeId(s) {
+  try {
+    const out = String(s || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+    return out || ("GF-" + rid());
+  } catch { return "GF-" + rid(); }
+}
+function growthHostPublic(h, viewerWs) {
+  return {
+    id: String(h.id || ""),
+    name: growthSafeName(h.name, "Bloatfrog"),
+    home_name: growthSafeName(h.home_name, "Frog-Hole"),
+    world_seed: Number(h.world_seed || 0) || 0,
+    x: Number(h.x || 0) || 0,
+    y: Number(h.y || 0) || 0,
+    age: Math.max(0, Math.floor((Date.now() - Number(h.updatedAt || 0)) / 1000)),
+    you: !!(viewerWs && h.ws === viewerWs)
+  };
+}
+function growthSend(ws, obj) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  try { ws.send("gf:" + JSON.stringify(obj)); } catch {}
+}
+function growthCleanHosts() {
+  const now = Date.now();
+  for (const [id, h] of [...growthHosts.entries()]) {
+    if (!h || !h.ws || h.ws.readyState !== WebSocket.OPEN || now - Number(h.updatedAt || 0) > 120000) {
+      growthHosts.delete(id);
+    }
+  }
+}
+function growthHostsFor(ws) {
+  growthCleanHosts();
+  return [...growthHosts.values()]
+    .map(h => growthHostPublic(h, ws))
+    .sort((a, b) => (b.you ? 1 : 0) - (a.you ? 1 : 0) || String(a.home_name).localeCompare(String(b.home_name)))
+    .slice(0, 80);
+}
+function growthSendHosts(ws) {
+  growthSend(ws, { t: "hosts", hosts: growthHostsFor(ws), ts: Date.now() });
+}
+function growthBroadcastHosts() {
+  growthCleanHosts();
+  try {
+    for (const c of wss.clients) {
+      if (c && c.readyState === WebSocket.OPEN && c._growthSeen) growthSendHosts(c);
+    }
+  } catch {}
+}
+function growthDetach(ws) {
+  if (!ws) return;
+  let changed = false;
+  for (const [id, h] of [...growthHosts.entries()]) {
+    if (h && h.ws === ws) { growthHosts.delete(id); changed = true; }
+  }
+  ws._growthSeen = false;
+  if (changed) growthBroadcastHosts();
+}
+function growthHandle(ws, payloadStr) {
+  let m = null;
+  try { m = JSON.parse(String(payloadStr || "")); } catch { m = null; }
+  if (!m || typeof m !== "object") return;
+  ws._growthSeen = true;
+  const t = String(m.t || m.type || "").toLowerCase();
+  if (t === "hello") {
+    ws._growthId = growthSafeId(m.id || ws._growthId);
+    ws._growthName = growthSafeName(m.name || ws._growthName, "Bloatfrog");
+    growthSend(ws, { t: "welcome", id: ws._growthId, name: ws._growthName, ts: Date.now() });
+    growthSendHosts(ws);
+    return;
+  }
+  if (t === "list") {
+    growthSendHosts(ws);
+    return;
+  }
+  if (t === "host") {
+    const id = growthSafeId(m.id || ws._growthId);
+    ws._growthId = id;
+    ws._growthName = growthSafeName(m.name || ws._growthName, "Bloatfrog");
+    const homeName = growthSafeName(m.home_name || ws._growthName, "Frog-Hole");
+    const entry = {
+      id,
+      name: ws._growthName,
+      home_name: homeName,
+      world_seed: Number(m.world_seed || 0) || 0,
+      x: clamp(Number(m.x || 0) || 0, -100000000, 100000000),
+      y: clamp(Number(m.y || 0) || 0, -100000000, 100000000),
+      ws,
+      updatedAt: Date.now()
+    };
+    growthHosts.set(id, entry);
+    growthSend(ws, { t: "host_ok", host: growthHostPublic(entry, ws), ts: Date.now() });
+    growthBroadcastHosts();
+    return;
+  }
+  if (t === "join_home") {
+    const hostId = growthSafeId(m.host_id || m.id || "");
+    growthCleanHosts();
+    const host = growthHosts.get(hostId);
+    if (!host || !host.ws || host.ws.readyState !== WebSocket.OPEN) {
+      growthSend(ws, { t: "error", code: "host_missing", message: "That Frog-Hole is no longer broadcasting." });
+      growthSendHosts(ws);
+      return;
+    }
+    const visitorName = growthSafeName(m.visitor_name || ws._growthName, "A visitor");
+    ws._growthId = growthSafeId(m.visitor_id || ws._growthId);
+    ws._growthName = visitorName;
+    growthSend(ws, { t: "joined_home", host: growthHostPublic(host, ws), ts: Date.now() });
+    if (host.ws !== ws) {
+      growthSend(host.ws, { t: "visitor_arrived", visitor_name: visitorName, visitor_id: ws._growthId, ts: Date.now() });
+    }
+    return;
+  }
+  if (t === "ping") {
+    growthSend(ws, { t: "pong", ts: Date.now() });
+    return;
+  }
+}
+
 // -----------------------------------------
 // Connection handler (auto-detect protocol)
 // -----------------------------------------
@@ -1841,6 +1976,11 @@ wss.on("connection", (ws, req) => {
     // STUG fleet-autobattle protocol:
     if (raw && raw.startsWith("s:")) {
       try { stugHandle(ws, raw.slice(2)); } catch {}
+      return;
+    }
+    // GROWTH Frog-Hole / Croakline protocol:
+    if (raw && raw.startsWith("gf:")) {
+      try { growthHandle(ws, raw.slice(3)); } catch {}
       return;
     }
 let m;
@@ -2066,6 +2206,7 @@ let m;
     try { agarthaDetach(ws, true); } catch {}
     try { belvaraDetach(ws, true); } catch {}
     try { stugDetach(ws, true); } catch {}
+    try { growthDetach(ws); } catch {}
     detachFromCurrentRoom();
   });
 });
