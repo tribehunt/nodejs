@@ -1915,7 +1915,10 @@ function growthHandle(ws, payloadStr) {
     if (!host.visitors) host.visitors = new Set();
     host.visitors.add(ws);
     growthSend(ws, { t: "joined_home", host: growthHostPublic(host, ws, true), snapshot: host.snapshot || null, ts: Date.now() });
-    if (host.snapshot && typeof host.snapshot === "object") growthSend(ws, { t: "director_world", snapshot: host.snapshot, ts: Date.now() });
+    if (host.snapshot && typeof host.snapshot === "object") growthSend(ws, { t: "director_world", host_id: hostId, snapshot: host.snapshot, ts: Date.now() });
+    // Force an immediate fresh director packet. This fixes the case where the
+    // visitor has the correct seed/terrain but no live object layer yet.
+    growthSend(host.ws, { t: "request_world", visitor_name: visitorName, visitor_id: ws._growthId, ts: Date.now() });
     growthSend(host.ws, { t: "visitor_arrived", visitor_name: visitorName, visitor_id: ws._growthId, ts: Date.now() });
     for (const v of growthVisitorSockets(host)) {
       if (v !== ws) growthSend(v, { t: "visitor_arrived", visitor_name: visitorName, visitor_id: ws._growthId, ts: Date.now() });
@@ -1936,6 +1939,24 @@ function growthHandle(ws, payloadStr) {
       } catch {}
       for (const v of growthVisitorSockets(host)) growthSend(v, { t: "director_world", host_id: id, snapshot: host.snapshot, ts: Date.now() });
     }
+    return;
+  }
+  if (t === "request_world") {
+    const hostId = growthSafeId(m.host_id || ws._growthHostId || "");
+    const host = growthHosts.get(hostId);
+    if (!host || !host.ws || host.ws.readyState !== WebSocket.OPEN) {
+      growthSend(ws, { t: "error", code: "host_missing", message: "That Frog-Hole is no longer broadcasting." });
+      return;
+    }
+    if (host.snapshot && typeof host.snapshot === "object") {
+      growthSend(ws, { t: "director_world", host_id: hostId, snapshot: host.snapshot, ts: Date.now() });
+    }
+    growthSend(host.ws, {
+      t: "request_world",
+      visitor_name: growthSafeName(m.visitor_name || ws._growthName, "A visitor"),
+      visitor_id: growthSafeId(m.visitor_id || ws._growthId),
+      ts: Date.now()
+    });
     return;
   }
   if (t === "player_update") {
