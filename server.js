@@ -1902,19 +1902,23 @@ function growthHandle(ws, payloadStr) {
       return;
     }
     const visitorName = growthSafeName(m.visitor_name || ws._growthName, "A visitor");
-    ws._growthId = growthSafeId(m.visitor_id || ws._growthId);
+    const visitorId = growthSafeId(m.visitor_id || ws._growthId);
+    if (host.ws === ws || visitorId === hostId) {
+      growthSend(ws, { t: "error", code: "self_join", message: "That is your own Frog-Hole. Pick another online host." });
+      growthSendHosts(ws);
+      return;
+    }
+    ws._growthId = visitorId;
     ws._growthName = visitorName;
     growthDetachVisitor(ws, true);
     ws._growthHostId = hostId;
     if (!host.visitors) host.visitors = new Set();
-    if (host.ws !== ws) host.visitors.add(ws);
+    host.visitors.add(ws);
     growthSend(ws, { t: "joined_home", host: growthHostPublic(host, ws, true), snapshot: host.snapshot || null, ts: Date.now() });
     if (host.snapshot && typeof host.snapshot === "object") growthSend(ws, { t: "director_world", snapshot: host.snapshot, ts: Date.now() });
-    if (host.ws !== ws) {
-      growthSend(host.ws, { t: "visitor_arrived", visitor_name: visitorName, visitor_id: ws._growthId, ts: Date.now() });
-      for (const v of growthVisitorSockets(host)) {
-        if (v !== ws) growthSend(v, { t: "visitor_arrived", visitor_name: visitorName, visitor_id: ws._growthId, ts: Date.now() });
-      }
+    growthSend(host.ws, { t: "visitor_arrived", visitor_name: visitorName, visitor_id: ws._growthId, ts: Date.now() });
+    for (const v of growthVisitorSockets(host)) {
+      if (v !== ws) growthSend(v, { t: "visitor_arrived", visitor_name: visitorName, visitor_id: ws._growthId, ts: Date.now() });
     }
     return;
   }
