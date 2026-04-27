@@ -1914,8 +1914,7 @@ function growthHandle(ws, payloadStr) {
     ws._growthHostId = hostId;
     if (!host.visitors) host.visitors = new Set();
     host.visitors.add(ws);
-    growthSend(ws, { t: "joined_home", host: growthHostPublic(host, ws, true), snapshot: host.snapshot || null, ts: Date.now() });
-    if (host.snapshot && typeof host.snapshot === "object") growthSend(ws, { t: "director_world", snapshot: host.snapshot, ts: Date.now() });
+    growthSend(ws, { t: "joined_home", host: growthHostPublic(host, ws, false), snapshot: null, ts: Date.now() });
     growthSend(host.ws, { t: "visitor_arrived", visitor_name: visitorName, visitor_id: ws._growthId, ts: Date.now() });
     growthSend(host.ws, { t: "request_world", visitor_name: visitorName, visitor_id: ws._growthId, ts: Date.now() });
     for (const v of growthVisitorSockets(host)) {
@@ -2060,6 +2059,91 @@ function growthHandle(ws, payloadStr) {
     for (const v of growthVisitorSockets(host)) {
       if (v !== target) growthSend(v, { t: "visitor_left", visitor_id: visitorId, visitor_name: growthSafeName(target._growthName, "A visitor"), ts: Date.now() });
     }
+    return;
+  }
+
+
+  if (t === "castle_grate_request") {
+    const hostId = growthSafeId(m.host_id || ws._growthHostId || "");
+    const host = hostId ? growthHosts.get(hostId) : null;
+    if (!host || !host.ws || host.ws.readyState !== WebSocket.OPEN) {
+      growthSend(ws, { t: "error", code: "host_missing", message: "Sunken Shield director is no longer available." });
+      return;
+    }
+    const player = (m.player && typeof m.player === "object") ? m.player : {};
+    const visitorId = growthSafeId(m.visitor_id || player.id || ws._growthId);
+    ws._growthId = visitorId;
+    ws._growthName = growthSafeName(m.visitor_name || m.name || player.name || ws._growthName, "A visitor");
+    if (!host.visitors) host.visitors = new Set();
+    host.visitors.add(ws);
+    ws._growthHostId = hostId;
+    growthSend(host.ws, {
+      t: "castle_grate_request",
+      host_id: hostId,
+      visitor_id: visitorId,
+      visitor_name: ws._growthName,
+      floor: Number(m.floor || 0) || 0,
+      direction: Number(m.direction || 0) || 0,
+      ts: Date.now()
+    });
+    return;
+  }
+
+  if (t === "castle_exit_request") {
+    const hostId = growthSafeId(m.host_id || ws._growthHostId || "");
+    const host = hostId ? growthHosts.get(hostId) : null;
+    if (!host || !host.ws || host.ws.readyState !== WebSocket.OPEN) {
+      growthSend(ws, { t: "error", code: "host_missing", message: "Sunken Shield director is no longer available." });
+      return;
+    }
+    const visitorId = growthSafeId(m.visitor_id || ws._growthId);
+    ws._growthId = visitorId;
+    ws._growthName = growthSafeName(m.visitor_name || m.name || ws._growthName, "A visitor");
+    if (!host.visitors) host.visitors = new Set();
+    host.visitors.add(ws);
+    ws._growthHostId = hostId;
+    growthSend(host.ws, {
+      t: "castle_exit_request",
+      host_id: hostId,
+      visitor_id: visitorId,
+      visitor_name: ws._growthName,
+      ts: Date.now()
+    });
+    return;
+  }
+
+  if (t === "castle_exit") {
+    const hostId = growthSafeId(m.host_id || ws._growthId || "");
+    const host = hostId ? growthHosts.get(hostId) : null;
+    if (!host || host.ws !== ws) return;
+    const packet = {
+      t: "castle_exit",
+      host_id: hostId,
+      reason: String(m.reason || "exit_grate").slice(0, 48),
+      requested_by: growthSafeName(m.requested_by || "", ""),
+      ts: Date.now()
+    };
+    for (const v of growthVisitorSockets(host)) {
+      growthSend(v, packet);
+      try { v._growthHostId = ""; } catch {}
+    }
+    try { if (host.visitors) host.visitors.clear(); } catch {}
+    return;
+  }
+
+  if (t === "castle_chat" || t === "chat") {
+    const hostId = growthSafeId(m.host_id || ws._growthHostId || m.id || ws._growthId || "");
+    const host = hostId ? growthHosts.get(hostId) : null;
+    if (!host) return;
+    const senderId = growthSafeId(m.id || ws._growthId || "");
+    ws._growthId = senderId;
+    ws._growthName = growthSafeName(m.name || ws._growthName, senderId || "FROG");
+    const msg = String(m.msg || m.message || "").replace(/\r?\n/g, " ").trim().slice(0, 220);
+    if (!msg) return;
+    const mid = String(m.mid || (senderId + "-" + Date.now() + "-" + rid())).slice(0, 80);
+    const packet = { t: "castle_chat", host_id: host.id, id: senderId, name: ws._growthName, msg, mid, ts: Date.now() };
+    if (host.ws && host.ws.readyState === WebSocket.OPEN) growthSend(host.ws, packet);
+    for (const v of growthVisitorSockets(host)) growthSend(v, packet);
     return;
   }
 
