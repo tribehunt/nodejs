@@ -2131,18 +2131,6 @@ function growthHandle(ws, payloadStr) {
     return;
   }
 
-  if (t === "castle_quest_event") {
-    const hostId = growthSafeId(m.host_id || ws._growthId || ws._growthHostId || "");
-    const host = hostId ? growthHosts.get(hostId) : null;
-    if (!host) return;
-    const event = String(m.event || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 48);
-    if (!event) return;
-    const packet = { t: "castle_quest_event", host_id: hostId, event, ts: Date.now() };
-    if (host.ws && host.ws.readyState === WebSocket.OPEN) growthSend(host.ws, packet);
-    for (const v of growthVisitorSockets(host)) growthSend(v, packet);
-    return;
-  }
-
   if (t === "castle_chat" || t === "chat") {
     const hostId = growthSafeId(m.host_id || ws._growthHostId || m.id || ws._growthId || "");
     const host = hostId ? growthHosts.get(hostId) : null;
