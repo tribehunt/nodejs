@@ -2225,6 +2225,24 @@ function growthHandle(ws, payloadStr) {
     return;
   }
 
+
+  if (t === "castle_xp_share") {
+    const hostId = growthSafeId(m.host_id || ws._growthId || "");
+    const host = hostId ? growthHosts.get(hostId) : null;
+    if (!host || host.ws !== ws) return;
+    const amount = Math.max(0, Math.floor(Number(m.amount || 0) || 0));
+    if (amount <= 0) return;
+    const packet = {
+      t: "castle_xp_share",
+      host_id: hostId,
+      amount,
+      reason: String(m.reason || "Sunken Shield kill").slice(0, 80),
+      ts: Date.now()
+    };
+    for (const v of growthVisitorSockets(host)) growthSend(v, packet);
+    return;
+  }
+
   if (t === "castle_quest_event") {
     const hostId = growthSafeId(m.host_id || ws._growthId || ws._growthHostId || "");
     const host = hostId ? growthHosts.get(hostId) : null;
