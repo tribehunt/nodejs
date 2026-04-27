@@ -337,7 +337,7 @@ const rooms = new Map();
 // ETHANE SEA PRISON protocol (p:...)
 // Simple prefix protocol so it won't collide with JSON-based games.
 // Clients send:  p:{"t":"hello","room":"ethane_prison","id":"P-XXXX","name":"P-XXXX"}
-// Chat send:     p:{"t":"chat","room":"ethane_prison","id":"P-XXXX","name":"P-XXXX","msg":"hello","mid":"..."} 
+// Chat send:     p:{"t":"chat","room":"ethane_prison","id":"P-XXXX","name":"P-XXXX","msg":"hello","mid":"..."}
 // Server sends:  p:{"t":"chat","id":"...","name":"...","msg":"...","mid":"...","ts":...}
 // ------------------------------------------------------------------------------------------------------------
 const prisonRooms = new Map(); // roomName -> { name, clients:Set<ws> }
