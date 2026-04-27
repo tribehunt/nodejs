@@ -1925,6 +1925,26 @@ function growthHandle(ws, payloadStr) {
     growthBroadcastHosts();
     return;
   }
+  if (t === "host_quit" || t === "director_quit") {
+    const hostId = growthSafeId(m.host_id || m.id || ws._growthId || "");
+    const host = hostId ? growthHosts.get(hostId) : null;
+    if (!host || host.ws !== ws) return;
+    const packet = {
+      t: "host_left",
+      host_id: hostId,
+      reason: String(m.reason || "director_quit").slice(0, 48),
+      name: growthSafeName(m.name || ws._growthName, "Director"),
+      ts: Date.now()
+    };
+    for (const v of growthVisitorSockets(host)) {
+      growthSend(v, packet);
+      try { v._growthHostId = ""; } catch {}
+    }
+    try { if (host.visitors) host.visitors.clear(); } catch {}
+    try { growthHosts.delete(hostId); } catch {}
+    growthBroadcastHosts();
+    return;
+  }
   if (t === "join_home") {
     const hostId = growthSafeId(m.host_id || m.id || "");
     growthCleanHosts();
