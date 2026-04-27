@@ -1897,14 +1897,14 @@ function growthHandle(ws, payloadStr) {
     growthCleanHosts();
     const host = growthHosts.get(hostId);
     if (!host || !host.ws || host.ws.readyState !== WebSocket.OPEN) {
-      growthSend(ws, { t: "error", code: "host_missing", message: "That Frog-Hole is no longer broadcasting." });
+      growthSend(ws, { t: "error", code: "host_missing", message: "That Sunken Shield director is no longer broadcasting." });
       growthSendHosts(ws);
       return;
     }
     const visitorName = growthSafeName(m.visitor_name || ws._growthName, "A visitor");
     const visitorId = growthSafeId(m.visitor_id || ws._growthId);
     if (host.ws === ws || visitorId === hostId) {
-      growthSend(ws, { t: "error", code: "self_join", message: "That is your own Frog-Hole. Pick another online host." });
+      growthSend(ws, { t: "error", code: "self_join", message: "That is your own Sunken Shield host. Pick another online director." });
       growthSendHosts(ws);
       return;
     }
@@ -2002,7 +2002,7 @@ function growthHandle(ws, payloadStr) {
     const hostId = growthSafeId(m.host_id || ws._growthHostId || "");
     const host = hostId ? growthHosts.get(hostId) : null;
     if (!host || !host.ws || host.ws.readyState !== WebSocket.OPEN) {
-      growthSend(ws, { t: "error", code: "host_missing", message: "Director Frog-Hole is no longer available." });
+      growthSend(ws, { t: "error", code: "host_missing", message: "Sunken Shield director is no longer available." });
       return;
     }
     const player = (m.player && typeof m.player === "object") ? m.player : {};
@@ -2031,6 +2031,35 @@ function growthHandle(ws, payloadStr) {
       request_id: String(m.request_id || "").slice(0, 96),
       ts: Date.now()
     });
+    return;
+  }
+
+
+  if (t === "visitor_decision") {
+    const hostId = growthSafeId(m.host_id || ws._growthId || "");
+    const host = hostId ? growthHosts.get(hostId) : null;
+    if (!host || host.ws !== ws) return;
+    const visitorId = growthSafeId(m.visitor_id || "");
+    const accepted = !!m.accepted;
+    let target = null;
+    for (const v of growthVisitorSockets(host)) {
+      if (growthSafeId(v._growthId || "") === visitorId) { target = v; break; }
+    }
+    if (!target) return;
+    if (accepted) {
+      growthSend(target, { t: "visitor_accepted", host_id: hostId, visitor_id: visitorId, ts: Date.now() });
+      growthSend(ws, { t: "visitor_accepted_ack", visitor_id: visitorId, ts: Date.now() });
+      if (host.snapshot && typeof host.snapshot === "object") {
+        growthSend(target, { t: "director_world", host_id: hostId, snapshot: host.snapshot, ts: Date.now() });
+      }
+      return;
+    }
+    growthSend(target, { t: "visitor_rejected", host_id: hostId, visitor_id: visitorId, message: "The director ignored the alcove request.", ts: Date.now() });
+    try { if (host.visitors) host.visitors.delete(target); } catch {}
+    try { target._growthHostId = ""; } catch {}
+    for (const v of growthVisitorSockets(host)) {
+      if (v !== target) growthSend(v, { t: "visitor_left", visitor_id: visitorId, visitor_name: growthSafeName(target._growthName, "A visitor"), ts: Date.now() });
+    }
     return;
   }
 
