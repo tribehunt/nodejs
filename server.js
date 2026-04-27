@@ -1752,7 +1752,8 @@ function azhaMaybeStart(room, roomId) {
 // Server sends:  gf:{"t":"welcome",...} / gf:{"t":"hosts",...} / gf:{"t":"host_ok",...}
 //                gf:{"t":"joined_home","host":{...}} / gf:{"t":"visitor_arrived","visitor_name":"..."}
 // ----------------------------------------------------------------------------------------------------------------------
-const growthHosts = new Map(); // id -> { id, name, home_name, world_seed, x, y, ws, visitors, snapshot, updatedAt }
+const growthHosts = new Map(); // id -> { id, name, home_name, world_seed, x, y, ws, visitors, snapshot, updatedAt, offlineSince }
+const GROWTH_DISCONNECT_GRACE_MS = 15000;
 function growthSafeName(s, fb) {
   try {
     const out = String(s || "").replace(/\s+/g, " ").trim().slice(0, 48);
@@ -1783,17 +1784,41 @@ function growthSend(ws, obj) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   try { ws.send("gf:" + JSON.stringify(obj)); } catch {}
 }
+function growthExpireHost(id, h) {
+  try {
+    for (const v of growthVisitorSockets(h)) {
+      growthSend(v, { t: "host_left", host_id: id, ts: Date.now() });
+      try { v._growthHostId = ""; } catch {}
+    }
+  } catch {}
+  try { growthHosts.delete(id); } catch {}
+}
 function growthCleanHosts() {
   const now = Date.now();
+  let changed = false;
   for (const [id, h] of [...growthHosts.entries()]) {
-    if (!h || !h.ws || h.ws.readyState !== WebSocket.OPEN || now - Number(h.updatedAt || 0) > 120000) {
-      growthHosts.delete(id);
+    if (!h) { growthHosts.delete(id); changed = true; continue; }
+    const open = !!(h.ws && h.ws.readyState === WebSocket.OPEN);
+    if (!open) {
+      if (!h.offlineSince) h.offlineSince = now;
+      if (now - Number(h.offlineSince || now) > GROWTH_DISCONNECT_GRACE_MS) {
+        growthExpireHost(id, h);
+        changed = true;
+      }
+      continue;
+    }
+    h.offlineSince = 0;
+    if (now - Number(h.updatedAt || 0) > 180000) {
+      growthExpireHost(id, h);
+      changed = true;
     }
   }
+  return changed;
 }
 function growthHostsFor(ws) {
   growthCleanHosts();
   return [...growthHosts.values()]
+    .filter(h => h && h.ws && h.ws.readyState === WebSocket.OPEN)
     .map(h => growthHostPublic(h, ws))
     .sort((a, b) => (b.you ? 1 : 0) - (a.you ? 1 : 0) || String(a.home_name).localeCompare(String(b.home_name)))
     .slice(0, 80);
@@ -1842,12 +1867,13 @@ function growthDetach(ws) {
   growthDetachVisitor(ws, false);
   for (const [id, h] of [...growthHosts.entries()]) {
     if (h && h.ws === ws) {
-      for (const v of growthVisitorSockets(h)) {
-        growthSend(v, { t: "host_left", host_id: id, ts: Date.now() });
-        try { v._growthHostId = ""; } catch {}
-      }
-      growthHosts.delete(id);
+      // Do not instantly boot visitors on a short Railway/browser reconnect.
+      // Keep the host cell warm briefly; if the same director re-announces the
+      // same id, visitors remain attached and receive the fresh snapshot.
+      h.ws = null;
+      h.offlineSince = Date.now();
       changed = true;
+      setTimeout(() => { try { growthCleanHosts(); growthBroadcastHosts(); } catch {} }, GROWTH_DISCONNECT_GRACE_MS + 1000);
     }
   }
   ws._growthSeen = false;
@@ -1875,6 +1901,7 @@ function growthHandle(ws, payloadStr) {
     ws._growthId = id;
     ws._growthName = growthSafeName(m.name || ws._growthName, "Bloatfrog");
     const homeName = growthSafeName(m.home_name || ws._growthName, "Frog-Hole");
+    const prev = growthHosts.get(id) || null;
     const entry = {
       id,
       name: ws._growthName,
@@ -1883,11 +1910,17 @@ function growthHandle(ws, payloadStr) {
       x: clamp(Number(m.x || 0) || 0, -100000000, 100000000),
       y: clamp(Number(m.y || 0) || 0, -100000000, 100000000),
       ws,
-      visitors: (growthHosts.get(id) && growthHosts.get(id).visitors) ? growthHosts.get(id).visitors : new Set(),
-      snapshot: (m.snapshot && typeof m.snapshot === "object") ? m.snapshot : ((growthHosts.get(id) && growthHosts.get(id).snapshot) || null),
-      updatedAt: Date.now()
+      visitors: (prev && prev.visitors) ? prev.visitors : new Set(),
+      snapshot: (m.snapshot && typeof m.snapshot === "object") ? m.snapshot : ((prev && prev.snapshot) || null),
+      updatedAt: Date.now(),
+      offlineSince: 0
     };
     growthHosts.set(id, entry);
+    for (const v of growthVisitorSockets(entry)) {
+      try { v._growthHostId = id; } catch {}
+      growthSend(v, { t: "visitor_accepted", host_id: id, visitor_id: growthSafeId(v._growthId || ""), reconnect: true, ts: Date.now() });
+      if (entry.snapshot && typeof entry.snapshot === "object") growthSend(v, { t: "director_world", host_id: id, snapshot: entry.snapshot, ts: Date.now() });
+    }
     growthSend(ws, { t: "host_ok", host: growthHostPublic(entry, ws), ts: Date.now() });
     growthBroadcastHosts();
     return;
@@ -1922,6 +1955,31 @@ function growthHandle(ws, payloadStr) {
     }
     return;
   }
+  if (t === "resume_visit") {
+    const hostId = growthSafeId(m.host_id || ws._growthHostId || "");
+    growthCleanHosts();
+    const host = hostId ? growthHosts.get(hostId) : null;
+    if (!host || !host.ws || host.ws.readyState !== WebSocket.OPEN) {
+      growthSend(ws, { t: "error", code: "host_missing", message: "Sunken Shield director is reconnecting or no longer available." });
+      return;
+    }
+    const player = (m.player && typeof m.player === "object") ? m.player : {};
+    const visitorId = growthSafeId(m.visitor_id || player.id || ws._growthId);
+    ws._growthId = visitorId;
+    ws._growthName = growthSafeName(m.visitor_name || m.name || player.name || ws._growthName, "A visitor");
+    ws._growthHostId = hostId;
+    if (!host.visitors) host.visitors = new Set();
+    host.visitors.add(ws);
+    growthSend(ws, { t: "visitor_accepted", host_id: hostId, visitor_id: visitorId, reconnect: true, ts: Date.now() });
+    if (host.snapshot && typeof host.snapshot === "object") {
+      growthSend(ws, { t: "director_world", host_id: hostId, snapshot: host.snapshot, ts: Date.now() });
+    }
+    if (host.ws && host.ws.readyState === WebSocket.OPEN) {
+      growthSend(host.ws, { t: "remote_player", from_id: visitorId, name: ws._growthName, player, reconnect: true, ts: Date.now() });
+    }
+    return;
+  }
+
   if (t === "request_world") {
     const hostId = growthSafeId(m.host_id || ws._growthHostId || m.id || "");
     const host = hostId ? growthHosts.get(hostId) : null;
