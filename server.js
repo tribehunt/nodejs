@@ -1,5 +1,5 @@
 // server.js - supports Eldritch Cyber Front,
-// Ethane Sea, Azha, Gun of Agartha, Belvara, STUG & GROWTH
+// Ethane Sea, Azha, STUG & GROWTH
 // One process, one port, isolated rooms by game.
 // by Dedset Media 02/24/2026
 const http = require("http");
@@ -197,8 +197,7 @@ function _httpsGetFollow(url, redirectsLeft, cb) {
 }
 function _sendReservedNameError(ws, proto, desired) {
   try {
-    if (proto === "agartha") agarthaSend(ws, { t: "error", code: "reserved_name", message: `Name "${desired}" is reserved.` });
-    else if (proto === "prison") prisonSend(ws, { t: "error", code: "reserved_name", message: `Name "${desired}" is reserved.` });
+    if (proto === "prison") prisonSend(ws, { t: "error", code: "reserved_name", message: `Name "${desired}" is reserved.` });
     else {
       try { ws.send(JSON.stringify({ type: "error", message: `Name "${desired}" is reserved.` })); } catch {}
     }
@@ -229,23 +228,7 @@ function _tryApplyPendingReserved(ws) {
       ws._pending_reserved_timer = null;
       return;
     }
-    if (proto === "agartha") {
-      const room = ws._agarthaRoomName ? agarthaRooms.get(ws._agarthaRoomName) : null;
-      if (room) {
-        const old = String(ws._agarthaName || "");
-        if (room.nameMap && old) {
-          const ok = normNameKey(old);
-          if (ok && room.nameMap.get(ok) === ws) room.nameMap.delete(ok);
-        }
-        const newName = agarthaMakeUniqueName(room, desired, ws._agarthaId);
-        ws._agarthaName = newName;
-        if (room.nameMap) room.nameMap.set(normNameKey(newName), ws);
-        agarthaSend(ws, { t: "welcome", id: ws._agarthaId, room: room.name, name: newName });
-        if (old && normNameKey(old) !== normNameKey(newName)) {
-          agarthaBroadcast(room, { t: "sys", msg: `${old} is now ${newName}.` });
-        }
-      }
-    } else if (proto === "prison") {
+    if (proto === "prison") {
       const room = ws._prisonRoomName ? prisonRooms.get(ws._prisonRoomName) : null;
       if (room) {
         const old = String(ws._prisonName || "");
@@ -537,218 +520,6 @@ function prisonHandle(ws, payloadStr) {
   }
   if (t === "ping") {
     prisonSend(ws, { t: "pong", ts: Date.now() });
-    return;
-  }
-}
-// ----------------------------------------------------------------------------------------------------------------------
-// BELVARA trade protocol (b:...)
-// Prefix protocol so it won't collide with JSON-based games.
-// Clients send:  b:{"t":"join","room":"belvara","id":"B-XXXX","name":"CAPTAIN"}
-// State send:    b:{"t":"state","room":"belvara","id":"B-XXXX","name":"CAPTAIN","x":0,"y":0,"a":0,"hub":"Neo-Jericho","credits":0,"rail_tier":1,"drones":0,"ts":...}
-// Shot send:     b:{"t":"shot","room":"belvara","id":"B-XXXX","x":..,"y":..,"vx":..,"vy":..,"dmg":..,"ts":..}
-// Chat send:     b:{"t":"chat","room":"belvara","id":"B-XXXX","name":"CAPTAIN","msg":"...","mid":"...","ts":...}
-// Server sends:  b:{"t":"welcome","id":"...","room":"...","name":"..."}
-//                b:{"t":"state",...} / b:{"t":"shot",...} / b:{"t":"chat",...} / b:{"t":"sys",...} / b:{"t":"leave",...}
-// ----------------------------------------------------------------------------------------------------------------------
-const belvaraRooms = new Map(); // roomName -> { name, clients:Set<ws>, nameMap:Map, ipMap:Map }
-function belvaraGetRoom(roomName) {
-  const rn = safeRoomId(roomName || "belvara", "belvara");
-  if (!belvaraRooms.has(rn)) belvaraRooms.set(rn, { name: rn, clients: new Set(), nameMap: new Map(), ipMap: new Map() });
-  const room = belvaraRooms.get(rn);
-  if (!room.nameMap) room.nameMap = new Map();
-  if (!room.ipMap) room.ipMap = new Map();
-  return room;
-}
-function belvaraMid() {
-  return (Math.random().toString(16).slice(2, 10) + Date.now().toString(16).slice(-8)).toUpperCase();
-}
-function belvaraSend(ws, obj) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  try { ws.send("b:" + JSON.stringify(obj)); } catch {}
-}
-function belvaraBroadcast(room, obj, exceptWs = null) {
-  const msg = "b:" + JSON.stringify(obj);
-  for (const ws of room.clients) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) continue;
-    if (exceptWs && ws === exceptWs) continue;
-    try { ws.send(msg); } catch {}
-  }
-}
-function belvaraDetach(ws, announce = true) {
-  if (!ws || !ws._belvaraRoomName) return;
-  const roomName = ws._belvaraRoomName;
-  const room = belvaraRooms.get(roomName);
-  if (room) {
-    room.clients.delete(ws);
-    if (room.nameMap && ws._belvaraName) {
-      const k = normNameKey(ws._belvaraName);
-      if (k && room.nameMap.get(k) === ws) room.nameMap.delete(k);
-    }
-    if (room.ipMap && ws._ip) {
-      if (room.ipMap.get(ws._ip) === ws) room.ipMap.delete(ws._ip);
-    }
-    if (announce && ws._belvaraId) {
-      belvaraBroadcast(room, { t: "leave", id: ws._belvaraId, ts: Date.now() }, ws);
-      if (ws._belvaraName) belvaraBroadcast(room, { t: "sys", msg: `${ws._belvaraName} left Belvara waters.`, ts: Date.now() });
-    }
-    if (room.clients.size === 0) belvaraRooms.delete(roomName);
-  }
-  ws._belvaraRoomName = null;
-}
-function belvaraKickSameIP(room, ip, exceptWs) {
-  if (!room || !ip) return;
-  for (const ows of [...room.clients]) {
-    if (!ows || ows === exceptWs) continue;
-    if (ows._ip && ows._ip === ip) {
-      belvaraSend(ows, { t: "error", code: "dup_ip", message: "Duplicate session from same IP; closing old." });
-      try { belvaraDetach(ows, false); } catch {}
-      try { ows.close(); } catch {}
-    }
-  }
-}
-function belvaraMakeUniqueId(room, desired, exceptWs = null) {
-  const base0 = String(desired || ("B-" + belvaraMid().slice(0, 8))).replace(/\s+/g, " ").trim();
-  const base = base0.slice(0, 32) || ("B-" + belvaraMid().slice(0, 8));
-  const used = new Set();
-  for (const ws of (room && room.clients ? room.clients : [])) {
-    if (!ws) continue;
-    if (exceptWs && ws === exceptWs) continue;
-    if (ws._belvaraId) used.add(String(ws._belvaraId).slice(0, 32));
-  }
-  if (!used.has(base)) return base;
-  for (let i = 0; i < 12; i++) {
-    const suf = "-" + rid().slice(0, 4).toUpperCase();
-    const cut = Math.max(1, 32 - suf.length);
-    const cand = (base.slice(0, cut) + suf).slice(0, 32);
-    if (!used.has(cand)) return cand;
-  }
-  return ("B-" + belvaraMid().slice(0, 8)).slice(0, 32);
-}
-function belvaraMakeUniqueName(room, desired, fallback) {
-  const base = String(desired || fallback || "CAPTAIN").replace(/\s+/g, " ").trim().slice(0, 24) || "CAPTAIN";
-  const has = (nm) => {
-    const k = normNameKey(nm);
-    if (!k) return false;
-    if (room && room.nameMap && room.nameMap.has(k)) return true;
-    for (const ws of (room && room.clients ? room.clients : [])) {
-      if (ws && normNameKey(ws._belvaraName) === k) return true;
-    }
-    return false;
-  };
-  if (!has(base)) return base;
-  for (let i = 0; i < 12; i++) {
-    const suf = "-" + Math.random().toString(36).slice(2, 5).toUpperCase();
-    const cut = Math.max(1, 24 - suf.length);
-    const cand = base.slice(0, cut) + suf;
-    if (!has(cand)) return cand;
-  }
-  const suf = "-" + rid().slice(0, 3).toUpperCase();
-  return (base.slice(0, Math.max(1, 24 - suf.length)) + suf).slice(0, 24);
-}
-function belvaraHandle(ws, payloadStr) {
-  let s = "";
-  try { s = String(payloadStr || "").trim(); } catch { s = ""; }
-  if (!s) return;
-  let m = null;
-  try { m = JSON.parse(s); } catch { m = null; }
-  if (!m || typeof m !== "object") {
-    const room = belvaraRooms.get(ws._belvaraRoomName || "") || belvaraGetRoom("belvara");
-    if (!ws._belvaraRoomName) {
-      ws._belvaraRoomName = room.name;
-      ws._belvaraId = belvaraMakeUniqueId(room, ws._belvaraId || ("B-" + belvaraMid().slice(0, 8)), ws);
-      belvaraKickSameIP(room, ws._ip, ws);
-      const desired0 = String(ws._belvaraName || ws._belvaraId).slice(0, 24);
-      const enf0 = enforceReservedName(ws, desired0, ws._belvaraName, ws._belvaraId, "belvara");
-      ws._belvaraName = belvaraMakeUniqueName(room, enf0.name, ws._belvaraId);
-      room.clients.add(ws);
-      if (room.ipMap && ws._ip) room.ipMap.set(ws._ip, ws);
-      if (room.nameMap) room.nameMap.set(normNameKey(ws._belvaraName), ws);
-      belvaraSend(ws, { t: "welcome", id: ws._belvaraId, room: room.name, name: ws._belvaraName, ts: Date.now() });
-      belvaraBroadcast(room, { t: "sys", msg: `${ws._belvaraName} joined Belvara waters.`, ts: Date.now() }, ws);
-    }
-    const msg = s.slice(0, 240);
-    belvaraBroadcast(room, { t: "chat", id: ws._belvaraId, name: ws._belvaraName, msg, mid: belvaraMid(), ts: Date.now() }, ws);
-    return;
-  }
-  const t = String(m.t || m.type || "").toLowerCase();
-  if (t === "hello" || t === "join") {
-    const room = belvaraGetRoom(m.room || "belvara");
-    const switching = ws._belvaraRoomName && ws._belvaraRoomName !== room.name;
-    if (switching) belvaraDetach(ws, true);
-    const alreadyIn = (!switching) && (ws._belvaraRoomName === room.name) && room && room.clients && room.clients.has(ws);
-    const oldName = String(ws._belvaraName || "").replace(/\s+/g, " ").trim().slice(0, 24);
-    ws._belvaraRoomName = room.name;
-    ws._belvaraId = String(m.id || ws._belvaraId || ("B-" + belvaraMid().slice(0, 8))).slice(0, 32);
-    belvaraKickSameIP(room, ws._ip, ws);
-    ws._belvaraId = belvaraMakeUniqueId(room, ws._belvaraId, ws);
-    let desired = String(m.name || ws._belvaraId).replace(/\s+/g, " ").trim().slice(0, 24);
-    const enf = enforceReservedName(ws, desired, ws._belvaraName, ws._belvaraId, "belvara");
-    desired = enf.name;
-    if (alreadyIn && room && room.nameMap && oldName) {
-      const ok = normNameKey(oldName);
-      if (ok && room.nameMap.get(ok) === ws) room.nameMap.delete(ok);
-    }
-    const newName = belvaraMakeUniqueName(room, desired, ws._belvaraId);
-    ws._belvaraName = newName;
-    room.clients.add(ws);
-    if (room.ipMap && ws._ip) room.ipMap.set(ws._ip, ws);
-    if (room.nameMap) room.nameMap.set(normNameKey(newName), ws);
-    belvaraSend(ws, { t: "welcome", id: ws._belvaraId, room: room.name, name: newName, ts: Date.now() });
-    if (!alreadyIn) belvaraBroadcast(room, { t: "sys", msg: `${newName} joined Belvara waters.`, ts: Date.now() }, ws);
-    else if (oldName && normNameKey(oldName) !== normNameKey(newName)) belvaraBroadcast(room, { t: "sys", msg: `${oldName} is now ${newName}.`, ts: Date.now() });
-    return;
-  }
-  if (t === "chat" || t === "msg") {
-    if (!ws._belvaraRoomName) belvaraHandle(ws, JSON.stringify({ t: "join", room: m.room || "belvara", id: m.id, name: m.name }));
-    const room = belvaraRooms.get(ws._belvaraRoomName);
-    if (!room) return;
-    const name = String(ws._belvaraName || ws._belvaraId || "CAPTAIN").slice(0, 24);
-    const id = String(ws._belvaraId || "").slice(0, 32);
-    let msg = String(m.msg || m.message || "");
-    msg = msg.replace(/\r?\n/g, " ").slice(0, 240);
-    const mid = String(m.mid || belvaraMid()).slice(0, 48);
-    belvaraBroadcast(room, { t: "chat", id, name, msg, mid, ts: Date.now() }, ws);
-    return;
-  }
-  if (t === "state") {
-    if (!ws._belvaraRoomName) belvaraHandle(ws, JSON.stringify({ t: "join", room: m.room || "belvara", id: m.id, name: m.name }));
-    const room = belvaraRooms.get(ws._belvaraRoomName);
-    if (!room) return;
-    const out = {
-      t: "state",
-      id: String(ws._belvaraId || m.id || "").slice(0, 32),
-      name: String(ws._belvaraName || m.name || "").slice(0, 24),
-      x: clamp(Number(m.x || 0), -1e9, 1e9),
-      y: clamp(Number(m.y || 0), -1e9, 1e9),
-      a: clamp(Number(m.a || 0), -1000, 1000),
-      hub: String(m.hub || "").slice(0, 32),
-      credits: (m.credits | 0) || 0,
-      rail_tier: (m.rail_tier | 0) || 1,
-      drones: (m.drones | 0) || 0,
-      ts: Date.now()
-    };
-    belvaraBroadcast(room, out, ws);
-    return;
-  }
-  if (t === "shot") {
-    if (!ws._belvaraRoomName) belvaraHandle(ws, JSON.stringify({ t: "join", room: m.room || "belvara", id: m.id, name: m.name }));
-    const room = belvaraRooms.get(ws._belvaraRoomName);
-    if (!room) return;
-    const out = {
-      t: "shot",
-      id: String(ws._belvaraId || m.id || "").slice(0, 32),
-      x: clamp(Number(m.x || 0), -1e9, 1e9),
-      y: clamp(Number(m.y || 0), -1e9, 1e9),
-      vx: clamp(Number(m.vx || 0), -1e6, 1e6),
-      vy: clamp(Number(m.vy || 0), -1e6, 1e6),
-      dmg: clamp(Number(m.dmg || 0), -1e6, 1e6),
-      ts: Date.now()
-    };
-    belvaraBroadcast(room, out, ws);
-    return;
-  }
-  if (t === "ping") {
-    belvaraSend(ws, { t: "pong", ts: Date.now() });
     return;
   }
 }
@@ -1246,196 +1017,6 @@ function stugHandle(ws, payloadStr) {
     return;
   }
 }
-// ------------------------------------------------------------------------------------------------------
-// GUN OF AGARTHA CHAT protocol (g:...)
-// Prefix protocol so it won't collide with JSON-based games.
-// Clients send:  g:{"t":"hello","room":"agartha","id":"G-XXXX","name":"G-XXXX"}
-// Chat send:     g:{"t":"chat","room":"agartha","id":"G-XXXX","name":"G-XXXX","msg":"hello","mid":"..."} 
-// Server sends:  g:{"t":"chat","id":"...","name":"...","msg":"...","mid":"...","ts":...}
-// ------------------------------------------------------------------------------------------------------
-const agarthaRooms = new Map(); // roomName -> { name, clients:Set<ws> }
-function agarthaGetRoom(roomName) {
-  const rn = safeRoomId(roomName || "agartha", "agartha");
-  if (!agarthaRooms.has(rn)) agarthaRooms.set(rn, { name: rn, clients: new Set(), nameMap: new Map(), ipMap: new Map() });
-  const room = agarthaRooms.get(rn);
-  if (!room.nameMap) room.nameMap = new Map();
-  if (!room.ipMap) room.ipMap = new Map();
-  return room;
-}
-function agarthaMid() {
-  return (
-    Math.random().toString(16).slice(2, 10) +
-    Date.now().toString(16).slice(-8)
-  ).toUpperCase();
-}
-function agarthaSend(ws, obj) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  try { ws.send("g:" + JSON.stringify(obj)); } catch {}
-}
-function agarthaBroadcast(room, obj) {
-  const msg = "g:" + JSON.stringify(obj);
-  for (const ws of room.clients) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try { ws.send(msg); } catch {}
-    }
-  }
-}
-function agarthaDetach(ws, announce = true) {
-  if (!ws || !ws._agarthaRoomName) return;
-  const roomName = ws._agarthaRoomName;
-  const room = agarthaRooms.get(roomName);
-  if (room) {
-    room.clients.delete(ws);
-    if (room.nameMap && ws._agarthaName) {
-      const k = normNameKey(ws._agarthaName);
-      if (k && room.nameMap.get(k) === ws) room.nameMap.delete(k);
-    }
-    if (room.ipMap && ws._ip) {
-      if (room.ipMap.get(ws._ip) === ws) room.ipMap.delete(ws._ip);
-    }
-    if (announce && ws._agarthaName) {
-      agarthaBroadcast(room, { t: "sys", msg: `${ws._agarthaName} left void.` });
-    }
-    if (room.clients.size === 0) agarthaRooms.delete(roomName);
-  }
-  ws._agarthaRoomName = null;
-}
-function agarthaKickSameIP(room, ip, exceptWs) {
-  if (!room || !ip) return;
-  for (const ows of [...room.clients]) {
-    if (!ows || ows === exceptWs) continue;
-    if (ows._ip && ows._ip === ip) {
-      agarthaSend(ows, { t: "error", code: "dup_ip", message: "Duplicate session from same IP; closing old." });
-      try { agarthaDetach(ows, false); } catch {}
-      try { ows.close(); } catch {}
-    }
-  }
-}
-function agarthaMakeUniqueName(room, desired, fallback) {
-  const base = String(desired || fallback || "PILOT").replace(/\s+/g, " ").trim().slice(0, 24) || "PILOT";
-  const has = (nm) => {
-    const k = normNameKey(nm);
-    if (!k) return false;
-    if (room && room.nameMap && room.nameMap.has(k)) return true;
-    for (const ws of (room && room.clients ? room.clients : [])) {
-      if (ws && normNameKey(ws._agarthaName) === k) return true;
-    }
-    return false;
-  };
-  if (!has(base)) return base;
-  for (let i = 0; i < 12; i++) {
-    const suf = "-" + Math.random().toString(36).slice(2, 5).toUpperCase();
-    const cut = Math.max(1, 24 - suf.length);
-    const cand = base.slice(0, cut) + suf;
-    if (!has(cand)) return cand;
-  }
-  const suf = "-" + rid().slice(0, 3).toUpperCase();
-  return (base.slice(0, Math.max(1, 24 - suf.length)) + suf).slice(0, 24);
-}
-function agarthaHandle(ws, payloadStr) {
-  let s = "";
-  try { s = String(payloadStr || "").trim(); } catch { s = ""; }
-  if (!s) return;
-  let m = null;
-  try { m = JSON.parse(s); } catch { m = null; }
-  if (!m || typeof m !== "object") {
-    if (!ws._agarthaRoomName) {
-      const room = agarthaGetRoom("agartha");
-      ws._agarthaRoomName = room.name;
-      ws._agarthaId = ws._agarthaId || ("G-" + agarthaMid().slice(0, 8));
-      agarthaKickSameIP(room, ws._ip, ws);
-      const _gDesired = String(ws._agarthaName || ws._agarthaId).slice(0, 24);
-      const _gEnf = enforceReservedName(ws, _gDesired, ws._agarthaName, ws._agarthaId, "agartha");
-      ws._agarthaName = agarthaMakeUniqueName(room, _gEnf.name, ws._agarthaId);
-      room.clients.add(ws);
-      if (room.ipMap && ws._ip) room.ipMap.set(ws._ip, ws);
-      if (room.nameMap) room.nameMap.set(normNameKey(ws._agarthaName), ws);
-      agarthaSend(ws, { t: "welcome", id: ws._agarthaId, room: room.name, name: ws._agarthaName });
-      agarthaBroadcast(room, { t: "sys", msg: `${ws._agarthaName} entered void.` });
-    }
-    const room = agarthaRooms.get(ws._agarthaRoomName);
-    if (!room) return;
-    const msg = s.slice(0, 240);
-    agarthaBroadcast(room, {
-      t: "chat",
-      id: ws._agarthaId,
-      name: ws._agarthaName,
-      msg,
-      mid: agarthaMid(),
-      ts: Date.now()
-    });
-    return;
-  }
-  const t = String(m.t || m.type || "").toLowerCase();
-  if (t === "hello" || t === "join") {
-    const room = agarthaGetRoom(m.room || "agartha");
-    const switching = ws._agarthaRoomName && ws._agarthaRoomName !== room.name;
-    if (switching) {
-      agarthaDetach(ws, true);
-    }
-    const alreadyIn = (!switching) && (ws._agarthaRoomName === room.name) && room && room.clients && room.clients.has(ws);
-    const oldName = String(ws._agarthaName || "").replace(/\s+/g, " ").trim().slice(0, 24);
-    ws._agarthaRoomName = room.name;
-    ws._agarthaId = String(m.id || ws._agarthaId || ("G-" + agarthaMid().slice(0, 8))).slice(0, 32);
-    agarthaKickSameIP(room, ws._ip, ws);
-    let desired = String(m.name || ws._agarthaId).replace(/\s+/g, " ").trim().slice(0, 24);
-    const rk = normNameKey(desired);
-    if (alreadyIn && oldName && rk && RESERVED_NAMES.has(rk) && !isSkeletonAuthorized(ws._ip) && !skeletonIP) {
-      try {
-        ws._pending_reserved = { desired, proto: "agartha", at: Date.now() };
-        if (!ws._pending_reserved_timer) ws._pending_reserved_timer = setTimeout(() => _tryApplyPendingReserved(ws), 300);
-      } catch {}
-      agarthaSend(ws, { t: "welcome", id: ws._agarthaId, room: room.name, name: oldName });
-      agarthaSend(ws, { t: "sys", msg: "Checking skeleton key..." });
-      return;
-    }
-    if (alreadyIn && room && room.nameMap && oldName) {
-      const ok = normNameKey(oldName);
-      if (ok && room.nameMap.get(ok) === ws) room.nameMap.delete(ok);
-    }
-    const _gEnf = enforceReservedName(ws, desired, ws._agarthaName, ws._agarthaId, "agartha");
-    desired = _gEnf.name;
-    const newName = agarthaMakeUniqueName(room, desired, ws._agarthaId);
-    ws._agarthaName = newName;
-    room.clients.add(ws);
-    if (room.ipMap && ws._ip) room.ipMap.set(ws._ip, ws);
-    if (room.nameMap) room.nameMap.set(normNameKey(newName), ws);
-    agarthaSend(ws, { t: "welcome", id: ws._agarthaId, room: room.name, name: newName });
-    if (!alreadyIn) {
-      agarthaBroadcast(room, { t: "sys", msg: `${newName} entered void.` });
-    } else if (oldName && normNameKey(oldName) !== normNameKey(newName)) {
-      agarthaBroadcast(room, { t: "sys", msg: `${oldName} is now ${newName}.` });
-    }
-    return;
-  }
-  if (t === "chat" || t === "msg") {
-    if (!ws._agarthaRoomName) {
-      agarthaHandle(ws, JSON.stringify({ t: "hello", room: m.room || "agartha", id: m.id, name: m.name }));
-    }
-    const room = agarthaRooms.get(ws._agarthaRoomName);
-    if (!room) return;
-    const name = String(ws._agarthaName || ws._agarthaId || "PILOT").slice(0, 24);
-    const id = String(ws._agarthaId || "").slice(0, 32);
-    let msg = String(m.msg || m.message || "");
-    msg = msg.replace(/\r?\n/g, " ").slice(0, 240);
-    const mt = String(msg || "").trim().toLowerCase();
-    if (mt === "/ip" || mt === "/whoami") {
-      const ip = ws._ip ? String(ws._ip) : "unknown";
-      const sk = skeletonIP ? "loaded" : "not loaded";
-      const age = skeletonFetchedAt ? Math.floor((Date.now() - skeletonFetchedAt) / 1000) : -1;
-      const ok = isSkeletonAuthorized(ip) ? "YES" : "NO";
-      agarthaSend(ws, { t: "sys", msg: `IP: ${ip} | skeleton: ${sk}${age >= 0 ? ` (${age}s ago)` : ``} | last: ${skeletonLastStatus || 0}${skeletonLastErr ? ` err:${skeletonLastErr}` : ``} | admin: ${ok}` });
-      return;
-    }
-    const mid = String(m.mid || agarthaMid()).slice(0, 48);
-    agarthaBroadcast(room, { t: "chat", id, name, msg, mid, ts: Date.now() });
-    return;
-  }
-  if (t === "ping") {
-    agarthaSend(ws, { t: "pong", ts: Date.now() });
-    return;
-  }
-}
 function roomKey(game, room) {
   return `${game}:${room}`;
 }
@@ -1742,7 +1323,7 @@ function azhaMaybeStart(room, roomId) {
   azhaBroadcast(room, { type: "start", room: roomId, seed: room.seed, mapW: room.mapW, mapH: room.mapH });
   azhaStartMission(room);
 }
-// ----------------------------------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------
 // GROWTH Frog-Hole / Croakline protocol (gf:...)
 // Isolated section for the Bloatfrog home-hosting tutorial.
 // Clients send:  gf:{"t":"hello","id":"GF-XXXX","name":"Peatwater Frog-Hole"}
@@ -1751,7 +1332,7 @@ function azhaMaybeStart(room, roomId) {
 //                gf:{"t":"join_home","host_id":"GF-XXXX","visitor_id":"GF-YYYY","visitor_name":"..."}
 // Server sends:  gf:{"t":"welcome",...} / gf:{"t":"hosts",...} / gf:{"t":"host_ok",...}
 //                gf:{"t":"joined_home","host":{...}} / gf:{"t":"visitor_arrived","visitor_name":"..."}
-// ----------------------------------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------
 const growthHosts = new Map(); // id -> { id, name, home_name, world_seed, x, y, ws, visitors, snapshot, updatedAt, offlineSince }
 const GROWTH_DISCONNECT_GRACE_MS = 15000;
 function growthSafeName(s, fb) {
@@ -1834,7 +1415,6 @@ function growthBroadcastHosts() {
     }
   } catch {}
 }
-
 function growthVisitorSockets(host) {
   const out = [];
   try {
@@ -1867,9 +1447,6 @@ function growthDetach(ws) {
   growthDetachVisitor(ws, false);
   for (const [id, h] of [...growthHosts.entries()]) {
     if (h && h.ws === ws) {
-      // Do not instantly boot visitors on a short Railway/browser reconnect.
-      // Keep the host cell warm briefly; if the same director re-announces the
-      // same id, visitors remain attached and receive the fresh snapshot.
       h.ws = null;
       h.offlineSince = Date.now();
       changed = true;
@@ -1999,7 +1576,6 @@ function growthHandle(ws, payloadStr) {
     }
     return;
   }
-
   if (t === "request_world") {
     const hostId = growthSafeId(m.host_id || ws._growthHostId || m.id || "");
     const host = hostId ? growthHosts.get(hostId) : null;
@@ -2013,7 +1589,6 @@ function growthHandle(ws, payloadStr) {
     }
     return;
   }
-
   if (t === "director_player") {
     const id = growthSafeId(m.id || ws._growthId);
     const host = growthHosts.get(id);
@@ -2025,7 +1600,6 @@ function growthHandle(ws, payloadStr) {
     for (const v of growthVisitorSockets(host)) growthSend(v, packet);
     return;
   }
-
   if (t === "entity_update") {
     const id = growthSafeId(m.id || ws._growthId);
     const host = growthHosts.get(id);
@@ -2042,7 +1616,6 @@ function growthHandle(ws, payloadStr) {
     }
     return;
   }
-
   if (t === "world_update") {
     const id = growthSafeId(m.id || ws._growthId);
     const host = growthHosts.get(id);
@@ -2074,7 +1647,6 @@ function growthHandle(ws, payloadStr) {
     }
     return;
   }
-
   if (t === "visitor_tongue") {
     const hostId = growthSafeId(m.host_id || ws._growthHostId || "");
     const host = hostId ? growthHosts.get(hostId) : null;
@@ -2110,8 +1682,6 @@ function growthHandle(ws, payloadStr) {
     });
     return;
   }
-
-
   if (t === "visitor_decision") {
     const hostId = growthSafeId(m.host_id || ws._growthId || "");
     const host = hostId ? growthHosts.get(hostId) : null;
@@ -2139,8 +1709,6 @@ function growthHandle(ws, payloadStr) {
     }
     return;
   }
-
-
   if (t === "castle_grate_request") {
     const hostId = growthSafeId(m.host_id || ws._growthHostId || "");
     const host = hostId ? growthHosts.get(hostId) : null;
@@ -2166,7 +1734,6 @@ function growthHandle(ws, payloadStr) {
     });
     return;
   }
-
   if (t === "castle_exit_request") {
     const hostId = growthSafeId(m.host_id || ws._growthHostId || "");
     const host = hostId ? growthHosts.get(hostId) : null;
@@ -2189,7 +1756,6 @@ function growthHandle(ws, payloadStr) {
     });
     return;
   }
-
   if (t === "castle_exit") {
     const hostId = growthSafeId(m.host_id || ws._growthId || "");
     const host = hostId ? growthHosts.get(hostId) : null;
@@ -2208,7 +1774,6 @@ function growthHandle(ws, payloadStr) {
     try { if (host.visitors) host.visitors.clear(); } catch {}
     return;
   }
-
   if (t === "castle_chat" || t === "chat") {
     const hostId = growthSafeId(m.host_id || ws._growthHostId || m.id || ws._growthId || "");
     const host = hostId ? growthHosts.get(hostId) : null;
@@ -2224,8 +1789,6 @@ function growthHandle(ws, payloadStr) {
     for (const v of growthVisitorSockets(host)) growthSend(v, packet);
     return;
   }
-
-
   if (t === "castle_xp_share") {
     const hostId = growthSafeId(m.host_id || ws._growthId || "");
     const host = hostId ? growthHosts.get(hostId) : null;
@@ -2242,7 +1805,6 @@ function growthHandle(ws, payloadStr) {
     for (const v of growthVisitorSockets(host)) growthSend(v, packet);
     return;
   }
-
   if (t === "castle_quest_event") {
     const hostId = growthSafeId(m.host_id || ws._growthId || ws._growthHostId || "");
     const host = hostId ? growthHosts.get(hostId) : null;
@@ -2254,7 +1816,6 @@ function growthHandle(ws, payloadStr) {
     for (const v of growthVisitorSockets(host)) growthSend(v, packet);
     return;
   }
-
   if (t === "visitor_action_result") {
     const hostId = growthSafeId(m.host_id || ws._growthId || "");
     const host = hostId ? growthHosts.get(hostId) : null;
@@ -2284,7 +1845,6 @@ function growthHandle(ws, payloadStr) {
     return;
   }
 }
-
 // -----------------------------------------
 // Connection handler (auto-detect protocol)
 // -----------------------------------------
@@ -2369,16 +1929,6 @@ wss.on("connection", (ws, req) => {
     // ETHANE SEA prison protocol:
     if (raw && raw.startsWith("p:")) {
       try { prisonHandle(ws, raw.slice(2)); } catch {}
-      return;
-    }
-    // GUN OF AGARTHA chat protocol:
-    if (raw && raw.startsWith("g:")) {
-      try { agarthaHandle(ws, raw.slice(2)); } catch {}
-      return;
-    }
-    // BELVARA trade protocol:
-    if (raw && raw.startsWith("b:")) {
-      try { belvaraHandle(ws, raw.slice(2)); } catch {}
       return;
     }
     // STUG fleet-autobattle protocol:
@@ -2611,8 +2161,6 @@ let m;
   });
   ws.on("close", () => {
     try { prisonDetach(ws, true); } catch {}
-    try { agarthaDetach(ws, true); } catch {}
-    try { belvaraDetach(ws, true); } catch {}
     try { stugDetach(ws, true); } catch {}
     try { growthDetach(ws); } catch {}
     detachFromCurrentRoom();
@@ -2698,7 +2246,6 @@ setInterval(() => {
     stugTickRoom(room, STUG_TICK_MS);
   }
 }, STUG_TICK_MS);
-
 // ------------------------------------------------------
 server.listen(PORT, "0.0.0.0", () => {
   console.log("Merged relay (Dedset App) on port", PORT);
