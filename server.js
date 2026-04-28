@@ -1426,6 +1426,29 @@ function growthVisitorSockets(host) {
   } catch {}
   return out;
 }
+function growthCombineEntityPages(layers) {
+  const combined = {};
+  const enemies = [];
+  const food = [];
+  const sorted = Array.isArray(layers) ? layers.slice().sort((a, b) => Number(a && a.sync_page || 0) - Number(b && b.sync_page || 0)) : [];
+  for (const layer of sorted) {
+    if (!layer || typeof layer !== "object") continue;
+    for (const [k, v] of Object.entries(layer)) {
+      if (k === "enemies" || k === "food") continue;
+      if (k === "paged" || k === "sync_seq" || k === "sync_page" || k === "sync_pages" || k === "sync_total_enemies" || k === "sync_total_food") continue;
+      if ((k === "dwellings" || k === "quests" || k === "hazards") && Array.isArray(v)) {
+        if (!Array.isArray(combined[k])) combined[k] = v;
+        continue;
+      }
+      combined[k] = v;
+    }
+    if (Array.isArray(layer.enemies)) enemies.push(...layer.enemies);
+    if (Array.isArray(layer.food)) food.push(...layer.food);
+  }
+  combined.enemies = enemies;
+  combined.food = food;
+  return combined;
+}
 function growthDetachVisitor(ws, silent = false) {
   if (!ws) return;
   const hostId = String(ws._growthHostId || "");
@@ -1605,14 +1628,33 @@ function growthHandle(ws, payloadStr) {
     const host = growthHosts.get(id);
     if (!host || host.ws !== ws) return;
     if (m.layer && typeof m.layer === "object") {
-      host.snapshot = Object.assign({}, host.snapshot || {}, m.layer);
+      const layer = m.layer;
       host.updatedAt = Date.now();
       try {
-        host.world_seed = Number(m.layer.world_seed || host.world_seed || 0) || host.world_seed || 0;
-        host.x = clamp(Number(m.layer.home_x || host.x || 0) || 0, -100000000, 100000000);
-        host.y = clamp(Number(m.layer.home_y || host.y || 0) || 0, -100000000, 100000000);
+        host.world_seed = Number(layer.world_seed || host.world_seed || 0) || host.world_seed || 0;
+        host.x = clamp(Number(layer.home_x || host.x || 0) || 0, -100000000, 100000000);
+        host.y = clamp(Number(layer.home_y || host.y || 0) || 0, -100000000, 100000000);
       } catch {}
-      for (const v of growthVisitorSockets(host)) growthSend(v, { t: "director_entities", host_id: id, layer: m.layer, ts: Date.now() });
+      if (layer.paged) {
+        const seq = String(layer.sync_seq || "");
+        const page = Math.max(0, Math.floor(Number(layer.sync_page || 0) || 0));
+        const pages = Math.max(1, Math.floor(Number(layer.sync_pages || 1) || 1));
+        if (!host.entityPageBuf || host.entityPageBuf.seq !== seq || host.entityPageBuf.pages !== pages) {
+          host.entityPageBuf = { seq, pages, layers: new Map(), at: Date.now() };
+        }
+        if (page < pages) host.entityPageBuf.layers.set(page, layer);
+        host.entityPageBuf.at = Date.now();
+        if (host.entityPageBuf.layers.size >= pages) {
+          const ordered = [];
+          for (let i = 0; i < pages; i++) ordered.push(host.entityPageBuf.layers.get(i));
+          const combined = growthCombineEntityPages(ordered);
+          host.snapshot = Object.assign({}, host.snapshot || {}, combined);
+          host.entityPageBuf = null;
+        }
+      } else {
+        host.snapshot = Object.assign({}, host.snapshot || {}, layer);
+      }
+      for (const v of growthVisitorSockets(host)) growthSend(v, { t: "director_entities", host_id: id, layer, ts: Date.now() });
     }
     return;
   }
