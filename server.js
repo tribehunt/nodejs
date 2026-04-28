@@ -1599,6 +1599,25 @@ function growthHandle(ws, payloadStr) {
     }
     return;
   }
+  if (t === "visitor_disconnect" || t === "leave_host" || t === "disconnect_host") {
+    try {
+      const hostId = growthSafeId(m.host_id || ws._growthHostId || "");
+      const visitorId = growthSafeId(m.visitor_id || ws._growthId || "");
+      const host = hostId ? growthHosts.get(hostId) : null;
+      if (host && host.visitors) {
+        host.visitors.delete(ws);
+        if (host.ws && host.ws.readyState === WebSocket.OPEN) {
+          growthSend(host.ws, { t: "visitor_left", visitor_id: visitorId, visitor_name: growthSafeName(m.visitor_name || ws._growthName, "A visitor"), manual: true, ts: Date.now() });
+        }
+        for (const v of growthVisitorSockets(host)) {
+          if (v !== ws) growthSend(v, { t: "visitor_left", visitor_id: visitorId, visitor_name: growthSafeName(m.visitor_name || ws._growthName, "A visitor"), manual: true, ts: Date.now() });
+        }
+      }
+      ws._growthHostId = "";
+      growthSend(ws, { t: "visitor_disconnected", host_id: hostId, visitor_id: visitorId, ts: Date.now() });
+    } catch {}
+    return;
+  }
   if (t === "request_world") {
     const hostId = growthSafeId(m.host_id || ws._growthHostId || m.id || "");
     const host = hostId ? growthHosts.get(hostId) : null;
@@ -1721,6 +1740,9 @@ function growthHandle(ws, payloadStr) {
       soda_note: String(m.soda_note || "").slice(0, 80),
       client_hit_uid: String(m.client_hit_uid || "").slice(0, 96),
       client_hit_type: String(m.client_hit_type || "").slice(0, 16),
+      castle_active: !!m.castle_active,
+      castle_floor: Number(m.castle_floor || -1) || -1,
+      mode: String(m.mode || "").slice(0, 24),
       request_id: String(m.request_id || "").slice(0, 96),
       ts: Date.now()
     });
