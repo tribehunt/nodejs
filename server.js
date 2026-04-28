@@ -1675,6 +1675,8 @@ function growthHandle(ws, payloadStr) {
       kinetic: Number(m.kinetic || 0) || 0,
       toxicity: Number(m.toxicity || 0) || 0,
       chaos: Number(m.chaos || 0) || 0,
+      soda_extra: Number(m.soda_extra || 0) || 0,
+      soda_note: String(m.soda_note || "").slice(0, 80),
       client_hit_uid: String(m.client_hit_uid || "").slice(0, 96),
       client_hit_type: String(m.client_hit_type || "").slice(0, 16),
       request_id: String(m.request_id || "").slice(0, 96),
