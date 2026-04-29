@@ -1873,7 +1873,7 @@ function growthHandle(ws, payloadStr) {
     }
     return;
   }
-  if (t === "sluagh_start" || t === "sluagh_state" || t === "sluagh_end") {
+  if (t === "sluagh_start" || t === "sluagh_state" || t === "sluagh_end" || t === "sluagh_combat_fx") {
     const hostId = growthSafeId(m.host_id || ws._growthId || "");
     const host = hostId ? growthHosts.get(hostId) : null;
     if (!host || host.ws !== ws) return;
