@@ -1840,6 +1840,56 @@ function growthHandle(ws, payloadStr) {
     try { if (host.visitors) host.visitors.clear(); } catch {}
     return;
   }
+
+  if (t === "sluagh_request") {
+    const hostId = growthSafeId(m.host_id || ws._growthHostId || ws._growthId || "");
+    const host = hostId ? growthHosts.get(hostId) : null;
+    if (!host || !host.ws || host.ws.readyState !== WebSocket.OPEN) {
+      growthSend(ws, { t: "error", code: "host_missing", message: "Sluagh host is no longer available." });
+      return;
+    }
+    const fromId = growthSafeId(m.from_id || ws._growthId || "");
+    ws._growthId = fromId;
+    ws._growthName = growthSafeName(m.name || ws._growthName, "Bloatfrog");
+    const packet = {
+      t: "sluagh_request", host_id: hostId, from_id: fromId, name: ws._growthName,
+      hole_uid: String(m.hole_uid || "").slice(0, 96), floor: Number(m.floor || 0) || 0,
+      x: Number(m.x || 0) || 0, y: Number(m.y || 0) || 0, ts: Date.now()
+    };
+    if (host.ws !== ws) growthSend(host.ws, packet);
+    for (const v of growthVisitorSockets(host)) if (v !== ws) growthSend(v, packet);
+    return;
+  }
+  if (t === "sluagh_response") {
+    const hostId = growthSafeId(m.host_id || ws._growthHostId || ws._growthId || "");
+    const host = hostId ? growthHosts.get(hostId) : null;
+    if (!host) return;
+    const fromId = growthSafeId(m.from_id || ws._growthId || "");
+    const toId = growthSafeId(m.to_id || "");
+    const packet = { t: "sluagh_response", host_id: hostId, from_id: fromId, to_id: toId, accepted: !!m.accepted, request: (m.request && typeof m.request === "object") ? m.request : {}, ts: Date.now() };
+    if (host.ws && host.ws.readyState === WebSocket.OPEN && host.ws !== ws) growthSend(host.ws, packet);
+    for (const v of growthVisitorSockets(host)) {
+      if (v !== ws && (!toId || growthSafeId(v._growthId || "") === toId)) growthSend(v, packet);
+    }
+    return;
+  }
+  if (t === "sluagh_start" || t === "sluagh_state" || t === "sluagh_end") {
+    const hostId = growthSafeId(m.host_id || ws._growthId || "");
+    const host = hostId ? growthHosts.get(hostId) : null;
+    if (!host || host.ws !== ws) return;
+    const packet = Object.assign({}, m, { host_id: hostId, ts: Date.now() });
+    for (const v of growthVisitorSockets(host)) growthSend(v, packet);
+    return;
+  }
+  if (t === "sluagh_tongue") {
+    const hostId = growthSafeId(m.host_id || ws._growthHostId || "");
+    const host = hostId ? growthHosts.get(hostId) : null;
+    if (!host || !host.ws || host.ws.readyState !== WebSocket.OPEN) return;
+    const packet = { t: "sluagh_tongue", host_id: hostId, from_id: growthSafeId(m.from_id || ws._growthId || ""), shot: (m.shot && typeof m.shot === "object") ? m.shot : {}, ts: Date.now() };
+    growthSend(host.ws, packet);
+    return;
+  }
+
   if (t === "castle_chat" || t === "chat") {
     const hostId = growthSafeId(m.host_id || ws._growthHostId || m.id || ws._growthId || "");
     const host = hostId ? growthHosts.get(hostId) : null;
