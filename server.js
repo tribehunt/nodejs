@@ -1881,6 +1881,25 @@ function growthHandle(ws, payloadStr) {
     for (const v of growthVisitorSockets(host)) growthSend(v, packet);
     return;
   }
+  if (t === "sluagh_player") {
+    const hostId = growthSafeId(m.host_id || ws._growthHostId || ws._growthId || "");
+    const host = hostId ? growthHosts.get(hostId) : null;
+    if (!host) return;
+    const fromId = growthSafeId(m.from_id || ws._growthId || "");
+    const packet = {
+      t: "sluagh_player",
+      host_id: hostId,
+      from_id: fromId,
+      name: growthSafeName(m.name || ws._growthName || "Frog", "Frog"),
+      x: Number(m.x || 0) || 0,
+      y: Number(m.y || 0) || 0,
+      ts: Date.now()
+    };
+    if (host.ws && host.ws.readyState === WebSocket.OPEN && host.ws !== ws) growthSend(host.ws, packet);
+    for (const v of growthVisitorSockets(host)) if (v !== ws) growthSend(v, packet);
+    return;
+  }
+
   if (t === "sluagh_tongue") {
     const hostId = growthSafeId(m.host_id || ws._growthHostId || "");
     const host = hostId ? growthHosts.get(hostId) : null;
