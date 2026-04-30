@@ -1,5 +1,5 @@
 // server.js - supports Eldritch Cyber Front,
-// Ethane Sea, Azha, STUG & GROWTH
+// Ethane Sea, Azha, STUG, GROWTH & FOIDBALL
 // One process, one port, isolated rooms by game.
 // by Dedset Media 02/24/2026
 const http = require("http");
@@ -1853,6 +1853,8 @@ function growthHandle(ws, payloadStr) {
     ws._growthName = growthSafeName(m.name || ws._growthName, "Bloatfrog");
     const packet = {
       t: "sluagh_request", host_id: hostId, from_id: fromId, name: ws._growthName,
+      size_percent: Number(m.size_percent || 100) || 100,
+      max_size: Number(m.max_size || 90) || 90,
       hole_uid: String(m.hole_uid || "").slice(0, 96), floor: Number(m.floor || 0) || 0,
       x: Number(m.x || 0) || 0, y: Number(m.y || 0) || 0, ts: Date.now()
     };
@@ -1866,7 +1868,18 @@ function growthHandle(ws, payloadStr) {
     if (!host) return;
     const fromId = growthSafeId(m.from_id || ws._growthId || "");
     const toId = growthSafeId(m.to_id || "");
-    const packet = { t: "sluagh_response", host_id: hostId, from_id: fromId, to_id: toId, accepted: !!m.accepted, request: (m.request && typeof m.request === "object") ? m.request : {}, ts: Date.now() };
+    const packet = {
+      t: "sluagh_response", host_id: hostId, from_id: fromId, to_id: toId, accepted: !!m.accepted,
+      reason: String(m.reason || "").slice(0, 48),
+      who: String(m.who || "").slice(0, 48),
+      need: Number(m.need || 0) || 0,
+      message: String(m.message || "").slice(0, 180),
+      request: (m.request && typeof m.request === "object") ? m.request : {},
+      name: growthSafeName(m.name || ws._growthName, "Bloatfrog"),
+      size_percent: Number(m.size_percent || 100) || 100,
+      max_size: Number(m.max_size || 73.5) || 73.5,
+      ts: Date.now()
+    };
     if (host.ws && host.ws.readyState === WebSocket.OPEN && host.ws !== ws) growthSend(host.ws, packet);
     for (const v of growthVisitorSockets(host)) {
       if (v !== ws && (!toId || growthSafeId(v._growthId || "") === toId)) growthSend(v, packet);
@@ -1980,6 +1993,94 @@ function growthHandle(ws, payloadStr) {
     return;
   }
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// FOIDBALL spectator protocol (fb:...)
+// Roster hub can list hosts. Hosts stream lightweight match snapshots. Viewers receive autoplay field frames.
+// ---------------------------------------------------------------------------------------------------------
+const foidHosts = new Map(); // id -> { id, name, ws, playing, snapshot, viewers:Set<ws>, updatedAt }
+function foidSafeId(s) {
+  try { return String(s || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64) || ("FB-" + rid()); } catch { return "FB-" + rid(); }
+}
+function foidSafeName(s, fb="FOIDBALL") {
+  try { return String(s || "").replace(/\s+/g, " ").trim().slice(0, 48) || fb; } catch { return fb; }
+}
+function foidSend(ws, obj) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  try { ws.send("fb:" + JSON.stringify(obj)); } catch {}
+}
+function foidHostPublic(h, viewerWs=null) {
+  return { id:String(h.id||""), name:foidSafeName(h.name,"FOIDBALL"), playing:!!h.playing,
+    viewers:h.viewers?Math.max(0,h.viewers.size|0):0,
+    age:Math.max(0,Math.floor((Date.now()-Number(h.updatedAt||0))/1000)), you:!!(viewerWs&&h.ws===viewerWs) };
+}
+function foidViewerSockets(h) {
+  const out=[]; if(!h||!h.viewers)return out;
+  for(const v of [...h.viewers]) { if(v&&v.readyState===WebSocket.OPEN) out.push(v); else h.viewers.delete(v); }
+  return out;
+}
+function foidSendHosts(ws) {
+  const hosts=[...foidHosts.values()].filter(h=>h&&h.ws&&h.ws.readyState===WebSocket.OPEN).map(h=>foidHostPublic(h,ws));
+  foidSend(ws,{t:"hosts",hosts,ts:Date.now()});
+}
+function foidBroadcastHosts() {
+  const hosts=[...foidHosts.values()].filter(h=>h&&h.ws&&h.ws.readyState===WebSocket.OPEN).map(h=>foidHostPublic(h));
+  try { for(const c of wss.clients) if(c&&c.readyState===WebSocket.OPEN&&c._foidSeen) foidSend(c,{t:"hosts",hosts,ts:Date.now()}); } catch {}
+}
+function foidDetachViewer(ws, silent=false) {
+  if(!ws||!ws._foidWatchingHostId)return;
+  const host=foidHosts.get(String(ws._foidWatchingHostId)); ws._foidWatchingHostId="";
+  if(host&&host.viewers){ host.viewers.delete(ws); const count=foidViewerSockets(host).length; if(!silent) foidSend(host.ws,{t:"spectator_count",count,ts:Date.now()}); }
+  foidBroadcastHosts();
+}
+function foidDetach(ws) {
+  if(!ws)return; foidDetachViewer(ws,true);
+  const id=String(ws._foidId||""); const host=id?foidHosts.get(id):null;
+  if(host&&host.ws===ws){
+    for(const v of foidViewerSockets(host)){ foidSend(v,{t:"host_left",host_id:id,ts:Date.now()}); try{v._foidWatchingHostId="";}catch{} }
+    foidHosts.delete(id); foidBroadcastHosts();
+  }
+  ws._foidSeen=false;
+}
+function foidHandle(ws, payloadStr) {
+  let m=null; try{m=JSON.parse(String(payloadStr||""));}catch{m=null}
+  if(!m||typeof m!=="object")return; ws._foidSeen=true;
+  const t=String(m.t||m.type||"").toLowerCase();
+  if(t==="hello") { ws._foidId=foidSafeId(m.id||ws._foidId); ws._foidName=foidSafeName(m.name||ws._foidName,"FOIDBALL"); foidSend(ws,{t:"welcome",id:ws._foidId,name:ws._foidName,ts:Date.now()}); foidSendHosts(ws); return; }
+  if(t==="list") { foidSendHosts(ws); return; }
+  if(t==="host") {
+    const id=foidSafeId(m.id||ws._foidId); ws._foidId=id; ws._foidName=foidSafeName(m.name||ws._foidName,"FOIDBALL");
+    const prev=foidHosts.get(id)||null;
+    const entry={id,name:ws._foidName,ws,playing:!!m.playing,snapshot:(m.snapshot&&typeof m.snapshot==="object")?m.snapshot:(prev?prev.snapshot:null),viewers:prev&&prev.viewers?prev.viewers:new Set(),updatedAt:Date.now()};
+    foidHosts.set(id,entry);
+    for(const v of foidViewerSockets(entry)){ try{v._foidWatchingHostId=id;}catch{}; foidSend(v,{t:"watch_ok",host:foidHostPublic(entry,v),ts:Date.now()}); if(entry.playing&&entry.snapshot) foidSend(v,{t:"frame",host_id:id,playing:true,snapshot:entry.snapshot,ts:Date.now()}); else foidSend(v,{t:"watch_wait",host_id:id,message:"HOST IS NOT IN A MATCH YET",ts:Date.now()}); }
+    foidSend(ws,{t:"host_ok",host:foidHostPublic(entry,ws),ts:Date.now()}); foidBroadcastHosts(); return;
+  }
+  if(t==="unhost"||t==="host_quit") {
+    const id=foidSafeId(m.id||ws._foidId||""); const host=id?foidHosts.get(id):null; if(!host||host.ws!==ws)return;
+    for(const v of foidViewerSockets(host)){ foidSend(v,{t:"host_left",host_id:id,ts:Date.now()}); try{v._foidWatchingHostId="";}catch{} }
+    foidHosts.delete(id); foidBroadcastHosts(); return;
+  }
+  if(t==="watch") {
+    const hostId=foidSafeId(m.host_id||""); const host=foidHosts.get(hostId);
+    if(!host||!host.ws||host.ws.readyState!==WebSocket.OPEN){ foidSend(ws,{t:"error",code:"host_missing",message:"That FOIDBALL host is offline."}); foidSendHosts(ws); return; }
+    if(host.ws===ws||hostId===foidSafeId(ws._foidId||"")){ foidSend(ws,{t:"error",code:"self_watch",message:"That is your own broadcast."}); return; }
+    if(!host.viewers)host.viewers=new Set(); foidDetachViewer(ws,true);
+    if(host.viewers.size>=20){ foidSend(ws,{t:"error",code:"full",message:"That FOIDBALL broadcast already has 20 viewers."}); return; }
+    ws._foidId=foidSafeId(m.viewer_id||ws._foidId); ws._foidName=foidSafeName(m.viewer_name||ws._foidName,"VIEWER"); ws._foidWatchingHostId=hostId; host.viewers.add(ws);
+    foidSend(ws,{t:"watch_ok",host:foidHostPublic(host,ws),ts:Date.now()}); foidSend(host.ws,{t:"spectator_count",count:foidViewerSockets(host).length,ts:Date.now()});
+    if(host.playing&&host.snapshot) foidSend(ws,{t:"frame",host_id:hostId,playing:true,snapshot:host.snapshot,ts:Date.now()}); else foidSend(ws,{t:"watch_wait",host_id:hostId,message:"HOST IS NOT IN A MATCH YET",ts:Date.now()});
+    foidBroadcastHosts(); return;
+  }
+  if(t==="unwatch") { foidDetachViewer(ws); return; }
+  if(t==="frame") {
+    const id=foidSafeId(m.id||ws._foidId||""); const host=id?foidHosts.get(id):null; if(!host||host.ws!==ws)return;
+    host.playing=!!m.playing; host.updatedAt=Date.now(); if(m.snapshot&&typeof m.snapshot==="object")host.snapshot=m.snapshot;
+    const packet={t:"frame",host_id:id,playing:host.playing,snapshot:host.snapshot,ts:Date.now()}; for(const v of foidViewerSockets(host)) foidSend(v,packet); return;
+  }
+  if(t==="ping") { foidSend(ws,{t:"pong",ts:Date.now()}); return; }
+}
+
 // -----------------------------------------
 // Connection handler (auto-detect protocol)
 // -----------------------------------------
@@ -2074,6 +2175,11 @@ wss.on("connection", (ws, req) => {
     // GROWTH Frog-Hole / Croakline protocol:
     if (raw && raw.startsWith("gf:")) {
       try { growthHandle(ws, raw.slice(3)); } catch {}
+      return;
+    }
+    // FOIDBALL spectator protocol:
+    if (raw && raw.startsWith("fb:")) {
+      try { foidHandle(ws, raw.slice(3)); } catch {}
       return;
     }
 let m;
@@ -2298,6 +2404,7 @@ let m;
     try { prisonDetach(ws, true); } catch {}
     try { stugDetach(ws, true); } catch {}
     try { growthDetach(ws); } catch {}
+    try { foidDetach(ws); } catch {}
     detachFromCurrentRoom();
   });
 });
