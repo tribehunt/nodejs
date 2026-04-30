@@ -2076,7 +2076,13 @@ function foidHandle(ws, payloadStr) {
   if(t==="frame") {
     const id=foidSafeId(m.id||ws._foidId||""); const host=id?foidHosts.get(id):null; if(!host||host.ws!==ws)return;
     host.playing=!!m.playing; host.updatedAt=Date.now(); if(m.snapshot&&typeof m.snapshot==="object")host.snapshot=m.snapshot;
-    const packet={t:"frame",host_id:id,playing:host.playing,snapshot:host.snapshot,ts:Date.now()}; for(const v of foidViewerSockets(host)) foidSend(v,packet); return;
+    const packet={t:"frame",host_id:id,playing:host.playing,snapshot:host.snapshot,ts:Date.now()};
+    for(const v of foidViewerSockets(host)) {
+      try {
+        if(Number(v.bufferedAmount || 0) < 262144) foidSend(v,packet);
+      } catch { foidSend(v,packet); }
+    }
+    return;
   }
   if(t==="ping") { foidSend(ws,{t:"pong",ts:Date.now()}); return; }
 }
