@@ -2059,8 +2059,85 @@ function twoUsers(room) {
   out.sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id)));
   return out;
 }
+function twoRoleForId(room, id) {
+  id = String(id || "");
+  if (!room || !id) return null;
+  if (String(room.roles.driver || "") === id) return "driver";
+  if (String(room.roles.shooter || "") === id) return "shooter";
+  return null;
+}
+function twoSendRoleSync(room) {
+  if (!room) return;
+  for (const [ws, meta] of room.clients.entries()) {
+    twoSend(ws, { t: "role_sync", id: meta.id, role: twoRoleForId(room, meta.id), roles: room.roles, ts: Date.now() });
+  }
+}
 function twoSyncLobby(room) {
   twoBroadcast(room, { t: "lobby", room: room.name, roles: room.roles, users: twoUsers(room), started: !!room.started, ts: Date.now() });
+  twoSendRoleSync(room);
+}
+
+function twoMetaById(room, id) {
+  id = String(id || "");
+  if (!room || !id) return null;
+  for (const meta of room.clients.values()) {
+    if (meta && String(meta.id || "") === id) return meta;
+  }
+  return null;
+}
+function twoNameById(room, id) {
+  const meta = twoMetaById(room, id);
+  return meta ? String(meta.name || meta.id || "Hunter").slice(0, 24) : "Hunter";
+}
+function twoCurrentIds(room) {
+  return [...room.clients.values()].map(m => String((m && m.id) || "")).filter(Boolean);
+}
+function twoCleanRoles(room) {
+  const ids = new Set(twoCurrentIds(room));
+  if (!ids.has(String(room.roles.driver || ""))) room.roles.driver = null;
+  if (!ids.has(String(room.roles.shooter || ""))) room.roles.shooter = null;
+  if (room.roles.driver && room.roles.shooter && room.roles.driver === room.roles.shooter && room.clients.size >= 2) {
+    const other = twoCurrentIds(room).find(id => id !== room.roles.driver) || null;
+    if (other) room.roles.shooter = other;
+  }
+}
+function twoShuffle(arr) {
+  const out = arr.slice();
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const t = out[i]; out[i] = out[j]; out[j] = t;
+  }
+  return out;
+}
+function twoAutoAssignRolesForLaunch(room, launcherId) {
+  twoCleanRoles(room);
+  const ids = twoCurrentIds(room);
+  if (!ids.length) return;
+  const beforeDriver = room.roles.driver;
+  const beforeShooter = room.roles.shooter;
+  if (ids.length === 1) {
+    const only = ids[0];
+    if (!room.roles.driver) room.roles.driver = only;
+    if (!room.roles.shooter) room.roles.shooter = only;
+  } else {
+    if (!room.roles.driver && !room.roles.shooter) {
+      const pair = twoShuffle(ids).slice(0, 2);
+      room.roles.driver = pair[0];
+      room.roles.shooter = pair[1];
+    } else if (room.roles.driver && !room.roles.shooter) {
+      room.roles.shooter = ids.find(id => id !== room.roles.driver) || room.roles.driver;
+    } else if (!room.roles.driver && room.roles.shooter) {
+      room.roles.driver = ids.find(id => id !== room.roles.shooter) || room.roles.shooter;
+    } else if (room.roles.driver === room.roles.shooter) {
+      const other = ids.find(id => id !== room.roles.driver);
+      if (other) room.roles.shooter = other;
+    }
+  }
+  if (beforeDriver !== room.roles.driver || beforeShooter !== room.roles.shooter) {
+    const d = twoNameById(room, room.roles.driver);
+    const g = twoNameById(room, room.roles.shooter);
+    twoBroadcast(room, { t: "chat", from: "COMMAND", name: "COMMAND", text: `Launch seats assigned: ${d} drives / ${g} shoots.`, ts: Date.now() });
+  }
 }
 function twoDetach(ws) {
   if (!ws || !ws._twoRoomName) return;
@@ -2089,34 +2166,27 @@ function twoRnd(seed) {
 }
 function twoGenMap(w, h, seed) {
   const rnd = twoRnd(seed);
-  const grid = [];
+  // Workable by construction: border walls only, plus isolated interior obstructions.
+  // Isolated walls cannot partition the map, so every vampire spawn remains reachable.
+  const cells = [];
   for (let y = 0; y < h; y++) {
-    let row = "";
+    cells[y] = [];
     for (let x = 0; x < w; x++) {
-      let wall = (x === 0 || y === 0 || x === w - 1 || y === h - 1);
-      if (!wall && rnd() < 0.075) wall = true;
-      if (x >= 1 && x <= 5 && y >= 1 && y <= 5) wall = false;
-      row += wall ? "1" : "0";
-    }
-    grid.push(row);
-  }
-  function setCell(x, y, ch) {
-    if (x <= 0 || y <= 0 || x >= w - 1 || y >= h - 1) return;
-    const row = grid[y].split(""); row[x] = ch; grid[y] = row.join("");
-  }
-  for (let i = 0; i < 7; i++) {
-    const cx = 5 + Math.floor(rnd() * (w - 10));
-    const cy = 4 + Math.floor(rnd() * (h - 8));
-    const rw = 2 + Math.floor(rnd() * 5);
-    const rh = 2 + Math.floor(rnd() * 4);
-    for (let yy = cy - rh; yy <= cy + rh; yy++) {
-      for (let xx = cx - rw; xx <= cx + rw; xx++) {
-        if (rnd() < 0.62) setCell(xx, yy, "1");
-      }
+      cells[y][x] = (x === 0 || y === 0 || x === w - 1 || y === h - 1) ? "1" : "0";
     }
   }
-  for (let y = 1; y <= 5; y++) for (let x = 1; x <= 5; x++) setCell(x, y, "0");
-  return grid;
+  function isBlockedNeighbor(x, y) {
+    return cells[y][x + 1] === "1" || cells[y][x - 1] === "1" || cells[y + 1][x] === "1" || cells[y - 1][x] === "1";
+  }
+  for (let i = 0; i < 42; i++) {
+    const x = 2 + Math.floor(rnd() * (w - 4));
+    const y = 2 + Math.floor(rnd() * (h - 4));
+    if (x <= 6 && y <= 6) continue;
+    if (isBlockedNeighbor(x, y)) continue;
+    cells[y][x] = "1";
+  }
+  for (let y = 1; y <= 5; y++) for (let x = 1; x <= 5; x++) cells[y][x] = "0";
+  return cells.map(row => row.join(""));
 }
 function twoIsWall(room, x, y) {
   const m = room.mission;
@@ -2161,8 +2231,19 @@ function twoSpawnMission(room) {
   const code = codes[Math.floor(rnd() * codes.length)] + "-" + Math.floor(100 + rnd() * 899);
   const enemies = [];
   const count = 7 + Math.floor(rnd() * 5);
+  const used = new Set(["2,2"]);
   for (let i = 0; i < count; i++) {
-    const p = twoFindOpen(map, rnd, target.x, target.y);
+    let p = null;
+    for (let tries = 0; tries < 240; tries++) {
+      const cand = twoFindOpen(map, rnd, target.x, target.y);
+      const key = `${cand.mx},${cand.my}`;
+      if (key !== "2,2" && !used.has(key) && map[cand.my] && map[cand.my][cand.mx] === "0") {
+        used.add(key);
+        p = cand;
+        break;
+      }
+    }
+    if (!p) p = { x: 2.5 + i * 0.35, y: 7.5, mx: 2 + i, my: 7 };
     enemies.push({ id: i + 1, x: Math.round(p.x * 1000) / 1000, y: Math.round(p.y * 1000) / 1000, hp: 2 + (rnd() < 0.22 ? 1 : 0) });
   }
   room.mission = {
@@ -2201,7 +2282,7 @@ function twoHandle(ws, payloadStr) {
     meta.ws = ws; meta.id = id; meta.name = desired; meta.sprite = clamp(Number(m.sprite || meta.sprite || 1), 1, 4);
     room.clients.set(ws, meta);
     ws._twoId = id;
-    twoSend(ws, { t: "welcome", id, room: room.name, roles: room.roles, ts: Date.now() });
+    twoSend(ws, { t: "welcome", id, room: room.name, roles: room.roles, role: twoRoleForId(room, id), ts: Date.now() });
     twoSyncLobby(room);
     if (room.mission) twoSend(ws, { t: "mission", mission: room.mission, ts: Date.now() });
     return;
@@ -2221,8 +2302,8 @@ function twoHandle(ws, payloadStr) {
     return;
   }
   if (t === "lobby_state") {
-    meta.x = clamp(Number(m.x || meta.x || 250), 180, 420);
-    meta.y = clamp(Number(m.y || meta.y || 190), 96, 314);
+    meta.x = clamp(Number(m.x || meta.x || 250), 17, 423);
+    meta.y = clamp(Number(m.y || meta.y || 190), 114, 390);
     meta.dir = String(m.dir || meta.dir || "down").slice(0, 8);
     meta.moving = !!m.moving;
     meta.sprite = clamp(Number(m.sprite || meta.sprite || 1), 1, 4);
@@ -2233,14 +2314,19 @@ function twoHandle(ws, payloadStr) {
   if (t === "role") {
     const role = String(m.role || "").toLowerCase();
     if (role !== "driver" && role !== "shooter") return;
+    twoCleanRoles(room);
+    const occupiedBy = room.roles[role];
+    if (occupiedBy && occupiedBy !== meta.id) {
+      const who = twoNameById(room, occupiedBy);
+      twoSend(ws, { t: "error", message: `${role.toUpperCase()} seat is already occupied by ${who}.` });
+      twoSend(ws, { t: "chat", from: "COMMAND", name: "COMMAND", text: `${role.toUpperCase()} is already occupied by ${who}.`, ts: Date.now() });
+      twoSyncLobby(room);
+      return;
+    }
     if (room.roles.driver === meta.id) room.roles.driver = null;
     if (room.roles.shooter === meta.id) room.roles.shooter = null;
-    if (room.roles[role] && room.roles[role] !== meta.id) {
-      twoSend(ws, { t: "error", message: `${role.toUpperCase()} seat is occupied.` });
-    } else {
-      room.roles[role] = meta.id;
-      twoBroadcast(room, { t: "chat", from: "COMMAND", name: "COMMAND", text: `${meta.name} took ${role.toUpperCase()}.`, ts: Date.now() });
-    }
+    room.roles[role] = meta.id;
+    twoBroadcast(room, { t: "chat", from: "COMMAND", name: "COMMAND", text: `${meta.name} took ${role.toUpperCase()}.`, ts: Date.now() });
     twoSyncLobby(room);
     return;
   }
@@ -2251,11 +2337,13 @@ function twoHandle(ws, payloadStr) {
   }
   if (t === "launch") {
     const mission = room.mission || twoSpawnMission(room);
-    if (!room.roles.driver && room.clients.size >= 1) room.roles.driver = meta.id;
-    if (!room.roles.shooter && room.clients.size === 1) room.roles.shooter = meta.id;
+    twoAutoAssignRolesForLaunch(room, meta.id);
     room.started = true;
     room.vehicle = { x: 2.5, y: 2.5, a: 0, hp: 100 };
-    twoBroadcast(room, { t: "start", mission, vehicle: room.vehicle, roles: room.roles, ts: Date.now() });
+    for (const [ows, ometa] of room.clients.entries()) {
+      twoSend(ows, { t: "start", mission, vehicle: room.vehicle, roles: room.roles, role: twoRoleForId(room, ometa.id), id: ometa.id, ts: Date.now() });
+    }
+    twoSendRoleSync(room);
     twoSyncLobby(room);
     return;
   }
