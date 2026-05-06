@@ -1,5 +1,5 @@
 // server.js - supports Eldritch Cyber Front,
-// Ethane Sea, Azha, STUG, GROWTH & FOIDBALL
+// Ethane Sea, Azha, STUG, GROWTH & [2]
 // One process, one port, isolated rooms by game.
 // by Dedset Media 02/24/2026
 const http = require("http");
@@ -1995,96 +1995,348 @@ function growthHandle(ws, payloadStr) {
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// FOIDBALL spectator protocol (fb:...)
-// Roster hub can list hosts. Hosts stream lightweight match snapshots. Viewers receive autoplay field frames.
+// [2] Hunters protocol (2:...)
+// Small 700x400 co-op vampire-nest game. One room = two hunters, one shared drop-pod vehicle.
+// Clients send:  2:{"t":"join","room":"global","id":"H-XXXX","name":"Hunter","sprite":1}
+//                2:{"t":"chat","text":"..."}
+//                2:{"t":"role","role":"driver"|"shooter"}
+//                2:{"t":"mission_request"}
+//                2:{"t":"launch"}
+//                2:{"t":"drive","v":{"x":2.5,"y":2.5,"a":0,"hp":100}}
+//                2:{"t":"shot","a":0}
+// Server sends:  2:{"t":"welcome"} / 2:{"t":"lobby"} / 2:{"t":"mission"} / 2:{"t":"start"}
+//                2:{"t":"vehicle"} / 2:{"t":"enemies"} / 2:{"t":"enemy_remove"} / 2:{"t":"complete"}
 // ---------------------------------------------------------------------------------------------------------
-const foidHosts = new Map(); // id -> { id, name, ws, playing, snapshot, viewers:Set<ws>, updatedAt }
-function foidSafeId(s) {
-  try { return String(s || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64) || ("FB-" + rid()); } catch { return "FB-" + rid(); }
+const twoRooms = new Map();
+function twoSafeId(s, fallback) {
+  s = String(s || fallback || ("H-" + rid())).replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32);
+  return s || ("H-" + rid());
 }
-function foidSafeName(s, fb="FOIDBALL") {
-  try { return String(s || "").replace(/\s+/g, " ").trim().slice(0, 48) || fb; } catch { return fb; }
-}
-function foidSend(ws, obj) {
+function twoSend(ws, obj) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  try { ws.send("fb:" + JSON.stringify(obj)); } catch {}
+  try { ws.send("2:" + JSON.stringify(obj)); } catch {}
 }
-function foidHostPublic(h, viewerWs=null) {
-  return { id:String(h.id||""), name:foidSafeName(h.name,"FOIDBALL"), playing:!!h.playing,
-    viewers:h.viewers?Math.max(0,h.viewers.size|0):0,
-    age:Math.max(0,Math.floor((Date.now()-Number(h.updatedAt||0))/1000)), you:!!(viewerWs&&h.ws===viewerWs) };
+function twoBroadcast(room, obj, exceptWs = null) {
+  const data = "2:" + JSON.stringify(obj);
+  for (const ws of room.clients.keys()) {
+    if (!ws || ws === exceptWs || ws.readyState !== WebSocket.OPEN) continue;
+    try { ws.send(data); } catch {}
+  }
 }
-function foidViewerSockets(h) {
-  const out=[]; if(!h||!h.viewers)return out;
-  for(const v of [...h.viewers]) { if(v&&v.readyState===WebSocket.OPEN) out.push(v); else h.viewers.delete(v); }
+function twoGetRoom(roomName) {
+  const rn = safeRoomId(roomName || "global", "global");
+  if (!twoRooms.has(rn)) {
+    twoRooms.set(rn, {
+      name: rn,
+      clients: new Map(),
+      roles: { driver: null, shooter: null },
+      mission: null,
+      started: false,
+      vehicle: { x: 2.5, y: 2.5, a: 0, hp: 100 },
+      seed: nowSeed(),
+      lastTick: Date.now()
+    });
+  }
+  return twoRooms.get(rn);
+}
+function twoUsers(room) {
+  const out = [];
+  for (const [ws, meta] of room.clients.entries()) {
+    let role = null;
+    if (room.roles.driver === meta.id) role = "driver";
+    if (room.roles.shooter === meta.id) role = "shooter";
+    out.push({
+      id: meta.id,
+      name: meta.name,
+      sprite: meta.sprite,
+      x: meta.x,
+      y: meta.y,
+      dir: meta.dir,
+      moving: !!meta.moving,
+      role
+    });
+  }
+  out.sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id)));
   return out;
 }
-function foidSendHosts(ws) {
-  const hosts=[...foidHosts.values()].filter(h=>h&&h.ws&&h.ws.readyState===WebSocket.OPEN).map(h=>foidHostPublic(h,ws));
-  foidSend(ws,{t:"hosts",hosts,ts:Date.now()});
+function twoSyncLobby(room) {
+  twoBroadcast(room, { t: "lobby", room: room.name, roles: room.roles, users: twoUsers(room), started: !!room.started, ts: Date.now() });
 }
-function foidBroadcastHosts() {
-  const hosts=[...foidHosts.values()].filter(h=>h&&h.ws&&h.ws.readyState===WebSocket.OPEN).map(h=>foidHostPublic(h));
-  try { for(const c of wss.clients) if(c&&c.readyState===WebSocket.OPEN&&c._foidSeen) foidSend(c,{t:"hosts",hosts,ts:Date.now()}); } catch {}
+function twoDetach(ws) {
+  if (!ws || !ws._twoRoomName) return;
+  const room = twoRooms.get(ws._twoRoomName);
+  if (room) {
+    const meta = room.clients.get(ws);
+    room.clients.delete(ws);
+    if (meta) {
+      if (room.roles.driver === meta.id) room.roles.driver = null;
+      if (room.roles.shooter === meta.id) room.roles.shooter = null;
+      twoBroadcast(room, { t: "chat", from: "NET", name: "NET", text: `${meta.name || meta.id} disconnected.`, ts: Date.now() });
+    }
+    if (room.clients.size === 0) twoRooms.delete(room.name);
+    else twoSyncLobby(room);
+  }
+  ws._twoRoomName = null;
 }
-function foidDetachViewer(ws, silent=false) {
-  if(!ws||!ws._foidWatchingHostId)return;
-  const host=foidHosts.get(String(ws._foidWatchingHostId)); ws._foidWatchingHostId="";
-  if(host&&host.viewers){ host.viewers.delete(ws); const count=foidViewerSockets(host).length; if(!silent) foidSend(host.ws,{t:"spectator_count",count,ts:Date.now()}); }
-  foidBroadcastHosts();
+function twoRnd(seed) {
+  let t = (seed >>> 0) || 1;
+  return function() {
+    t += 0x6D2B79F5;
+    let r = Math.imul(t ^ (t >>> 15), 1 | t);
+    r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+  };
 }
-function foidDetach(ws) {
-  if(!ws)return; foidDetachViewer(ws,true);
-  const id=String(ws._foidId||""); const host=id?foidHosts.get(id):null;
-  if(host&&host.ws===ws){
-    for(const v of foidViewerSockets(host)){ foidSend(v,{t:"host_left",host_id:id,ts:Date.now()}); try{v._foidWatchingHostId="";}catch{} }
-    foidHosts.delete(id); foidBroadcastHosts();
+function twoGenMap(w, h, seed) {
+  const rnd = twoRnd(seed);
+  const grid = [];
+  for (let y = 0; y < h; y++) {
+    let row = "";
+    for (let x = 0; x < w; x++) {
+      let wall = (x === 0 || y === 0 || x === w - 1 || y === h - 1);
+      if (!wall && rnd() < 0.075) wall = true;
+      if (x >= 1 && x <= 5 && y >= 1 && y <= 5) wall = false;
+      row += wall ? "1" : "0";
+    }
+    grid.push(row);
   }
-  ws._foidSeen=false;
+  function setCell(x, y, ch) {
+    if (x <= 0 || y <= 0 || x >= w - 1 || y >= h - 1) return;
+    const row = grid[y].split(""); row[x] = ch; grid[y] = row.join("");
+  }
+  for (let i = 0; i < 7; i++) {
+    const cx = 5 + Math.floor(rnd() * (w - 10));
+    const cy = 4 + Math.floor(rnd() * (h - 8));
+    const rw = 2 + Math.floor(rnd() * 5);
+    const rh = 2 + Math.floor(rnd() * 4);
+    for (let yy = cy - rh; yy <= cy + rh; yy++) {
+      for (let xx = cx - rw; xx <= cx + rw; xx++) {
+        if (rnd() < 0.62) setCell(xx, yy, "1");
+      }
+    }
+  }
+  for (let y = 1; y <= 5; y++) for (let x = 1; x <= 5; x++) setCell(x, y, "0");
+  return grid;
 }
-function foidHandle(ws, payloadStr) {
-  let m=null; try{m=JSON.parse(String(payloadStr||""));}catch{m=null}
-  if(!m||typeof m!=="object")return; ws._foidSeen=true;
-  const t=String(m.t||m.type||"").toLowerCase();
-  if(t==="hello") { ws._foidId=foidSafeId(m.id||ws._foidId); ws._foidName=foidSafeName(m.name||ws._foidName,"FOIDBALL"); foidSend(ws,{t:"welcome",id:ws._foidId,name:ws._foidName,ts:Date.now()}); foidSendHosts(ws); return; }
-  if(t==="list") { foidSendHosts(ws); return; }
-  if(t==="host") {
-    const id=foidSafeId(m.id||ws._foidId); ws._foidId=id; ws._foidName=foidSafeName(m.name||ws._foidName,"FOIDBALL");
-    const prev=foidHosts.get(id)||null;
-    const entry={id,name:ws._foidName,ws,playing:!!m.playing,snapshot:(m.snapshot&&typeof m.snapshot==="object")?m.snapshot:(prev?prev.snapshot:null),viewers:prev&&prev.viewers?prev.viewers:new Set(),updatedAt:Date.now()};
-    foidHosts.set(id,entry);
-    for(const v of foidViewerSockets(entry)){ try{v._foidWatchingHostId=id;}catch{}; foidSend(v,{t:"watch_ok",host:foidHostPublic(entry,v),ts:Date.now()}); if(entry.playing&&entry.snapshot) foidSend(v,{t:"frame",host_id:id,playing:true,snapshot:entry.snapshot,ts:Date.now()}); else foidSend(v,{t:"watch_wait",host_id:id,message:"HOST IS NOT IN A MATCH YET",ts:Date.now()}); }
-    foidSend(ws,{t:"host_ok",host:foidHostPublic(entry,ws),ts:Date.now()}); foidBroadcastHosts(); return;
+function twoIsWall(room, x, y) {
+  const m = room.mission;
+  if (!m || !Array.isArray(m.map) || !m.map.length) return true;
+  const xi = Math.floor(Number(x));
+  const yi = Math.floor(Number(y));
+  if (yi < 0 || yi >= m.map.length || xi < 0 || xi >= m.map[0].length) return true;
+  return m.map[yi][xi] === "1";
+}
+function twoLineClear(room, x0, y0, x1, y1) {
+  const dx = x1 - x0, dy = y1 - y0;
+  const dist = Math.hypot(dx, dy) || 1;
+  const steps = Math.max(1, Math.floor(dist / 0.12));
+  for (let i = 1; i < steps; i++) {
+    const t = i / steps;
+    if (twoIsWall(room, x0 + dx * t, y0 + dy * t)) return false;
   }
-  if(t==="unhost"||t==="host_quit") {
-    const id=foidSafeId(m.id||ws._foidId||""); const host=id?foidHosts.get(id):null; if(!host||host.ws!==ws)return;
-    for(const v of foidViewerSockets(host)){ foidSend(v,{t:"host_left",host_id:id,ts:Date.now()}); try{v._foidWatchingHostId="";}catch{} }
-    foidHosts.delete(id); foidBroadcastHosts(); return;
+  return true;
+}
+function twoFindOpen(map, rnd, nearX, nearY) {
+  const h = map.length, w = map[0].length;
+  for (let tries = 0; tries < 200; tries++) {
+    let x, y;
+    if (Number.isFinite(nearX) && Number.isFinite(nearY)) {
+      x = Math.max(1, Math.min(w - 2, Math.floor(nearX + (rnd() - 0.5) * 12)));
+      y = Math.max(1, Math.min(h - 2, Math.floor(nearY + (rnd() - 0.5) * 10)));
+    } else {
+      x = 2 + Math.floor(rnd() * (w - 4));
+      y = 2 + Math.floor(rnd() * (h - 4));
+    }
+    if (map[y] && map[y][x] === "0") return { x: x + 0.5, y: y + 0.5, mx: x, my: y };
   }
-  if(t==="watch") {
-    const hostId=foidSafeId(m.host_id||""); const host=foidHosts.get(hostId);
-    if(!host||!host.ws||host.ws.readyState!==WebSocket.OPEN){ foidSend(ws,{t:"error",code:"host_missing",message:"That FOIDBALL host is offline."}); foidSendHosts(ws); return; }
-    if(host.ws===ws||hostId===foidSafeId(ws._foidId||"")){ foidSend(ws,{t:"error",code:"self_watch",message:"That is your own broadcast."}); return; }
-    if(!host.viewers)host.viewers=new Set(); foidDetachViewer(ws,true);
-    if(host.viewers.size>=20){ foidSend(ws,{t:"error",code:"full",message:"That FOIDBALL broadcast already has 20 viewers."}); return; }
-    ws._foidId=foidSafeId(m.viewer_id||ws._foidId); ws._foidName=foidSafeName(m.viewer_name||ws._foidName,"VIEWER"); ws._foidWatchingHostId=hostId; host.viewers.add(ws);
-    foidSend(ws,{t:"watch_ok",host:foidHostPublic(host,ws),ts:Date.now()}); foidSend(host.ws,{t:"spectator_count",count:foidViewerSockets(host).length,ts:Date.now()});
-    if(host.playing&&host.snapshot) foidSend(ws,{t:"frame",host_id:hostId,playing:true,snapshot:host.snapshot,ts:Date.now()}); else foidSend(ws,{t:"watch_wait",host_id:hostId,message:"HOST IS NOT IN A MATCH YET",ts:Date.now()});
-    foidBroadcastHosts(); return;
+  return { x: 2.5, y: 2.5, mx: 2, my: 2 };
+}
+function twoSpawnMission(room) {
+  const seed = nowSeed();
+  const rnd = twoRnd(seed);
+  const w = 32, h = 22;
+  const map = twoGenMap(w, h, seed);
+  const target = twoFindOpen(map, rnd, 24, 15);
+  const codes = ["ASH CHOIR", "BLACK ALTAR", "GLASS COFFIN", "STATIC ORCHARD", "DEAD VOLT", "RED CHAPEL", "NULL BASILICA", "HOLLOW RELAY"];
+  const code = codes[Math.floor(rnd() * codes.length)] + "-" + Math.floor(100 + rnd() * 899);
+  const enemies = [];
+  const count = 7 + Math.floor(rnd() * 5);
+  for (let i = 0; i < count; i++) {
+    const p = twoFindOpen(map, rnd, target.x, target.y);
+    enemies.push({ id: i + 1, x: Math.round(p.x * 1000) / 1000, y: Math.round(p.y * 1000) / 1000, hp: 2 + (rnd() < 0.22 ? 1 : 0) });
   }
-  if(t==="unwatch") { foidDetachViewer(ws); return; }
-  if(t==="frame") {
-    const id=foidSafeId(m.id||ws._foidId||""); const host=id?foidHosts.get(id):null; if(!host||host.ws!==ws)return;
-    host.playing=!!m.playing; host.updatedAt=Date.now(); if(m.snapshot&&typeof m.snapshot==="object")host.snapshot=m.snapshot;
-    const packet={t:"frame",host_id:id,playing:host.playing,snapshot:host.snapshot,ts:Date.now()};
-    for(const v of foidViewerSockets(host)) {
-      try {
-        if(Number(v.bufferedAmount || 0) < 262144) foidSend(v,packet);
-      } catch { foidSend(v,packet); }
+  room.mission = {
+    id: "NEST-" + String(seed >>> 0), seed, code,
+    mapW: w, mapH: h, map,
+    target: { x: Math.round((rnd() * 900 + 50) * 10) / 10, y: Math.round((rnd() * 900 + 50) * 10) / 10, mx: target.mx, my: target.my },
+    enemies,
+    complete: false
+  };
+  room.vehicle = { x: 2.5, y: 2.5, a: 0, hp: 100 };
+  room.started = false;
+  return room.mission;
+}
+function twoHandle(ws, payloadStr) {
+  let m = null;
+  try { m = JSON.parse(String(payloadStr || "")); } catch { return; }
+  if (!m || typeof m !== "object") return;
+  const t = String(m.t || m.type || "").toLowerCase();
+  if (t === "join") {
+    const roomName = safeRoomId(m.room || "global", "global");
+    let room = twoGetRoom(roomName);
+    if (room.clients.size >= 2 && !room.clients.has(ws)) {
+      twoSend(ws, { t: "error", message: "Room is full for [2]. One driver, one shooter." });
+      return;
+    }
+    if (ws._twoRoomName && ws._twoRoomName !== roomName) twoDetach(ws);
+    ws._twoRoomName = roomName;
+    let id = twoSafeId(m.id, "H-" + rid());
+    for (const meta of room.clients.values()) {
+      if (meta.id === id && meta.ws !== ws) id = twoSafeId(id + "-" + rid().slice(0, 3), id);
+    }
+    let desired = String(m.name || id).replace(/\s+/g, " ").trim().slice(0, 20) || id;
+    const enf = enforceReservedName(ws, desired, "", id, "two");
+    desired = enf.name;
+    const meta = room.clients.get(ws) || { ws, id, name: desired, sprite: 1, x: 250, y: 190, dir: "down", moving: false };
+    meta.ws = ws; meta.id = id; meta.name = desired; meta.sprite = clamp(Number(m.sprite || meta.sprite || 1), 1, 4);
+    room.clients.set(ws, meta);
+    ws._twoId = id;
+    twoSend(ws, { t: "welcome", id, room: room.name, roles: room.roles, ts: Date.now() });
+    twoSyncLobby(room);
+    if (room.mission) twoSend(ws, { t: "mission", mission: room.mission, ts: Date.now() });
+    return;
+  }
+  if (!ws._twoRoomName) {
+    twoHandle(ws, JSON.stringify({ t: "join", room: m.room || "global", id: m.id, name: m.name, sprite: m.sprite }));
+  }
+  const room = twoRooms.get(ws._twoRoomName);
+  if (!room) return;
+  const meta = room.clients.get(ws);
+  if (!meta) return;
+  if (t === "chat" || t === "msg") {
+    const text = String(m.text || m.msg || "").replace(/\r?\n/g, " ").trim().slice(0, 220);
+    if (!text) return;
+    const name = String(m.name || meta.name || meta.id).slice(0, 24);
+    twoBroadcast(room, { t: "chat", from: meta.id, name, text, ts: Date.now() });
+    return;
+  }
+  if (t === "lobby_state") {
+    meta.x = clamp(Number(m.x || meta.x || 250), 180, 420);
+    meta.y = clamp(Number(m.y || meta.y || 190), 96, 314);
+    meta.dir = String(m.dir || meta.dir || "down").slice(0, 8);
+    meta.moving = !!m.moving;
+    meta.sprite = clamp(Number(m.sprite || meta.sprite || 1), 1, 4);
+    if (m.name != null) meta.name = String(m.name || meta.name || meta.id).replace(/\s+/g, " ").trim().slice(0, 20) || meta.id;
+    twoSyncLobby(room);
+    return;
+  }
+  if (t === "role") {
+    const role = String(m.role || "").toLowerCase();
+    if (role !== "driver" && role !== "shooter") return;
+    if (room.roles.driver === meta.id) room.roles.driver = null;
+    if (room.roles.shooter === meta.id) room.roles.shooter = null;
+    if (room.roles[role] && room.roles[role] !== meta.id) {
+      twoSend(ws, { t: "error", message: `${role.toUpperCase()} seat is occupied.` });
+    } else {
+      room.roles[role] = meta.id;
+      twoBroadcast(room, { t: "chat", from: "COMMAND", name: "COMMAND", text: `${meta.name} took ${role.toUpperCase()}.`, ts: Date.now() });
+    }
+    twoSyncLobby(room);
+    return;
+  }
+  if (t === "mission_request") {
+    const mission = room.mission || twoSpawnMission(room);
+    twoBroadcast(room, { t: "mission", mission, ts: Date.now() });
+    return;
+  }
+  if (t === "launch") {
+    const mission = room.mission || twoSpawnMission(room);
+    if (!room.roles.driver && room.clients.size >= 1) room.roles.driver = meta.id;
+    if (!room.roles.shooter && room.clients.size === 1) room.roles.shooter = meta.id;
+    room.started = true;
+    room.vehicle = { x: 2.5, y: 2.5, a: 0, hp: 100 };
+    twoBroadcast(room, { t: "start", mission, vehicle: room.vehicle, roles: room.roles, ts: Date.now() });
+    twoSyncLobby(room);
+    return;
+  }
+  if (t === "drive") {
+    if (room.roles.driver && room.roles.driver !== meta.id) return;
+    const v = (m.v && typeof m.v === "object") ? m.v : {};
+    room.vehicle = {
+      x: clamp(Number(v.x != null ? v.x : room.vehicle.x), 1.2, (room.mission ? room.mission.mapW - 1.2 : 31)),
+      y: clamp(Number(v.y != null ? v.y : room.vehicle.y), 1.2, (room.mission ? room.mission.mapH - 1.2 : 21)),
+      a: clamp(Number(v.a != null ? v.a : room.vehicle.a), -999999, 999999),
+      hp: clamp(Number(v.hp != null ? v.hp : room.vehicle.hp), 0, 100)
+    };
+    twoBroadcast(room, { t: "vehicle", v: room.vehicle, by: meta.id, ts: Date.now() });
+    return;
+  }
+  if (t === "shot") {
+    if (room.roles.shooter && room.roles.shooter !== meta.id) return;
+    if (!room.mission || !Array.isArray(room.mission.enemies)) return;
+    const a = Number(m.a != null ? m.a : room.vehicle.a);
+    const sx = room.vehicle.x, sy = room.vehicle.y;
+    let bestIdx = -1, bestD = 999999;
+    for (let i = 0; i < room.mission.enemies.length; i++) {
+      const e = room.mission.enemies[i];
+      const dx = e.x - sx, dy = e.y - sy;
+      const d = Math.hypot(dx, dy);
+      if (d < 0.2 || d > 17) continue;
+      let da = Math.atan2(dy, dx) - a;
+      while (da <= -Math.PI) da += Math.PI * 2;
+      while (da > Math.PI) da -= Math.PI * 2;
+      if (Math.abs(da) < 0.12 && d < bestD && twoLineClear(room, sx, sy, e.x, e.y)) { bestIdx = i; bestD = d; }
+    }
+    twoBroadcast(room, { t: "shot", by: meta.id, a, ts: Date.now() });
+    if (bestIdx >= 0) {
+      const e = room.mission.enemies[bestIdx];
+      e.hp = (e.hp | 0) - 1;
+      if (e.hp <= 0) {
+        const dead = room.mission.enemies.splice(bestIdx, 1)[0];
+        twoBroadcast(room, { t: "enemy_remove", id: dead.id, by: meta.id, ts: Date.now() });
+        if (room.mission.enemies.length === 0) {
+          room.started = false;
+          room.mission.complete = true;
+          twoBroadcast(room, { t: "complete", mission: room.mission, by: meta.id, ts: Date.now() });
+          room.mission = null;
+        }
+      } else {
+        twoBroadcast(room, { t: "enemy_update", enemies: [{ id: e.id, x: e.x, y: e.y, hp: e.hp }], ts: Date.now() });
+      }
     }
     return;
   }
-  if(t==="ping") { foidSend(ws,{t:"pong",ts:Date.now()}); return; }
+  if (t === "ping") {
+    twoSend(ws, { t: "pong", ts: Date.now() });
+    return;
+  }
+}
+function twoTickRoom(room, dt) {
+  if (!room || !room.started || !room.mission || !Array.isArray(room.mission.enemies)) return;
+  const v = room.vehicle || { x: 2.5, y: 2.5, hp: 100 };
+  const moved = [];
+  let damaged = false;
+  for (const e of room.mission.enemies) {
+    const dx = v.x - e.x, dy = v.y - e.y;
+    const dist = Math.hypot(dx, dy) || 1;
+    if (dist < 0.68) {
+      v.hp = clamp(Number(v.hp || 100) - 10.5 * (dt / 1000), 0, 100);
+      damaged = true;
+      continue;
+    }
+    const sp = 0.74 * (dt / 1000);
+    const nx = e.x + dx / dist * sp;
+    const ny = e.y + dy / dist * sp;
+    if (!twoIsWall(room, nx, ny)) { e.x = Math.round(nx * 1000) / 1000; e.y = Math.round(ny * 1000) / 1000; moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp }); }
+  }
+  if (moved.length) twoBroadcast(room, { t: "enemy_update", enemies: moved, ts: Date.now() });
+  if (damaged) twoBroadcast(room, { t: "vehicle", v, ts: Date.now() });
+  if (v.hp <= 0) {
+    room.started = false;
+    v.hp = 100;
+    twoBroadcast(room, { t: "chat", from: "COMMAND", name: "COMMAND", text: "Pod disabled. Emergency recall complete.", ts: Date.now() });
+    twoBroadcast(room, { t: "vehicle", v, ts: Date.now() });
+  }
 }
 
 // -----------------------------------------
@@ -2183,9 +2435,9 @@ wss.on("connection", (ws, req) => {
       try { growthHandle(ws, raw.slice(3)); } catch {}
       return;
     }
-    // FOIDBALL spectator protocol:
-    if (raw && raw.startsWith("fb:")) {
-      try { foidHandle(ws, raw.slice(3)); } catch {}
+    // [2] Hunters protocol:
+    if (raw && raw.startsWith("2:")) {
+      try { twoHandle(ws, raw.slice(2)); } catch {}
       return;
     }
 let m;
@@ -2410,10 +2662,21 @@ let m;
     try { prisonDetach(ws, true); } catch {}
     try { stugDetach(ws, true); } catch {}
     try { growthDetach(ws); } catch {}
-    try { foidDetach(ws); } catch {}
+    try { twoDetach(ws); } catch {}
     detachFromCurrentRoom();
   });
 });
+
+// -----------------------------
+// [2] Hunters enemy AI tick
+// -----------------------------
+const TWO_TICK_MS = 80;
+setInterval(() => {
+  try {
+    for (const room of twoRooms.values()) twoTickRoom(room, TWO_TICK_MS);
+  } catch {}
+}, TWO_TICK_MS);
+
 // ----------------------------------------
 // AZHA fixed-rate net sync & enemy AI tick
 // ----------------------------------------
