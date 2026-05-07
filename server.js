@@ -2295,8 +2295,15 @@ function twoGenMap(w, h, seed) {
     [[0,0],[0,1],[0,2]],
     [[0,0],[1,0],[1,1],[2,1]],
     [[0,0],[-1,0],[0,1],[1,1]],
+    [[0,0],[1,0],[2,0],[2,1]],
+    [[0,0],[0,1],[0,2],[1,2]],
+    [[0,0],[1,0],[2,0],[3,0]],
+    [[0,0],[0,1],[0,2],[0,3]],
+    [[0,0],[1,0],[0,1],[1,2]],
+    [[0,0],[-1,0],[1,0],[0,1],[0,-1]],
+    [[0,0],[1,0],[2,0],[1,1],[2,1]],
   ];
-  for (let i = 0; i < 18; i++) {
+  for (let i = 0; i < 30; i++) {
     const shape = shapes[Math.floor(rnd() * shapes.length)];
     const ox = 3 + Math.floor(rnd() * (w - 6));
     const oy = 3 + Math.floor(rnd() * (h - 6));
@@ -2311,12 +2318,29 @@ function twoGenMap(w, h, seed) {
     if (!ok) continue;
     for (const [x, y] of pts) cells[y][x] = "1";
   }
-  for (let i = 0; i < 18; i++) {
+  for (let i = 0; i < 26; i++) {
     const x = 3 + Math.floor(rnd() * (w - 6));
     const y = 3 + Math.floor(rnd() * (h - 6));
     if (x <= 7 && y <= 7) continue;
     const n = (cells[y][x+1] === "1" ? 1 : 0) + (cells[y][x-1] === "1" ? 1 : 0) + (cells[y+1][x] === "1" ? 1 : 0) + (cells[y-1][x] === "1" ? 1 : 0);
-    if (n <= 1) cells[y][x] = "1";
+    if (n <= 2 || rnd() < 0.18) cells[y][x] = "1";
+  }
+  for (let i = 0; i < 3; i++) {
+    if (rnd() < 0.55) {
+      const yy = 7 + Math.floor(rnd() * Math.max(1, h - 12));
+      const start = 4 + Math.floor(rnd() * 5);
+      const end = w - (4 + Math.floor(rnd() * 4));
+      for (let xx = start; xx < end; xx++) {
+        if (!(xx <= 7 && yy <= 7) && rnd() < 0.74) cells[yy][xx] = "0";
+      }
+    } else {
+      const xx = 8 + Math.floor(rnd() * Math.max(1, w - 14));
+      const start = 5 + Math.floor(rnd() * 4);
+      const end = h - (4 + Math.floor(rnd() * 4));
+      for (let yy = start; yy < end; yy++) {
+        if (rnd() < 0.72) cells[yy][xx] = "0";
+      }
+    }
   }
   for (let y = 1; y <= 5; y++) for (let x = 1; x <= 5; x++) cells[y][x] = "0";
   const seen = new Set();
@@ -2353,6 +2377,53 @@ function twoLineClear(room, x0, y0, x1, y1) {
     if (twoIsWall(room, x0 + dx * t, y0 + dy * t)) return false;
   }
   return true;
+}
+function twoPointSegmentDistance(ax, ay, bx, by, px, py) {
+  const vx = bx - ax, vy = by - ay;
+  const denom = vx * vx + vy * vy;
+  if (denom <= 0.000001) return { d: Math.hypot(px - ax, py - ay), u: 0 };
+  let u = ((px - ax) * vx + (py - ay) * vy) / denom;
+  u = clamp(u, 0, 1);
+  const cx = ax + vx * u, cy = ay + vy * u;
+  return { d: Math.hypot(px - cx, py - cy), u };
+}
+function twoCastLineBlocker(caster, enemies, px, py, fromX, fromY) {
+  const ax = Number.isFinite(fromX) ? Number(fromX) : Number(caster.x || 0);
+  const ay = Number.isFinite(fromY) ? Number(fromY) : Number(caster.y || 0);
+  const bx = Number(px || 0), by = Number(py || 0);
+  if (Math.hypot(bx - ax, by - ay) <= 0.35) return null;
+  let best = null, bestU = 999;
+  for (const other of (enemies || [])) {
+    if (!other || other === caster || Number(other.hp || 0) <= 0) continue;
+    const ox = Number(other.x || ax), oy = Number(other.y || ay);
+    const hit = twoPointSegmentDistance(ax, ay, bx, by, ox, oy);
+    if (hit.u <= 0.075 || hit.u >= 0.92) continue;
+    const body = Number(other.body_radius || TWO_ENEMY_RADIUS);
+    if (hit.d <= Math.max(0.34, body + 0.18) && hit.u < bestU) { best = other; bestU = hit.u; }
+  }
+  return best;
+}
+function twoFindCastLanePoint(room, caster, enemies, px, py) {
+  const ex = Number(caster.x || 0), ey = Number(caster.y || 0);
+  const dx = Number(px || 0) - ex, dy = Number(py || 0) - ey;
+  const dist = Math.hypot(dx, dy) || 1;
+  const nx = -dy / dist, ny = dx / dist;
+  const fx = dx / dist, fy = dy / dist;
+  const sideFirst = Number(caster.flank_dir || 1) < 0 ? -1 : 1;
+  let best = null, bestScore = 999999;
+  for (const side of [sideFirst, -sideFirst]) {
+    for (const lateral of [0.85, 1.25, 1.75, 2.30]) {
+      for (const back of [0, -0.45, 0.45]) {
+        const cx = ex + nx * side * lateral + fx * back;
+        const cy = ey + ny * side * lateral + fy * back;
+        if (!twoEnemyBodyClear(room, caster, cx, cy, enemies, room.mission && room.mission.vehicle ? room.mission.vehicle : { x: px, y: py })) continue;
+        if (twoCastLineBlocker(caster, enemies, px, py, cx, cy)) continue;
+        const score = lateral + Math.abs(back) * 0.35 + Math.hypot(cx - ex, cy - ey) * 0.15;
+        if (score < bestScore) { best = { x: cx, y: cy }; bestScore = score; }
+      }
+    }
+  }
+  return best;
 }
 function twoFindOpen(map, rnd, nearX, nearY) {
   const h = map.length, w = map[0].length;
@@ -2635,8 +2706,21 @@ function twoResolveShotDamage(dnd, enemy) {
   const damage = hit ? Math.max(1, twoRollDice(dc * (crit ? 2 : 1), ds) + bonus + (extraD4 ? twoRollDice(extraD4, 4) : 0)) : 0;
   return { d20, attack_bonus: atk, ac, hit, crit, damage };
 }
+function twoCombatLog(room, text) {
+  try {
+    if (!room || !text) return;
+    twoBroadcast(room, { t: "combat_log", text: String(text).slice(0, 180), ts: Date.now() });
+  } catch (_) {}
+}
+function twoShotRollText(roll, enemy) {
+  const label = (enemy && enemy.elite ? "GEM " : "") + (String((enemy && enemy.archetype) || "") === "caster" ? "LICH" : "PAL");
+  const total = Number(roll.d20 || 0) + Number(roll.attack_bonus || 0);
+  if (roll.hit) return `SHOT${roll.crit ? " CRIT" : ""}: d20 ${roll.d20}+${roll.attack_bonus}=${total} vs AC ${roll.ac} ${label} -> HIT ${roll.damage}`;
+  return `SHOT: d20 ${roll.d20}+${roll.attack_bonus}=${total} vs AC ${roll.ac} ${label} -> ${Number(roll.d20 || 0) === 1 ? "JAM" : "MISS"}`;
+}
 function twoResolveEnemyDamage(e, v) {
   const mode = String(e.attack_mode || "melee");
+  const label = (e && e.elite ? "GEM " : "") + (String(e.archetype || "") === "caster" ? "LICH" : "PAL");
   if (mode === "wis_save") {
     const dc = Number(e.save_dc || 13);
     const bonus = Number(v.wis_save || 0);
@@ -2645,17 +2729,20 @@ function twoResolveEnemyDamage(e, v) {
     const dice = Array.isArray(e.damage_dice) ? e.damage_dice : [2, 6];
     let raw = twoRollDice(dice[0], dice[1]) + Number(e.damage_bonus || 0);
     raw *= (1.0 + Number(e.rally_bonus_active || 0));
-    return Math.max(1, saved ? Math.floor(raw / 2) : Math.floor(raw));
+    const damage = Math.max(1, saved ? Math.floor(raw / 2) : Math.floor(raw));
+    return { damage, text: `${label} WIS SAVE: d20 ${d20}+${bonus} vs DC ${dc} -> ${saved ? "SAVE" : "FAIL"} / ${damage} hull` };
   }
   const ac = Number(v.ac || 16);
   const d20 = 1 + Math.floor(Math.random() * 20);
   const atk = Number(e.attack_bonus || 4);
-  const hit = d20 !== 1 && (d20 === 20 || d20 + atk >= ac);
-  if (!hit) return 0;
+  const total = d20 + atk;
+  const hit = d20 !== 1 && (d20 === 20 || total >= ac);
+  if (!hit) return { damage: 0, text: `${label}: d20 ${d20}+${atk}=${total} vs TANK AC ${ac} -> MISS` };
   const dice = Array.isArray(e.damage_dice) ? e.damage_dice : [2, 6];
   let out = twoRollDice(dice[0] * (d20 === 20 ? 2 : 1), dice[1]) + Number(e.damage_bonus || 0);
   out *= (1.0 + Number(e.rally_bonus_active || 0));
-  return Math.max(1, Math.floor(out));
+  const damage = Math.max(1, Math.floor(out));
+  return { damage, text: `${label}${d20 === 20 ? " CRIT" : ""}: d20 ${d20}+${atk}=${total} vs TANK AC ${ac} -> HIT ${damage}` };
 }
 
 function twoScaleTraitForLevel(tr, level, wave) {
@@ -2840,6 +2927,17 @@ function twoWallForwardClear(room, nx, ny, ux, uy, radius) {
   const sx = -uy * side, sy = ux * side;
   return !twoIsWall(room, px, py) && !twoIsWall(room, px + sx, py + sy) && !twoIsWall(room, px - sx, py - sy);
 }
+function twoWallClearanceScore(room, nx, ny, radius) {
+  const r = Math.max(0.18, Number(radius || TWO_ENEMY_RADIUS) * 1.12);
+  const samples = [[r,0],[-r,0],[0,r],[0,-r],[r*0.75,r*0.75],[-r*0.75,r*0.75],[r*0.75,-r*0.75],[-r*0.75,-r*0.75]];
+  let score = 0, blocked = 0;
+  for (const [ox, oy] of samples) {
+    if (!twoIsWall(room, nx + ox, ny + oy)) score += 0.10;
+    else { blocked += 1; score -= 0.72; }
+  }
+  if (blocked >= 2) score -= 1.20 + blocked * 0.28;
+  return score;
+}
 function twoSteeredMove(room, e, ex, ey, mx, my, step, tx, ty, enemies, vehicle) {
   if (!Number.isFinite(step) || step <= 0.0001) return false;
   const base = Math.atan2(my, mx);
@@ -2848,7 +2946,7 @@ function twoSteeredMove(room, e, ex, ey, mx, my, step, tx, ty, enemies, vehicle)
   const oldD = Math.hypot(tx - ex, ty - ey);
   const sideOrder = Number(e.avoidBias || 0) > 0 ? [1, -1] : (Number(e.avoidBias || 0) < 0 ? [-1, 1] : [flank, -flank]);
   const offsets = [0];
-  for (const mag of [0.34, 0.68, 1.02, 1.38, 1.72]) for (const side of sideOrder) offsets.push(side * mag);
+  for (const mag of [0.34, 0.68, 1.02, 1.38, 1.72, 2.12, 2.55]) for (const side of sideOrder) offsets.push(side * mag);
   offsets.push(Math.PI);
   let best = null, bestScore = -999999;
   for (const scale of [1.0, 0.72, 0.48]) {
@@ -2861,7 +2959,8 @@ function twoSteeredMove(room, e, ex, ey, mx, my, step, tx, ty, enemies, vehicle)
       if (!wallClear && scale > 0.50) continue;
       const progress = (oldD - Math.hypot(tx - nx, ty - ny)) * 8.0;
       const pressure = twoBodyPressureScore(e, nx, ny, enemies, vehicle);
-      const score = progress + pressure + (wallClear ? 0.45 : -0.85) - Math.abs(off) * 0.42 - (Math.abs(off) > 2.4 ? 1.2 : 0) + scale * 0.16;
+      const clearance = twoWallClearanceScore(room, nx, ny, radius);
+      const score = progress + pressure + clearance + (wallClear ? 0.45 : -0.85) - Math.abs(off) * 0.42 - (Math.abs(off) > 2.4 ? 1.2 : 0) + scale * 0.16;
       if (score > bestScore) { bestScore = score; best = { nx, ny, off }; }
     }
   }
@@ -3167,6 +3266,7 @@ function twoHandle(ws, payloadStr) {
       const e = room.mission.enemies[bestIdx];
       const shotDnd = Object.assign({}, (m.dnd && typeof m.dnd === "object") ? m.dnd : {}, { buff_damage_d4: twoActiveBuffCount(room, 3) });
       const shotRoll = twoResolveShotDamage(shotDnd, e);
+      twoCombatLog(room, twoShotRollText(shotRoll, e));
       if (!shotRoll.hit) {
         twoBroadcast(room, { t: "enemy_update", enemies: [{ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, miss: true }], ts: Date.now() });
         return;
@@ -3237,17 +3337,25 @@ function twoTickRoom(room, dt) {
     const contactStop = bodyRadius + tankRadius + 0.10;
     const meleeAttackRange = Math.max(Number(e.attack_range || 0.74), contactStop + 0.16);
     let didCast = false;
+    const aggro = Number(v.aggro_range || 8.5);
+    const closeVisible = !!(visible && dist <= (isCaster ? Math.max(2.10, Number(e.attack_range || 0.74) * 0.38) : Math.max(2.85, meleeAttackRange + 1.15)));
+    const alreadyHurt = Number(e.hp || 1) < Number(e.max_hp || e.hp || 1);
 
-    if (visible) {
+    if (visible && (dist <= aggro || closeVisible || alreadyHurt)) {
+      // CHA / aggro only lowers the first trigger radius.  Close, wounded, or
+      // already-engaged vampires keep hunting and never freeze in front of the tank.
       e.lastX = px;
       e.lastY = py;
-      e.smellT = 2.25;
+      e.smellT = Math.max(Number(e.smellT || 0), 2.45);
+      e.engagedT = Math.max(Number(e.engagedT || 0), isCaster ? 3.6 : 5.0);
     } else {
       e.smellT = Math.max(0, Number(e.smellT || 0) - dtSec);
+      e.engagedT = Math.max(0, Number(e.engagedT || 0) - dtSec);
     }
     e.attackT = Math.max(0, Number(e.attackT || 0) - dtSec);
     e.lungeT = Math.max(0, Number(e.lungeT || 0) - dtSec);
     e.castingT = Math.max(0, Number(e.castingT || 0) - dtSec);
+    e.castBlockedT = Math.max(0, Number(e.castBlockedT || 0) - dtSec);
 
     if (isCaster) {
       const maxSlots = Math.max(1, Number(e.spell_slots_max || 3) | 0);
@@ -3266,13 +3374,16 @@ function twoTickRoom(room, dt) {
       e.spellRechargeT = 0;
     }
 
-    const aggro = Number(v.aggro_range || 8.5);
     // Both enemy types are cooldown-driven. Brutes never require fake spell slots.
     const hasCharge = true;
     const effectiveAttackRange = isCaster ? Number(e.attack_range || 0.74) : meleeAttackRange;
-    if (visible && dist <= effectiveAttackRange && hasCharge) {
+    const castBlocker = (isCaster && visible && dist <= effectiveAttackRange) ? twoCastLineBlocker(e, room.mission.enemies, px, py) : null;
+    if (castBlocker) { e.castBlockedT = Math.max(Number(e.castBlockedT || 0), 0.55); e.brain = "lich-reposition-cast-lane"; }
+    if (visible && dist <= effectiveAttackRange && hasCharge && (!isCaster || !castBlocker)) {
       if (e.attackT <= 0) {
-        let dmg = twoResolveEnemyDamage(e, v);
+        let atkResult = twoResolveEnemyDamage(e, v);
+        twoCombatLog(room, atkResult.text);
+        let dmg = Number(atkResult.damage || 0);
         if (e.elite && isCaster) {
           twoAddAcidStack(v);
           dmg = 0;
@@ -3299,14 +3410,24 @@ function twoTickRoom(room, dt) {
 
     let tx, ty;
     const aggroMove = Number(v.aggro_range || 8.5);
-    if (visible && dist <= aggroMove) {
+    if (visible && (dist <= aggroMove || closeVisible || Number(e.engagedT || 0) > 0)) {
       if (dist < contactStop) {
         const awayX = (ex - px) / dist, awayY = (ey - py) / dist;
         tx = ex + awayX * 1.20; ty = ey + awayY * 1.20;
       }
       else if (isCaster && Number(e.prefer_range || 0) > 0) {
         const prefer = Number(e.prefer_range || 0);
-        if (dist < prefer * 0.70) { tx = ex - dx; ty = ey - dy; }
+        if (Number(e.castBlockedT || 0) > 0 || castBlocker) {
+          const lane = twoFindCastLanePoint(room, e, room.mission.enemies, px, py);
+          if (lane) { tx = lane.x; ty = lane.y; e.brain = "lich-reposition-cast-lane"; }
+          else {
+            const side = Number(e.flank_dir || 1) < 0 ? -1 : 1;
+            tx = ex + (-dy / dist) * side * 1.65;
+            ty = ey + (dx / dist) * side * 1.65;
+            e.brain = "lich-reposition-cast-lane";
+          }
+        }
+        else if (dist < prefer * 0.70) { tx = ex - dx; ty = ey - dy; }
         else if (dist > Math.min(Number(e.attack_range || 0) * 0.88, prefer * 1.35)) { tx = px; ty = py; }
         else {
           const side = Number(e.flank_dir || 1) < 0 ? -1 : 1;
@@ -3317,14 +3438,27 @@ function twoTickRoom(room, dt) {
         tx = px; ty = py;
       }
     }
-    else if (Number(e.smellT || 0) > 0 && Number.isFinite(e.lastX) && Number.isFinite(e.lastY)) { tx = e.lastX; ty = e.lastY; }
+    else if (Number(e.smellT || 0) > 0 && Number.isFinite(e.lastX) && Number.isFinite(e.lastY)) { tx = e.lastX; ty = e.lastY; e.brain = "investigate"; }
     else {
-      tx = ex + Math.cos(idx * 1.9 + Date.now() * 0.0007) * 1.4;
-      ty = ey + Math.sin(idx * 2.3 + Date.now() * 0.0006) * 1.1;
+      // No idle orbit/jiggle.  If the vampire has no line-of-sight, scent trail,
+      // attack, or regroup objective, it holds position like a predator.
+      e.brain = isCaster ? "lich-command-hold" : "paladin-sentry-hold";
+      e.avoidT = 0;
+      e.avoidBias = 0;
+      e.stuckT = 0;
+      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: false, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot });
+      continue;
+    }
+
+    const targetDist = Math.hypot(tx - ex, ty - ey);
+    if (targetDist <= Math.max(0.075, Number(e.body_radius || TWO_ENEMY_RADIUS) * 0.22)) {
+      e.stuckT = 0;
+      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: false, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot });
+      continue;
     }
 
     let vx = tx - ex, vy = ty - ey;
-    let mag = Math.hypot(vx, vy) || 1;
+    let mag = targetDist || 1;
     vx /= mag; vy /= mag;
 
     let sepX = 0, sepY = 0;
@@ -3341,7 +3475,7 @@ function twoTickRoom(room, dt) {
     let flank = Number(e.flank_bias || 0.5) * (visible ? 1.0 : 1.45) * (wounded && !isCaster ? 1.08 : 1.0);
     // First-person view fix: visible melee enemies should advance straight at the tank,
     // not diagonally strafe while the minimap path reads as direct.
-    if (!isCaster && visible && dist <= Number(v.aggro_range || 8.5)) flank = 0;
+    if (!isCaster && visible && (dist <= Number(v.aggro_range || 8.5) || closeVisible || Number(e.engagedT || 0) > 0)) flank = 0;
     if (isCaster) flank *= 0.90;
     const lx = -vy * fd * flank, ly = vx * fd * flank;
     let mx = vx + lx + sepX * 1.7, my = vy + ly + sepY * 1.7;
@@ -3358,9 +3492,19 @@ function twoTickRoom(room, dt) {
     const step = speed * dtSec;
     let ok = twoSteeredMove(room, e, ex, ey, mx, my, step, tx, ty, room.mission.enemies, v);
     if (!ok) {
+      if (!isCaster && visible && dist > meleeAttackRange + 0.18) {
+        const dxp = (px - ex) / (dist || 1), dyp = (py - ey) / (dist || 1);
+        if (twoMoveEnemy(room, e, ex + dxp * step, ey + dyp * step, [], v)) {
+          e.stuckT = 0;
+          moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: true, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot });
+          continue;
+        }
+      }
       e.stuckT = Number(e.stuckT || 0) + dtSec;
       if (!isCaster && visible && dist <= meleeAttackRange + 0.18 && e.attackT <= 0) {
-        const dmg = twoResolveEnemyDamage(e, v);
+        const atkResult = twoResolveEnemyDamage(e, v);
+        twoCombatLog(room, atkResult.text);
+        const dmg = Number(atkResult.damage || 0);
         if (dmg > 0) { v.hp = clamp(Number(v.hp || 100) - dmg, 0, 100); damaged = true; }
         e.attackT = Number(e.attack_cooldown || 0.45) * (0.82 + Math.random() * 0.34);
         e.lungeT = 0.16;
