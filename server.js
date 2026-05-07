@@ -2307,6 +2307,7 @@ function twoPrepareEnemy(e, rnd) {
   e.attack_damage = Number(tr.attack);
   e.attack_range = Number(tr.range);
   e.prefer_range = Number(tr.prefer_range || 0);
+  e.body_radius = Number(e.body_radius || TWO_ENEMY_RADIUS);
   e.attack_cooldown = Number(tr.cooldown);
   e.flank_bias = Number(tr.flank);
   e.flank_dir = Number(e.flank_dir || ((eid % 2) ? -1 : 1));
@@ -2331,11 +2332,70 @@ function twoPrepareEnemy(e, rnd) {
   e.stuckT = Number(e.stuckT || 0);
   return e;
 }
-function twoMoveEnemy(room, e, nx, ny) {
+const TWO_ENEMY_RADIUS = 0.32;
+const TWO_TANK_RADIUS = 0.48;
+const TWO_ENEMY_TANK_STANDOFF = TWO_ENEMY_RADIUS + TWO_TANK_RADIUS + 0.10;
+const TWO_ENEMY_ENEMY_STANDOFF = TWO_ENEMY_RADIUS * 2.0 + 0.10;
+
+function twoCircleOpen(room, x, y, radius) {
+  const r = Math.max(0, Number(radius || 0));
+  if (twoIsWall(room, x, y)) return false;
+  if (r <= 0.01) return true;
+  const samples = [
+    [ r, 0], [-r, 0], [0,  r], [0, -r],
+    [ r * 0.70,  r * 0.70], [-r * 0.70,  r * 0.70],
+    [ r * 0.70, -r * 0.70], [-r * 0.70, -r * 0.70],
+  ];
+  for (const [ox, oy] of samples) if (twoIsWall(room, x + ox, y + oy)) return false;
+  return true;
+}
+
+function twoVehicleCanStand(room, x, y, oldX = null, oldY = null) {
+  if (!twoCircleOpen(room, x, y, 0.30)) return false;
+  oldX = Number(oldX == null ? x : oldX);
+  oldY = Number(oldY == null ? y : oldY);
+  const enemies = room && room.mission && Array.isArray(room.mission.enemies) ? room.mission.enemies : [];
+  for (const o of enemies) {
+    if (!o || Number(o.hp || 1) <= 0) continue;
+    const ox = Number(o.x || x), oy = Number(o.y || y);
+    const orad = Number(o.body_radius || TWO_ENEMY_RADIUS);
+    const minD = orad + TWO_TANK_RADIUS + 0.08;
+    const oldD = Math.hypot(oldX - ox, oldY - oy);
+    const newD = Math.hypot(x - ox, y - oy);
+    if (newD < minD && newD <= oldD + 0.006) return false;
+  }
+  return true;
+}
+
+function twoEnemyBodyClear(room, e, nx, ny, enemies, vehicle) {
   const ex = Number(e.x || 0), ey = Number(e.y || 0);
-  if (!twoIsWall(room, nx, ny)) { e.x = Math.round(nx * 1000) / 1000; e.y = Math.round(ny * 1000) / 1000; return true; }
-  if (!twoIsWall(room, nx, ey)) { e.x = Math.round(nx * 1000) / 1000; return true; }
-  if (!twoIsWall(room, ex, ny)) { e.y = Math.round(ny * 1000) / 1000; return true; }
+  const radius = Number(e.body_radius || TWO_ENEMY_RADIUS);
+  if (!twoCircleOpen(room, nx, ny, radius)) return false;
+
+  const v = vehicle || room.vehicle || { x: 2.5, y: 2.5 };
+  const px = Number(v.x || 2.5), py = Number(v.y || 2.5);
+  const minTankD = radius + Number(v.body_radius || TWO_TANK_RADIUS) + 0.08;
+  const oldTankD = Math.hypot(ex - px, ey - py);
+  const newTankD = Math.hypot(nx - px, ny - py);
+  if (newTankD < minTankD && newTankD <= oldTankD + 0.006) return false;
+
+  for (const o of (enemies || [])) {
+    if (!o || o === e || Number(o.hp || 1) <= 0) continue;
+    const ox = Number(o.x || ex), oy = Number(o.y || ey);
+    const orad = Number(o.body_radius || TWO_ENEMY_RADIUS);
+    const minD = radius + orad + 0.08;
+    const oldD = Math.hypot(ex - ox, ey - oy);
+    const newD = Math.hypot(nx - ox, ny - oy);
+    if (newD < minD && newD <= oldD + 0.006) return false;
+  }
+  return true;
+}
+
+function twoMoveEnemy(room, e, nx, ny, enemies, vehicle) {
+  const ex = Number(e.x || 0), ey = Number(e.y || 0);
+  if (twoEnemyBodyClear(room, e, nx, ny, enemies, vehicle)) { e.x = Math.round(nx * 1000) / 1000; e.y = Math.round(ny * 1000) / 1000; return true; }
+  if (twoEnemyBodyClear(room, e, nx, ey, enemies, vehicle)) { e.x = Math.round(nx * 1000) / 1000; return true; }
+  if (twoEnemyBodyClear(room, e, ex, ny, enemies, vehicle)) { e.y = Math.round(ny * 1000) / 1000; return true; }
   return false;
 }
 
@@ -2549,11 +2609,19 @@ function twoHandle(ws, payloadStr) {
   if (t === "drive") {
     if (room.roles.driver && room.roles.driver !== meta.id) return;
     const v = (m.v && typeof m.v === "object") ? m.v : {};
+    const wantX = clamp(Number(v.x != null ? v.x : room.vehicle.x), 1.2, (room.mission ? room.mission.mapW - 1.2 : 31));
+    const wantY = clamp(Number(v.y != null ? v.y : room.vehicle.y), 1.2, (room.mission ? room.mission.mapH - 1.2 : 21));
+    const oldX = Number(room.vehicle.x || 2.5), oldY = Number(room.vehicle.y || 2.5);
+    let finalX = oldX, finalY = oldY;
+    if (twoVehicleCanStand(room, wantX, wantY, oldX, oldY)) { finalX = wantX; finalY = wantY; }
+    else if (twoVehicleCanStand(room, wantX, oldY, oldX, oldY)) finalX = wantX;
+    else if (twoVehicleCanStand(room, oldX, wantY, oldX, oldY)) finalY = wantY;
     room.vehicle = {
-      x: clamp(Number(v.x != null ? v.x : room.vehicle.x), 1.2, (room.mission ? room.mission.mapW - 1.2 : 31)),
-      y: clamp(Number(v.y != null ? v.y : room.vehicle.y), 1.2, (room.mission ? room.mission.mapH - 1.2 : 21)),
+      x: finalX,
+      y: finalY,
       a: clamp(Number(v.a != null ? v.a : room.vehicle.a), -999999, 999999),
-      hp: clamp(Number(v.hp != null ? v.hp : room.vehicle.hp), 0, 100)
+      hp: clamp(Number(v.hp != null ? v.hp : room.vehicle.hp), 0, 100),
+      body_radius: TWO_TANK_RADIUS
     };
     twoBroadcast(room, { t: "vehicle", v: room.vehicle, by: meta.id, ts: Date.now() });
     return;
@@ -2568,7 +2636,8 @@ function twoHandle(ws, payloadStr) {
       const e = room.mission.enemies[i];
       const dx = e.x - sx, dy = e.y - sy;
       const d = Math.hypot(dx, dy);
-      if (d < 0.2 || d > 17) continue;
+      // Too-close enemies must not become unshootable if a stale packet overlaps the tank.
+      if (d < 0.025 || d > 17) continue;
       let da = Math.atan2(dy, dx) - a;
       while (da <= -Math.PI) da += Math.PI * 2;
       while (da > Math.PI) da -= Math.PI * 2;
@@ -2618,6 +2687,10 @@ function twoTickRoom(room, dt) {
     const dist = Math.hypot(dx, dy) || 0.001;
     const visible = twoLineClear(room, ex, ey, px, py);
     const isCaster = String(e.archetype || "") === "caster";
+    const bodyRadius = Number(e.body_radius || TWO_ENEMY_RADIUS);
+    const tankRadius = Number(v.body_radius || TWO_TANK_RADIUS);
+    const contactStop = bodyRadius + tankRadius + 0.10;
+    const meleeAttackRange = Math.max(Number(e.attack_range || 0.74), contactStop + 0.16);
     let didCast = false;
 
     if (visible) {
@@ -2649,9 +2722,10 @@ function twoTickRoom(room, dt) {
     }
 
     const aggro = Number(v.aggro_range || 8.5);
-    // Enemy 2 is cooldown-driven, not ammo-driven: never let it stall after spending spell slots.
-    const hasCharge = isCaster ? true : (Number(e.spell_slots || 0) > 0);
-    if (visible && dist <= Number(e.attack_range || 0.74) && hasCharge) {
+    // Both enemy types are cooldown-driven. Brutes never require fake spell slots.
+    const hasCharge = true;
+    const effectiveAttackRange = isCaster ? Number(e.attack_range || 0.74) : meleeAttackRange;
+    if (visible && dist <= effectiveAttackRange && hasCharge) {
       if (e.attackT <= 0) {
         const dmg = twoResolveEnemyDamage(e, v);
         if (dmg > 0) {
@@ -2676,7 +2750,11 @@ function twoTickRoom(room, dt) {
     let tx, ty;
     const aggroMove = Number(v.aggro_range || 8.5);
     if (visible && dist <= aggroMove) {
-      if (isCaster && Number(e.prefer_range || 0) > 0) {
+      if (dist < contactStop) {
+        const awayX = (ex - px) / dist, awayY = (ey - py) / dist;
+        tx = ex + awayX * 1.20; ty = ey + awayY * 1.20;
+      }
+      else if (isCaster && Number(e.prefer_range || 0) > 0) {
         const prefer = Number(e.prefer_range || 0);
         if (dist < prefer * 0.70) { tx = ex - dx; ty = ey - dy; }
         else if (dist > Math.min(Number(e.attack_range || 0) * 0.88, prefer * 1.35)) { tx = px; ty = py; }
@@ -2705,7 +2783,7 @@ function twoTickRoom(room, dt) {
       const o = room.mission.enemies[j];
       const ox = ex - Number(o.x || ex), oy = ey - Number(o.y || ey);
       const od = Math.hypot(ox, oy);
-      if (od > 0.001 && od < 0.82) { sepX += ox / od * (0.82 - od); sepY += oy / od * (0.82 - od); }
+      if (od > 0.001 && od < TWO_ENEMY_ENEMY_STANDOFF) { sepX += ox / od * (TWO_ENEMY_ENEMY_STANDOFF - od); sepY += oy / od * (TWO_ENEMY_ENEMY_STANDOFF - od); }
     }
 
     const fd = Number(e.flank_dir || 1) < 0 ? -1 : 1;
@@ -2734,9 +2812,16 @@ function twoTickRoom(room, dt) {
       [ex + (vx - ly) * step, ey + (vy + lx) * step],
     ];
     let ok = false;
-    for (const c of candidates) { if (twoMoveEnemy(room, e, c[0], c[1])) { ok = true; break; } }
+    for (const c of candidates) { if (twoMoveEnemy(room, e, c[0], c[1], room.mission.enemies, v)) { ok = true; break; } }
     if (!ok) {
       e.stuckT = Number(e.stuckT || 0) + dtSec;
+      if (!isCaster && visible && dist <= meleeAttackRange + 0.18 && e.attackT <= 0) {
+        const dmg = twoResolveEnemyDamage(e, v);
+        if (dmg > 0) { v.hp = clamp(Number(v.hp || 100) - dmg, 0, 100); damaged = true; }
+        e.attackT = Number(e.attack_cooldown || 0.45) * (0.82 + Math.random() * 0.34);
+        e.lungeT = 0.16;
+      }
+      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: false, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max });
       if (e.stuckT > 0.18) { e.flank_dir = -fd; e.stuckT = 0; }
     } else {
       e.stuckT = 0;
