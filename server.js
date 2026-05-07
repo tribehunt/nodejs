@@ -2675,6 +2675,67 @@ function twoTickRoom(room, dt) {
   }
 }
 
+
+// ------------------------------------------------------
+// Shared WebSocket connection router
+// ------------------------------------------------------
+function detachAllProtocols(ws) {
+  try { twoDetach(ws); } catch {}
+  try { growthDetach(ws); } catch {}
+  try { stugDetach(ws, true); } catch {}
+  try { prisonDetach(ws, true); } catch {}
+}
+
+function routeSocketMessage(ws, data) {
+  let raw = "";
+  try {
+    raw = Buffer.isBuffer(data) ? data.toString("utf8") : String(data || "");
+  } catch {
+    raw = "";
+  }
+  if (!raw) return;
+
+  if (raw.startsWith("2:")) { twoHandle(ws, raw.slice(2)); return; }
+  if (raw.startsWith("gf:")) { growthHandle(ws, raw.slice(3)); return; }
+  if (raw.startsWith("s:")) { stugHandle(ws, raw.slice(2)); return; }
+  if (raw.startsWith("p:")) { prisonHandle(ws, raw.slice(2)); return; }
+
+  // Legacy/no-prefix fallback.
+  let m = null;
+  try { m = JSON.parse(raw); } catch { m = null; }
+  if (m && typeof m === "object") {
+    const game = String(m.game || m.proto || m.protocol || m.g || "").toLowerCase();
+    if (game === "two" || game === "2" || game === "hunters") { twoHandle(ws, raw); return; }
+    if (game === "growth" || game === "gf") { growthHandle(ws, raw); return; }
+    if (game === "stug" || game === "s") { stugHandle(ws, raw); return; }
+    if (game === "prison" || game === "ethane" || game === "p") { prisonHandle(ws, raw); return; }
+
+    const t = String(m.t || m.type || "").toLowerCase();
+    if (t === "join" || t === "lobby_state" || t === "role" || t === "mission_request" || t === "launch" || t === "drive" || t === "shot" || t === "ping") {
+      twoHandle(ws, raw);
+      return;
+    }
+  }
+
+  // Plain text fallback.
+  prisonHandle(ws, raw);
+}
+
+wss.on("connection", (ws, req) => {
+  ws.isAlive = true;
+  ws._ip = pickIP(req) || "";
+  ws.on("pong", () => { ws.isAlive = true; });
+  ws.on("ping", () => { ws.isAlive = true; });
+  ws.on("message", (data) => {
+    ws.isAlive = true;
+    try { routeSocketMessage(ws, data); } catch (err) {
+      try { ws.send(JSON.stringify({ type: "error", message: "Relay packet error." })); } catch {}
+    }
+  });
+  ws.on("close", () => { detachAllProtocols(ws); });
+  ws.on("error", () => { detachAllProtocols(ws); });
+});
+
 // -----------------------------
 // [2] Hunters enemy AI tick
 // -----------------------------
