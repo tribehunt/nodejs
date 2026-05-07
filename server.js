@@ -2584,7 +2584,8 @@ function twoSpawnWaveElite(room, level) {
   const pool = cands.slice(0, Math.max(12, Math.min(cands.length, 36)));
   const p = pool[Math.floor(Math.random() * pool.length)];
   let serial = Math.max(500, Number(mission.next_enemy_serial || 500) | 0) + 1;
-  const eliteType = Math.random() < 0.35 ? "lich" : "paladin";
+  const casterAlive = Array.isArray(mission.enemies) && mission.enemies.some(e => e && String(e.archetype || "") === "caster" && Number(e.hp || 0) > 0);
+  const eliteType = casterAlive ? "paladin" : (Math.random() < 0.35 ? "lich" : "paladin");
   let enemyId = eliteType === "lich" ? ((serial % 2 === 0) ? serial : serial + 1) : ((serial % 2 === 1) ? serial : serial + 1);
   const e = twoPrepareEnemy({ id: enemyId, x: Math.round(p.x * 1000) / 1000, y: Math.round(p.y * 1000) / 1000, elite: true, elite_type: eliteType, militia_delay: 0, enemy_level: level, enemy_wave: waveNo }, Math.random);
   mission.next_enemy_serial = enemyId + 1;
@@ -2624,7 +2625,8 @@ function twoSpawnNextWave(room, level) {
   const base = Number(mission.base_wave_size || 7) | 0;
   const lvl = Math.max(1, Math.min(20, Number(level || waves.level_gate || 1) | 0));
   const total = Math.max(5, Math.min(12, base + Math.floor(waveNo / 3) + Math.floor(lvl / 7)));
-  const lichCount = Math.max(1, Math.min(Math.floor(total / 4), total - 2));
+  // Enemy 2 is an officer slot, not common filler: max one caster per wave.
+  const lichCount = total >= 5 ? 1 : 0;
   const lichSlots = new Set();
   while (lichSlots.size < lichCount) lichSlots.add(Math.floor(Math.random() * total));
   let serial = Math.max(100, Number(mission.next_enemy_serial || 100) | 0);
@@ -3047,6 +3049,8 @@ function twoSpawnMission(room, campaignReq = null, level = 1) {
   const enemies = [];
   const count = 7 + Math.floor(rnd() * 5);
   const used = new Set(["2,2"]);
+  const officerSlot = Math.floor(rnd() * Math.max(1, count));
+  let palSerial = 1;
   for (let i = 0; i < count; i++) {
     let p = null;
     for (let tries = 0; tries < 240; tries++) {
@@ -3059,9 +3063,10 @@ function twoSpawnMission(room, campaignReq = null, level = 1) {
       }
     }
     if (!p) p = { x: 2.5 + i * 0.35, y: 7.5, mx: 2 + i, my: 7 };
-    const tr = twoNosferatuTrait(i + 1);
+    const enemyId = (i === officerSlot) ? 2 : (palSerial++ * 2 - 1);
+    const tr = twoNosferatuTrait(enemyId);
     enemies.push(twoPrepareEnemy({
-      id: i + 1,
+      id: enemyId,
       x: Math.round(p.x * 1000) / 1000,
       y: Math.round(p.y * 1000) / 1000,
       enemy_level: level || 1,
@@ -3070,8 +3075,10 @@ function twoSpawnMission(room, campaignReq = null, level = 1) {
       flank_dir: ((i % 2) ? 1 : -1)
     }, rnd));
   }
+  const flashliteWeather = (rnd() < 0.5) ? "NIGHT" : "EVENING";
   room.mission = {
     id: (campaign ? ("CAMPAIGN-" + campaign.stage + "-" + String(seed >>> 0)) : ("NEST-" + String(seed >>> 0))), seed, code,
+    flashlite_weather: flashliteWeather,
     raid_code: raidCode,
     location: campaign ? campaign.location : "Unknown Exclusion Zone",
     campaign: campaign || { enabled: false },
