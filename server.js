@@ -2227,18 +2227,18 @@ function twoNosferatuTrait(eid) {
     return {
       archetype: "brute", kind: "rage-brute", role: "tanky fearless monstrous rage machine",
       stats: { STR: 18, DEX: 11, CON: 18, INT: 6, WIS: 11, CHA: 8 },
-      ac: 14, hp: 34, speed: 1.04, lunge: 2.08,
+      ac: 14, hp: 34, speed: 1.34, lunge: 2.18,
       attack_bonus: 6, damage_dice: [2, 8], damage_bonus: 4,
-      attack: 13, range: 0.62, prefer_range: 0, cooldown: 0.64, flank: 0.38,
+      attack: 13, range: 0.58, prefer_range: 0, cooldown: 0.62, flank: 0.38,
       xp: 200, save_dc: 0, attack_mode: "melee"
     };
   }
   return {
     archetype: "caster", kind: "eldritch-caster", role: "intelligent wary ranged Nosferatu",
     stats: { STR: 9, DEX: 16, CON: 12, INT: 17, WIS: 15, CHA: 14 },
-    ac: 13, hp: 24, speed: 1.12, lunge: 1.40,
+    ac: 13, hp: 24, speed: 0.62, lunge: 0.90,
     attack_bonus: 6, damage_dice: [2, 6], damage_bonus: 3,
-    attack: 10, range: 5.80, prefer_range: 3.65, cooldown: 1.08, flank: 0.88,
+    attack: 10, range: 6.15, prefer_range: 4.10, cooldown: 1.18, flank: 0.72, spell_slots: 3, spell_recharge: 2.75,
     xp: 250, save_dc: 13, attack_mode: "wis_save"
   };
 }
@@ -2289,31 +2289,45 @@ function twoPrepareEnemy(e, rnd) {
   const fresh = !e.dnd5e;
   e.id = eid;
   e.dnd5e = true;
-  e.archetype = String(e.archetype || tr.archetype);
-  e.kind = String(e.kind || tr.kind);
-  e.role = String(e.role || tr.role);
+  // ID owns the rules archetype; do not preserve stale mission/cached packets.
+  e.archetype = String(tr.archetype);
+  e.kind = String(tr.kind);
+  e.role = String(tr.role);
   e.stats = (e.stats && typeof e.stats === "object") ? e.stats : tr.stats;
-  e.ac = Number(e.ac || tr.ac);
+  e.ac = Number(tr.ac);
   e.max_hp = Math.max(Number(e.max_hp || 0) | 0, Number(tr.hp || 20) | 0);
+  const hasHp = Object.prototype.hasOwnProperty.call(e, "hp") && e.hp !== null && e.hp !== undefined;
   const ehp = Number(e.hp || 0) | 0;
-  e.hp = (fresh || ehp <= 6) ? e.max_hp : Math.max(1, Math.min(ehp, e.max_hp));
-  e.speed = Number(e.speed || tr.speed);
-  e.lunge_speed = Number(e.lunge_speed || tr.lunge);
-  e.attack_bonus = Number(e.attack_bonus || tr.attack_bonus);
-  e.damage_dice = Array.isArray(e.damage_dice) ? e.damage_dice : tr.damage_dice;
-  e.damage_bonus = Number(e.damage_bonus || tr.damage_bonus);
-  e.attack_damage = Number(e.attack_damage || tr.attack);
-  e.attack_range = Number(e.attack_range || tr.range);
-  e.prefer_range = Number(e.prefer_range || tr.prefer_range || 0);
-  e.attack_cooldown = Number(e.attack_cooldown || tr.cooldown);
-  e.flank_bias = Number(e.flank_bias || tr.flank);
+  e.hp = (!hasHp || fresh) ? e.max_hp : Math.max(1, Math.min(ehp, e.max_hp));
+  e.speed = Number(tr.speed);
+  e.lunge_speed = Number(tr.lunge);
+  e.attack_bonus = Number(tr.attack_bonus);
+  e.damage_dice = tr.damage_dice;
+  e.damage_bonus = Number(tr.damage_bonus);
+  e.attack_damage = Number(tr.attack);
+  e.attack_range = Number(tr.range);
+  e.prefer_range = Number(tr.prefer_range || 0);
+  e.attack_cooldown = Number(tr.cooldown);
+  e.flank_bias = Number(tr.flank);
   e.flank_dir = Number(e.flank_dir || ((eid % 2) ? -1 : 1));
-  e.xp = Number(e.xp || tr.xp);
-  e.save_dc = Number(e.save_dc || tr.save_dc || 0);
-  e.attack_mode = String(e.attack_mode || tr.attack_mode || "melee");
+  e.xp = Number(tr.xp);
+  e.save_dc = Number(tr.save_dc || 0);
+  e.attack_mode = String(tr.attack_mode || "melee");
+  e.spell_slots_max = Number(tr.spell_slots || 0) | 0;
+  if (String(e.archetype || "") === "caster") {
+    if (e.spell_slots === undefined || e.spell_slots === null) e.spell_slots = e.spell_slots_max;
+    e.spell_slots = Math.max(0, Math.min(Number(e.spell_slots || 0) | 0, e.spell_slots_max));
+    e.spellRechargeT = Number(e.spellRechargeT || e.spell_recharge_t || 0);
+    e.spellRechargeNeed = Number(tr.spell_recharge || 2.75);
+  } else {
+    e.spell_slots = 0;
+    e.spellRechargeT = 0;
+    e.spellRechargeNeed = 0;
+  }
   e.attackT = Number(e.attackT || ((rnd ? rnd() : Math.random()) * 0.34));
   e.smellT = Number(e.smellT || 0);
-  e.lungeT = Number(e.lungeT || 0);
+  e.lungeT = Number(e.lungeT || e.lunge_t || 0);
+  e.castingT = Number(e.castingT || e.casting_t || 0);
   e.stuckT = Number(e.stuckT || 0);
   return e;
 }
@@ -2323,6 +2337,28 @@ function twoMoveEnemy(room, e, nx, ny) {
   if (!twoIsWall(room, nx, ey)) { e.x = Math.round(nx * 1000) / 1000; return true; }
   if (!twoIsWall(room, ex, ny)) { e.y = Math.round(ny * 1000) / 1000; return true; }
   return false;
+}
+
+function twoFindCoverPoint(room, ex, ey, px, py) {
+  const away = Math.atan2(ey - py, ex - px);
+  let best = null;
+  let bestScore = -999999;
+  const radii = [1.1, 1.7, 2.35, 3.0];
+  const offs = [0, 0.45, -0.45, 0.9, -0.9, 1.35, -1.35, Math.PI];
+  for (const radius of radii) {
+    for (const off of offs) {
+      const ang = away + off;
+      const cx = ex + Math.cos(ang) * radius;
+      const cy = ey + Math.sin(ang) * radius;
+      if (twoIsWall(room, cx, cy)) continue;
+      const blocked = !twoLineClear(room, px, py, cx, cy);
+      const distGain = Math.hypot(cx - px, cy - py);
+      const score = (blocked ? 8 : 0) + distGain - Math.abs(off) * 0.45;
+      if (score > bestScore) { bestScore = score; best = { x: cx, y: cy, covered: blocked }; }
+    }
+  }
+  if (best) return best;
+  return { x: ex + Math.cos(away) * 2.0, y: ey + Math.sin(away) * 2.0, covered: false };
 }
 
 function twoCampaignPayload(raw) {
@@ -2557,7 +2593,7 @@ function twoHandle(ws, payloadStr) {
           room.mission = null;
         }
       } else {
-        twoBroadcast(room, { t: "enemy_update", enemies: [{ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode }], ts: Date.now() });
+        twoBroadcast(room, { t: "enemy_update", enemies: [{ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, lunge_t: e.lungeT, casting_t: e.castingT }], ts: Date.now() });
       }
     }
     return;
@@ -2577,23 +2613,45 @@ function twoTickRoom(room, dt) {
   for (let idx = 0; idx < room.mission.enemies.length; idx++) {
     const e = twoPrepareEnemy(room.mission.enemies[idx]);
     const ex = Number(e.x || 0), ey = Number(e.y || 0);
-    const dx = Number(v.x || 2.5) - ex, dy = Number(v.y || 2.5) - ey;
+    const px = Number(v.x || 2.5), py = Number(v.y || 2.5);
+    const dx = px - ex, dy = py - ey;
     const dist = Math.hypot(dx, dy) || 0.001;
-    const visible = twoLineClear(room, ex, ey, Number(v.x || 2.5), Number(v.y || 2.5));
+    const visible = twoLineClear(room, ex, ey, px, py);
+    const isCaster = String(e.archetype || "") === "caster";
+    let didCast = false;
+
     if (visible) {
-      e.lastX = Number(v.x || 2.5);
-      e.lastY = Number(v.y || 2.5);
+      e.lastX = px;
+      e.lastY = py;
       e.smellT = 2.25;
     } else {
       e.smellT = Math.max(0, Number(e.smellT || 0) - dtSec);
     }
     e.attackT = Math.max(0, Number(e.attackT || 0) - dtSec);
     e.lungeT = Math.max(0, Number(e.lungeT || 0) - dtSec);
+    e.castingT = Math.max(0, Number(e.castingT || 0) - dtSec);
+
+    if (isCaster) {
+      const maxSlots = Math.max(1, Number(e.spell_slots_max || 3) | 0);
+      e.spell_slots_max = maxSlots;
+      e.spell_slots = Math.max(0, Math.min(Number(e.spell_slots || 0) | 0, maxSlots));
+      if (e.spell_slots < maxSlots) {
+        e.spellRechargeT = Number(e.spellRechargeT || 0) + dtSec;
+        const need = Math.max(0.75, Number(e.spellRechargeNeed || 2.75));
+        if (e.spellRechargeT >= need) {
+          e.spell_slots = Math.min(maxSlots, e.spell_slots + 1);
+          e.spellRechargeT = 0;
+        }
+      }
+    } else {
+      e.spell_slots = 0;
+      e.spellRechargeT = 0;
+    }
 
     const aggro = Number(v.aggro_range || 8.5);
-    if (visible && dist > aggro) {
-      // High CHA tanks draw farther aggro. Outside the signal radius, monsters prowl.
-    } else if (visible && dist <= Number(e.attack_range || 0.74)) {
+    // Enemy 2 is cooldown-driven, not ammo-driven: never let it stall after spending spell slots.
+    const hasCharge = isCaster ? true : (Number(e.spell_slots || 0) > 0);
+    if (visible && dist <= Number(e.attack_range || 0.74) && hasCharge) {
       if (e.attackT <= 0) {
         const dmg = twoResolveEnemyDamage(e, v);
         if (dmg > 0) {
@@ -2601,19 +2659,34 @@ function twoTickRoom(room, dt) {
           damaged = true;
         }
         e.attackT = Number(e.attack_cooldown || 0.45) * (0.82 + Math.random() * 0.34);
-        e.lungeT = (String(e.archetype || "") === "caster") ? 0.09 : 0.16;
+        if (isCaster) {
+          e.castingT = 0.70;
+          e.lungeT = 0;
+          e.spell_slots = Math.max(1, Number(e.spell_slots_max || e.spell_slots || 1) | 0);
+          e.spellRechargeT = 0;
+          didCast = true;
+        } else {
+          e.lungeT = 0.16;
+        }
       }
-      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, moving: false });
-      continue;
+      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: false, lunge_t: e.lungeT, casting_t: e.castingT, cast: didCast, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max });
+      if (!isCaster || dist >= Math.max(1.0, Number(e.prefer_range || 0) * 0.65)) continue;
     }
 
     let tx, ty;
     const aggroMove = Number(v.aggro_range || 8.5);
     if (visible && dist <= aggroMove) {
-      if (String(e.archetype || "") === "caster" && Number(e.prefer_range || 0) > 0 && dist < Number(e.prefer_range || 0) * 0.86) {
-        tx = ex - dx; ty = ey - dy;
+      if (isCaster && Number(e.prefer_range || 0) > 0) {
+        const prefer = Number(e.prefer_range || 0);
+        if (dist < prefer * 0.70) { tx = ex - dx; ty = ey - dy; }
+        else if (dist > Math.min(Number(e.attack_range || 0) * 0.88, prefer * 1.35)) { tx = px; ty = py; }
+        else {
+          const side = Number(e.flank_dir || 1) < 0 ? -1 : 1;
+          tx = ex + (-dy / dist) * side * 0.95;
+          ty = ey + (dx / dist) * side * 0.95;
+        }
       } else {
-        tx = Number(v.x || 2.5); ty = Number(v.y || 2.5);
+        tx = px; ty = py;
       }
     }
     else if (Number(e.smellT || 0) > 0 && Number.isFinite(e.lastX) && Number.isFinite(e.lastY)) { tx = e.lastX; ty = e.lastY; }
@@ -2637,15 +2710,20 @@ function twoTickRoom(room, dt) {
 
     const fd = Number(e.flank_dir || 1) < 0 ? -1 : 1;
     const wounded = (Number(e.hp || 1) <= Math.max(1, (Number(e.max_hp || 3) | 0) >> 1));
-    let flank = Number(e.flank_bias || 0.5) * (visible ? 1.0 : 1.45) * (wounded ? 1.22 : 1.0);
+    let flank = Number(e.flank_bias || 0.5) * (visible ? 1.0 : 1.45) * (wounded && !isCaster ? 1.08 : 1.0);
+    // First-person view fix: visible melee enemies should advance straight at the tank,
+    // not diagonally strafe while the minimap path reads as direct.
+    if (!isCaster && visible && dist <= Number(v.aggro_range || 8.5)) flank = 0;
+    if (isCaster) flank *= 0.90;
     const lx = -vy * fd * flank, ly = vx * fd * flank;
     let mx = vx + lx + sepX * 1.7, my = vy + ly + sepY * 1.7;
     mag = Math.hypot(mx, my) || 1;
     mx /= mag; my /= mag;
 
     let speed = Number(e.speed || 1.0);
-    if (visible && dist < 5.0) speed *= 1.18;
-    if (wounded) speed *= 1.10;
+    if (!isCaster && visible && dist < 5.0) speed *= 1.16;
+    if (isCaster) speed *= 0.92;
+    if (!isCaster && wounded) speed *= 1.08;
     if (Number(e.lungeT || 0) > 0) speed = Math.max(speed, Number(e.lunge_speed || speed));
     const step = speed * dtSec;
     const candidates = [
@@ -2662,7 +2740,7 @@ function twoTickRoom(room, dt) {
       if (e.stuckT > 0.18) { e.flank_dir = -fd; e.stuckT = 0; }
     } else {
       e.stuckT = 0;
-      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, moving: true });
+      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: true, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max });
     }
   }
   if (moved.length) twoBroadcast(room, { t: "enemy_update", enemies: moved, ts: Date.now() });
@@ -2674,6 +2752,7 @@ function twoTickRoom(room, dt) {
     twoBroadcast(room, { t: "vehicle", v, ts: Date.now() });
   }
 }
+
 
 
 // ------------------------------------------------------
