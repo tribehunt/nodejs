@@ -2221,14 +2221,160 @@ function twoFindOpen(map, rnd, nearX, nearY) {
   }
   return { x: 2.5, y: 2.5, mx: 2, my: 2 };
 }
-function twoSpawnMission(room) {
+function twoNosferatuTrait(eid) {
+  const odd = ((Math.max(1, Number(eid || 1) | 0) % 2) === 1);
+  if (odd) {
+    return {
+      archetype: "brute", kind: "rage-brute", role: "tanky fearless monstrous rage machine",
+      stats: { STR: 18, DEX: 11, CON: 18, INT: 6, WIS: 11, CHA: 8 },
+      ac: 14, hp: 34, speed: 1.04, lunge: 2.08,
+      attack_bonus: 6, damage_dice: [2, 8], damage_bonus: 4,
+      attack: 13, range: 0.62, prefer_range: 0, cooldown: 0.64, flank: 0.38,
+      xp: 200, save_dc: 0, attack_mode: "melee"
+    };
+  }
+  return {
+    archetype: "caster", kind: "eldritch-caster", role: "intelligent wary ranged Nosferatu",
+    stats: { STR: 9, DEX: 16, CON: 12, INT: 17, WIS: 15, CHA: 14 },
+    ac: 13, hp: 24, speed: 1.12, lunge: 1.40,
+    attack_bonus: 6, damage_dice: [2, 6], damage_bonus: 3,
+    attack: 10, range: 5.80, prefer_range: 3.65, cooldown: 1.08, flank: 0.88,
+    xp: 250, save_dc: 13, attack_mode: "wis_save"
+  };
+}
+function twoRollDice(count, sides) {
+  count = Math.max(1, Math.min(20, Number(count || 1) | 0));
+  sides = Math.max(2, Math.min(100, Number(sides || 6) | 0));
+  let total = 0;
+  for (let i = 0; i < count; i++) total += 1 + Math.floor(Math.random() * sides);
+  return total;
+}
+function twoResolveShotDamage(dnd, enemy) {
+  dnd = (dnd && typeof dnd === "object") ? dnd : {};
+  const atk = clamp(Number(dnd.attack_bonus != null ? dnd.attack_bonus : 4), -5, 18);
+  const dice = Array.isArray(dnd.damage_dice) ? dnd.damage_dice : [2, 8];
+  const dc = Math.max(1, Math.min(8, Number(dice[0] || 2) | 0));
+  const ds = Math.max(2, Math.min(20, Number(dice[1] || 8) | 0));
+  const bonus = clamp(Number(dnd.damage_bonus != null ? dnd.damage_bonus : 2), -5, 20);
+  const d20 = 1 + Math.floor(Math.random() * 20);
+  const ac = Number(enemy.ac || 12);
+  const hit = d20 !== 1 && (d20 === 20 || d20 + atk >= ac);
+  const crit = hit && d20 === 20;
+  const damage = hit ? Math.max(1, twoRollDice(dc * (crit ? 2 : 1), ds) + bonus) : 0;
+  return { d20, attack_bonus: atk, ac, hit, crit, damage };
+}
+function twoResolveEnemyDamage(e, v) {
+  const mode = String(e.attack_mode || "melee");
+  if (mode === "wis_save") {
+    const dc = Number(e.save_dc || 13);
+    const bonus = Number(v.wis_save || 0);
+    const d20 = 1 + Math.floor(Math.random() * 20);
+    const saved = d20 !== 1 && (d20 === 20 || d20 + bonus >= dc);
+    const dice = Array.isArray(e.damage_dice) ? e.damage_dice : [2, 6];
+    const raw = twoRollDice(dice[0], dice[1]) + Number(e.damage_bonus || 0);
+    return Math.max(1, saved ? Math.floor(raw / 2) : raw);
+  }
+  const ac = Number(v.ac || 16);
+  const d20 = 1 + Math.floor(Math.random() * 20);
+  const atk = Number(e.attack_bonus || 4);
+  const hit = d20 !== 1 && (d20 === 20 || d20 + atk >= ac);
+  if (!hit) return 0;
+  const dice = Array.isArray(e.damage_dice) ? e.damage_dice : [2, 6];
+  return Math.max(1, twoRollDice(dice[0] * (d20 === 20 ? 2 : 1), dice[1]) + Number(e.damage_bonus || 0));
+}
+function twoPrepareEnemy(e, rnd) {
+  e = (e && typeof e === "object") ? e : {};
+  const eid = Math.max(1, Number(e.id || 1) | 0);
+  const tr = twoNosferatuTrait(eid);
+  const fresh = !e.dnd5e;
+  e.id = eid;
+  e.dnd5e = true;
+  e.archetype = String(e.archetype || tr.archetype);
+  e.kind = String(e.kind || tr.kind);
+  e.role = String(e.role || tr.role);
+  e.stats = (e.stats && typeof e.stats === "object") ? e.stats : tr.stats;
+  e.ac = Number(e.ac || tr.ac);
+  e.max_hp = Math.max(Number(e.max_hp || 0) | 0, Number(tr.hp || 20) | 0);
+  const ehp = Number(e.hp || 0) | 0;
+  e.hp = (fresh || ehp <= 6) ? e.max_hp : Math.max(1, Math.min(ehp, e.max_hp));
+  e.speed = Number(e.speed || tr.speed);
+  e.lunge_speed = Number(e.lunge_speed || tr.lunge);
+  e.attack_bonus = Number(e.attack_bonus || tr.attack_bonus);
+  e.damage_dice = Array.isArray(e.damage_dice) ? e.damage_dice : tr.damage_dice;
+  e.damage_bonus = Number(e.damage_bonus || tr.damage_bonus);
+  e.attack_damage = Number(e.attack_damage || tr.attack);
+  e.attack_range = Number(e.attack_range || tr.range);
+  e.prefer_range = Number(e.prefer_range || tr.prefer_range || 0);
+  e.attack_cooldown = Number(e.attack_cooldown || tr.cooldown);
+  e.flank_bias = Number(e.flank_bias || tr.flank);
+  e.flank_dir = Number(e.flank_dir || ((eid % 2) ? -1 : 1));
+  e.xp = Number(e.xp || tr.xp);
+  e.save_dc = Number(e.save_dc || tr.save_dc || 0);
+  e.attack_mode = String(e.attack_mode || tr.attack_mode || "melee");
+  e.attackT = Number(e.attackT || ((rnd ? rnd() : Math.random()) * 0.34));
+  e.smellT = Number(e.smellT || 0);
+  e.lungeT = Number(e.lungeT || 0);
+  e.stuckT = Number(e.stuckT || 0);
+  return e;
+}
+function twoMoveEnemy(room, e, nx, ny) {
+  const ex = Number(e.x || 0), ey = Number(e.y || 0);
+  if (!twoIsWall(room, nx, ny)) { e.x = Math.round(nx * 1000) / 1000; e.y = Math.round(ny * 1000) / 1000; return true; }
+  if (!twoIsWall(room, nx, ey)) { e.x = Math.round(nx * 1000) / 1000; return true; }
+  if (!twoIsWall(room, ex, ny)) { e.y = Math.round(ny * 1000) / 1000; return true; }
+  return false;
+}
+
+function twoCampaignPayload(raw) {
+  try {
+    if (!raw || typeof raw !== "object" || !raw.enabled) return null;
+    const stage = Math.max(0, Math.min(5, Number(raw.stage || 0) | 0));
+    const location = String(raw.location || raw.city || "Unknown Seed Nest").replace(/\s+/g, " ").trim().slice(0, 80);
+    if (!location) return null;
+    const code = String(raw.code || ("SEED NEST " + String(raw.roman || stage + 1))).replace(/\s+/g, " ").trim().slice(0, 80);
+    return {
+      enabled: true,
+      title: String(raw.title || "SEED NEST CAMPAIGN").slice(0, 64),
+      stage,
+      roman: String(raw.roman || "?").slice(0, 8),
+      code,
+      city: String(raw.city || "").slice(0, 48),
+      region: String(raw.region || "").slice(0, 48),
+      country: String(raw.country || "").slice(0, 48),
+      location,
+      lat: Number.isFinite(Number(raw.lat)) ? Number(raw.lat) : 0,
+      lon: Number.isFinite(Number(raw.lon)) ? Number(raw.lon) : 0,
+      subtitle: String(raw.subtitle || "").slice(0, 180),
+      final: !!raw.final
+    };
+  } catch { return null; }
+}
+
+function twoMissionMatchesCampaign(mission, campaignReq = null) {
+  const campaign = twoCampaignPayload(campaignReq);
+  if (!campaign) return true;
+  if (!mission || typeof mission !== "object") return false;
+  const mc = (mission.campaign && typeof mission.campaign === "object") ? mission.campaign : {};
+  if (!mc.enabled) return false;
+  const mStage = Number(mc.stage != null ? mc.stage : -1) | 0;
+  const cStage = Number(campaign.stage != null ? campaign.stage : -2) | 0;
+  if (mStage !== cStage) return false;
+  const mLoc = String(mission.location || mc.location || "").replace(/\s+/g, " ").trim();
+  const cLoc = String(campaign.location || "").replace(/\s+/g, " ").trim();
+  if (cLoc && mLoc && mLoc !== cLoc) return false;
+  return true;
+}
+
+function twoSpawnMission(room, campaignReq = null) {
   const seed = nowSeed();
   const rnd = twoRnd(seed);
   const w = 32, h = 22;
   const map = twoGenMap(w, h, seed);
   const target = twoFindOpen(map, rnd, 24, 15);
+  const campaign = twoCampaignPayload(campaignReq);
   const codes = ["ASH CHOIR", "BLACK ALTAR", "GLASS COFFIN", "STATIC ORCHARD", "DEAD VOLT", "RED CHAPEL", "NULL BASILICA", "HOLLOW RELAY"];
-  const code = codes[Math.floor(rnd() * codes.length)] + "-" + Math.floor(100 + rnd() * 899);
+  const raidCode = codes[Math.floor(rnd() * codes.length)] + "-" + Math.floor(100 + rnd() * 899);
+  const code = campaign ? campaign.code : raidCode;
   const enemies = [];
   const count = 7 + Math.floor(rnd() * 5);
   const used = new Set(["2,2"]);
@@ -2244,12 +2390,29 @@ function twoSpawnMission(room) {
       }
     }
     if (!p) p = { x: 2.5 + i * 0.35, y: 7.5, mx: 2 + i, my: 7 };
-    enemies.push({ id: i + 1, x: Math.round(p.x * 1000) / 1000, y: Math.round(p.y * 1000) / 1000, hp: 2 + (rnd() < 0.22 ? 1 : 0) });
+    const tr = twoNosferatuTrait(i + 1);
+    const hp = tr.hp + (rnd() < 0.28 ? 1 : 0);
+    enemies.push(twoPrepareEnemy({
+      id: i + 1,
+      x: Math.round(p.x * 1000) / 1000,
+      y: Math.round(p.y * 1000) / 1000,
+      hp, max_hp: hp, kind: tr.kind,
+      speed: tr.speed, lunge_speed: tr.lunge,
+      attack_damage: tr.attack, attack_range: tr.range, attack_cooldown: tr.cooldown,
+      flank_bias: tr.flank, flank_dir: ((i % 2) ? 1 : -1)
+    }, rnd));
   }
   room.mission = {
-    id: "NEST-" + String(seed >>> 0), seed, code,
+    id: (campaign ? ("CAMPAIGN-" + campaign.stage + "-" + String(seed >>> 0)) : ("NEST-" + String(seed >>> 0))), seed, code,
+    raid_code: raidCode,
+    location: campaign ? campaign.location : "Unknown Exclusion Zone",
+    campaign: campaign || { enabled: false },
     mapW: w, mapH: h, map,
-    target: { x: Math.round((rnd() * 900 + 50) * 10) / 10, y: Math.round((rnd() * 900 + 50) * 10) / 10, mx: target.mx, my: target.my },
+    target: {
+      x: campaign ? Math.round(campaign.lon * 1000) / 1000 : Math.round((rnd() * 900 + 50) * 10) / 10,
+      y: campaign ? Math.round(campaign.lat * 1000) / 1000 : Math.round((rnd() * 900 + 50) * 10) / 10,
+      mx: target.mx, my: target.my
+    },
     enemies,
     complete: false
   };
@@ -2282,7 +2445,7 @@ function twoHandle(ws, payloadStr) {
     meta.ws = ws; meta.id = id; meta.name = desired; meta.sprite = clamp(Number(m.sprite || meta.sprite || 1), 1, 4);
     room.clients.set(ws, meta);
     ws._twoId = id;
-    twoSend(ws, { t: "welcome", id, room: room.name, roles: room.roles, role: twoRoleForId(room, id), ts: Date.now() });
+    twoSend(ws, { t: "welcome", id, room: room.name, roles: room.roles, role: twoRoleForId(room, id), ip: ws._ip || "", ts: Date.now() });
     twoSyncLobby(room);
     if (room.mission) twoSend(ws, { t: "mission", mission: room.mission, ts: Date.now() });
     return;
@@ -2331,12 +2494,12 @@ function twoHandle(ws, payloadStr) {
     return;
   }
   if (t === "mission_request") {
-    const mission = room.mission || twoSpawnMission(room);
+    const mission = (room.mission && twoMissionMatchesCampaign(room.mission, m.campaign)) ? room.mission : twoSpawnMission(room, m.campaign);
     twoBroadcast(room, { t: "mission", mission, ts: Date.now() });
     return;
   }
   if (t === "launch") {
-    const mission = room.mission || twoSpawnMission(room);
+    const mission = (room.mission && twoMissionMatchesCampaign(room.mission, m.campaign)) ? room.mission : twoSpawnMission(room, m.campaign);
     twoAutoAssignRolesForLaunch(room, meta.id);
     room.started = true;
     room.vehicle = { x: 2.5, y: 2.5, a: 0, hp: 100 };
@@ -2378,7 +2541,12 @@ function twoHandle(ws, payloadStr) {
     twoBroadcast(room, { t: "shot", by: meta.id, a, ts: Date.now() });
     if (bestIdx >= 0) {
       const e = room.mission.enemies[bestIdx];
-      e.hp = (e.hp | 0) - 1;
+      const shotRoll = twoResolveShotDamage(m.dnd, e);
+      if (!shotRoll.hit) {
+        twoBroadcast(room, { t: "enemy_update", enemies: [{ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, miss: true }], ts: Date.now() });
+        return;
+      }
+      e.hp = (e.hp | 0) - Math.max(1, shotRoll.damage | 0);
       if (e.hp <= 0) {
         const dead = room.mission.enemies.splice(bestIdx, 1)[0];
         twoBroadcast(room, { t: "enemy_remove", id: dead.id, by: meta.id, ts: Date.now() });
@@ -2389,33 +2557,113 @@ function twoHandle(ws, payloadStr) {
           room.mission = null;
         }
       } else {
-        twoBroadcast(room, { t: "enemy_update", enemies: [{ id: e.id, x: e.x, y: e.y, hp: e.hp }], ts: Date.now() });
+        twoBroadcast(room, { t: "enemy_update", enemies: [{ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode }], ts: Date.now() });
       }
     }
     return;
   }
   if (t === "ping") {
-    twoSend(ws, { t: "pong", ts: Date.now() });
+    twoSend(ws, { t: "pong", client_ts: m.client_ts || 0, ip: ws._ip || "", ts: Date.now() });
     return;
   }
 }
 function twoTickRoom(room, dt) {
   if (!room || !room.started || !room.mission || !Array.isArray(room.mission.enemies)) return;
   const v = room.vehicle || { x: 2.5, y: 2.5, hp: 100 };
+  const dtSec = Math.max(0.001, Math.min(0.09, Number(dt || 80) / 1000));
   const moved = [];
   let damaged = false;
-  for (const e of room.mission.enemies) {
-    const dx = v.x - e.x, dy = v.y - e.y;
-    const dist = Math.hypot(dx, dy) || 1;
-    if (dist < 0.68) {
-      v.hp = clamp(Number(v.hp || 100) - 10.5 * (dt / 1000), 0, 100);
-      damaged = true;
+
+  for (let idx = 0; idx < room.mission.enemies.length; idx++) {
+    const e = twoPrepareEnemy(room.mission.enemies[idx]);
+    const ex = Number(e.x || 0), ey = Number(e.y || 0);
+    const dx = Number(v.x || 2.5) - ex, dy = Number(v.y || 2.5) - ey;
+    const dist = Math.hypot(dx, dy) || 0.001;
+    const visible = twoLineClear(room, ex, ey, Number(v.x || 2.5), Number(v.y || 2.5));
+    if (visible) {
+      e.lastX = Number(v.x || 2.5);
+      e.lastY = Number(v.y || 2.5);
+      e.smellT = 2.25;
+    } else {
+      e.smellT = Math.max(0, Number(e.smellT || 0) - dtSec);
+    }
+    e.attackT = Math.max(0, Number(e.attackT || 0) - dtSec);
+    e.lungeT = Math.max(0, Number(e.lungeT || 0) - dtSec);
+
+    const aggro = Number(v.aggro_range || 8.5);
+    if (visible && dist > aggro) {
+      // High CHA tanks draw farther aggro. Outside the signal radius, monsters prowl.
+    } else if (visible && dist <= Number(e.attack_range || 0.74)) {
+      if (e.attackT <= 0) {
+        const dmg = twoResolveEnemyDamage(e, v);
+        if (dmg > 0) {
+          v.hp = clamp(Number(v.hp || 100) - dmg, 0, 100);
+          damaged = true;
+        }
+        e.attackT = Number(e.attack_cooldown || 0.45) * (0.82 + Math.random() * 0.34);
+        e.lungeT = (String(e.archetype || "") === "caster") ? 0.09 : 0.16;
+      }
+      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, moving: false });
       continue;
     }
-    const sp = 0.74 * (dt / 1000);
-    const nx = e.x + dx / dist * sp;
-    const ny = e.y + dy / dist * sp;
-    if (!twoIsWall(room, nx, ny)) { e.x = Math.round(nx * 1000) / 1000; e.y = Math.round(ny * 1000) / 1000; moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp }); }
+
+    let tx, ty;
+    const aggroMove = Number(v.aggro_range || 8.5);
+    if (visible && dist <= aggroMove) {
+      if (String(e.archetype || "") === "caster" && Number(e.prefer_range || 0) > 0 && dist < Number(e.prefer_range || 0) * 0.86) {
+        tx = ex - dx; ty = ey - dy;
+      } else {
+        tx = Number(v.x || 2.5); ty = Number(v.y || 2.5);
+      }
+    }
+    else if (Number(e.smellT || 0) > 0 && Number.isFinite(e.lastX) && Number.isFinite(e.lastY)) { tx = e.lastX; ty = e.lastY; }
+    else {
+      tx = ex + Math.cos(idx * 1.9 + Date.now() * 0.0007) * 1.4;
+      ty = ey + Math.sin(idx * 2.3 + Date.now() * 0.0006) * 1.1;
+    }
+
+    let vx = tx - ex, vy = ty - ey;
+    let mag = Math.hypot(vx, vy) || 1;
+    vx /= mag; vy /= mag;
+
+    let sepX = 0, sepY = 0;
+    for (let j = 0; j < room.mission.enemies.length; j++) {
+      if (j === idx) continue;
+      const o = room.mission.enemies[j];
+      const ox = ex - Number(o.x || ex), oy = ey - Number(o.y || ey);
+      const od = Math.hypot(ox, oy);
+      if (od > 0.001 && od < 0.82) { sepX += ox / od * (0.82 - od); sepY += oy / od * (0.82 - od); }
+    }
+
+    const fd = Number(e.flank_dir || 1) < 0 ? -1 : 1;
+    const wounded = (Number(e.hp || 1) <= Math.max(1, (Number(e.max_hp || 3) | 0) >> 1));
+    let flank = Number(e.flank_bias || 0.5) * (visible ? 1.0 : 1.45) * (wounded ? 1.22 : 1.0);
+    const lx = -vy * fd * flank, ly = vx * fd * flank;
+    let mx = vx + lx + sepX * 1.7, my = vy + ly + sepY * 1.7;
+    mag = Math.hypot(mx, my) || 1;
+    mx /= mag; my /= mag;
+
+    let speed = Number(e.speed || 1.0);
+    if (visible && dist < 5.0) speed *= 1.18;
+    if (wounded) speed *= 1.10;
+    if (Number(e.lungeT || 0) > 0) speed = Math.max(speed, Number(e.lunge_speed || speed));
+    const step = speed * dtSec;
+    const candidates = [
+      [ex + mx * step, ey + my * step],
+      [ex + vx * step, ey + vy * step],
+      [ex + (vx - lx) * step, ey + (vy - ly) * step],
+      [ex + (vx + ly) * step, ey + (vy - lx) * step],
+      [ex + (vx - ly) * step, ey + (vy + lx) * step],
+    ];
+    let ok = false;
+    for (const c of candidates) { if (twoMoveEnemy(room, e, c[0], c[1])) { ok = true; break; } }
+    if (!ok) {
+      e.stuckT = Number(e.stuckT || 0) + dtSec;
+      if (e.stuckT > 0.18) { e.flank_dir = -fd; e.stuckT = 0; }
+    } else {
+      e.stuckT = 0;
+      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, moving: true });
+    }
   }
   if (moved.length) twoBroadcast(room, { t: "enemy_update", enemies: moved, ts: Date.now() });
   if (damaged) twoBroadcast(room, { t: "vehicle", v, ts: Date.now() });
@@ -2426,334 +2674,6 @@ function twoTickRoom(room, dt) {
     twoBroadcast(room, { t: "vehicle", v, ts: Date.now() });
   }
 }
-
-// -----------------------------------------
-// Connection handler (auto-detect protocol)
-// -----------------------------------------
-wss.on("connection", (ws, req) => {
-  ws.isAlive = true;
-  ws.on("pong", () => { ws.isAlive = true; });
-  ws._ip = pickIP(req);
-  ws._proto = null; // "ECF" | "AZHA"
-  ws._ecf_id = null;
-  ws._roomGame = null; // "ECF"|"AZHA"
-  ws._roomName = null;
-  // ECF defaults
-  let ecf_id = rid();
-  let ecf_roomName = "brothers";
-  // AZHA defaults
-  let azha_roomName = "global";
-  let azha_meta = {
-    id: "U" + Math.floor(Math.random() * 1e9).toString(36),
-    name: "",
-    ready: false,
-    state: null
-  };
-  function detachFromCurrentRoom() {
-    if (!ws._roomGame || !ws._roomName) return;
-    if (ws._roomGame === "ECF") {
-      const room = getRoom("ECF", ws._roomName);
-      if (ecf_id && room.clients.get(ecf_id) === ws) room.clients.delete(ecf_id);
-      room.ready.delete(ecf_id);
-      ecfBroadcast(room, { t: "leave", id: ecf_id });
-      deleteRoomIfEmpty(room);
-    } else {
-      const room = getRoom("AZHA", ws._roomName);
-      room.clients.delete(ws);
-      room.started = false;
-      room.seed = 0;
-      room.mapGrid = null;
-      room.mission = { step: 0, phase: "rally", target: { x: 2.5, y: 2.5 }, entities: [], nextId: 1 };
-      azhaSyncLobby(room, ws._roomName);
-      deleteRoomIfEmpty(room);
-    }
-    ws._roomGame = null;
-    ws._roomName = null;
-  }
-  function attachToRoom(game, roomName) {
-    ws._roomGame = game;
-    ws._roomName = roomName;
-    if (game === "ECF") {
-      const room = getRoom("ECF", roomName);
-      if (ws._ip) {
-        for (const [oid, ows] of room.clients) {
-          if (!ows || ows === ws) continue;
-          if (ows._ip && ows._ip === ws._ip) {
-            room.clients.delete(oid);
-            room.ready.delete(oid);
-            try { ows.send(JSON.stringify({ t: "error", code: "dup_ip", message: "Duplicate session from same IP; closing old." })); } catch {}
-            try { ows.close(); } catch {}
-          }
-        }
-      }
-      room.clients.set(ecf_id, ws);
-      if (!room.ready.has(ecf_id)) room.ready.set(ecf_id, false);
-      return room;
-    } else {
-      const room = getRoom("AZHA", roomName);
-      if (ws._ip) {
-        for (const [ows] of room.clients) {
-          if (!ows || ows === ws) continue;
-          if (ows._ip && ows._ip === ws._ip) {
-            room.clients.delete(ows);
-            try { ows.send(JSON.stringify({ type: "error", message: "Duplicate session from same IP; closing old." })); } catch {}
-            try { ows.close(); } catch {}
-          }
-        }
-      }
-      room.clients.set(ws, azha_meta);
-      return room;
-    }
-  }
-  ws.on("message", (buf) => {
-    let raw = "";
-    try { raw = buf.toString("utf8"); } catch { raw = ""; }
-    // ETHANE SEA prison protocol:
-    if (raw && raw.startsWith("p:")) {
-      try { prisonHandle(ws, raw.slice(2)); } catch {}
-      return;
-    }
-    // STUG fleet-autobattle protocol:
-    if (raw && raw.startsWith("s:")) {
-      try { stugHandle(ws, raw.slice(2)); } catch {}
-      return;
-    }
-    // GROWTH Frog-Hole / Croakline protocol:
-    if (raw && raw.startsWith("gf:")) {
-      try { growthHandle(ws, raw.slice(3)); } catch {}
-      return;
-    }
-    // [2] Hunters protocol:
-    if (raw && raw.startsWith("2:")) {
-      try { twoHandle(ws, raw.slice(2)); } catch {}
-      return;
-    }
-let m;
-    try { m = JSON.parse(raw); } catch { return; }
-    if (!m) return;
-    if (!ws._proto) {
-      if (m.t) ws._proto = "ECF";
-      else if (m.type) ws._proto = "AZHA";
-      else return;
-    }
-    // ------------
-    // ECF handling
-    // ------------
-    if (ws._proto === "ECF") {
-      const t = m.t;
-      if (!ws._roomGame) {
-        ws._roomGame = "ECF";
-        ws._roomName = ecf_roomName;
-        ws._ecf_id = ecf_id;
-        const room = attachToRoom("ECF", ecf_roomName);
-        ws.send(JSON.stringify({ t: "welcome", id: ecf_id, room: ecf_roomName }));
-        ws.send(JSON.stringify(ecfRoomState(room)));
-      }
-      const room = getRoom("ECF", ws._roomName);
-      if (room.game !== "ECF") return;
-      if (t === "hello") {
-        const roomName = safeRoomId(m.room || "brothers", "brothers");
-        const oldRoomName = ws._roomName;
-        if (oldRoomName !== roomName) {
-          detachFromCurrentRoom();
-          ecf_roomName = roomName;
-          attachToRoom("ECF", roomName);
-        }
-        ws.send(JSON.stringify({ t: "welcome", id: ecf_id, room: ws._roomName }));
-        ws.send(JSON.stringify(ecfRoomState(getRoom("ECF", ws._roomName))));
-        ecfBroadcast(getRoom("ECF", ws._roomName), { t: "msg", s: `${ecf_id} joined.` }, ecf_id);
-        return;
-      }
-      if (t === "scan") {
-        room.seed = (m.seed != null ? m.seed : room.seed);
-        room.difficulty = (m.difficulty != null ? m.difficulty : room.difficulty);
-        room.missionActive = false;
-        for (const k of room.ready.keys()) room.ready.set(k, false);
-        ecfBroadcast(room, { t: "scan", seed: room.seed, difficulty: room.difficulty });
-        ecfBroadcast(room, ecfRoomState(room));
-        return;
-      }
-      if (t === "ready") {
-        room.ready.set(ecf_id, !!m.ready);
-        ecfBroadcast(room, ecfRoomState(room));
-        const ids = [...room.clients.keys()].sort();
-        if (room.seed != null && !room.missionActive) {
-          if (ws._roomName === "solo") {
-            if (!!room.ready.get(ecf_id)) {
-              room.missionActive = true;
-              ecfBroadcast(room, { t: "start", seed: room.seed, difficulty: room.difficulty, players: [ecf_id] });
-              ecfBroadcast(room, ecfRoomState(room));
-            }
-          } else {
-            if (ids.length >= 2) {
-              const r0 = !!room.ready.get(ids[0]);
-              const r1 = !!room.ready.get(ids[1]);
-              if (r0 && r1) {
-                room.missionActive = true;
-                ecfBroadcast(room, { t: "start", seed: room.seed, difficulty: room.difficulty, players: ids.slice(0, 2) });
-                ecfBroadcast(room, ecfRoomState(room));
-              }
-            }
-          }
-        }
-        return;
-      }
-      if (t === "state") {
-        ecfBroadcast(room, { t: "state", id: ecf_id, x: m.x, y: m.y, a: m.a, hp: m.hp }, ecf_id);
-        return;
-      }
-      if (t === "mission_exit") {
-        ecfBroadcast(room, { t: "mission_exit", id: ecf_id, reason: m.reason, hp: m.hp }, ecf_id);
-        return;
-      }
-      if (t === "shot") {
-        ecfBroadcast(room, { t: "shot", id: ecf_id, x: m.x, y: m.y, vx: m.vx, vy: m.vy, dmg: m.dmg }, ecf_id);
-        return;
-      }
-      if (t === "dmg") {
-        ecfBroadcast(room, { t: "dmg", from: ecf_id, to: m.to, amt: m.amt }, ecf_id);
-        return;
-      }
-      if (t === "obj_use") {
-        ecfBroadcast(room, { t: "obj_use", id: ecf_id, i: m.i, on: !!m.on }, ecf_id);
-        return;
-      }
-      if (t === "enemies") {
-        ecfBroadcast(room, {
-          t: "enemies",
-          id: ecf_id,
-          en: m.en, te: m.te, stl: m.stl, swc: m.swc, ssd: m.ssd,
-          mt: m.mt, obj: m.obj, op: m.op, od: m.od,
-          ex: m.ex, ext: m.ext, exr: m.exr
-        }, ecf_id);
-        return;
-      }
-      if (t === "msg") {
-        const s = ((m.s != null ? m.s : "")).toString().slice(0, 240);
-        if (s.length) ecfBroadcast(room, { t: "msg", s }, ecf_id);
-        return;
-      }
-      return;
-    }
-    // -------------
-    // AZHA handling
-    // -------------
-    if (ws._proto === "AZHA") {
-      const type = m.type;
-      if (!ws._roomGame) {
-        ws._roomGame = "AZHA";
-        ws._roomName = azha_roomName;
-        const room = attachToRoom("AZHA", azha_roomName);
-        azhaSyncLobby(room, ws._roomName);
-      }
-      let room = getRoom("AZHA", ws._roomName);
-      if (room.game !== "AZHA") return;
-      if (type === "join") {
-        const nextRoomId = safeRoomId(m.room || "global", "global");
-        const nextRoom = getRoom("AZHA", nextRoomId);
-        if (nextRoom.clients.size >= 2 && !nextRoom.clients.has(ws)) {
-          try { ws.send(JSON.stringify({ type: "error", message: "Room is full (2 players max)." })); } catch {}
-          return;
-        }
-        detachFromCurrentRoom();
-        azha_roomName = nextRoomId;
-        ws._roomGame = "AZHA";
-        ws._roomName = nextRoomId;
-        room = attachToRoom("AZHA", nextRoomId);
-        azha_meta.id = String(m.id || azha_meta.id).slice(0, 32);
-        let desired = String(m.name || "").replace(/\s+/g, " ").trim().slice(0, 24);
-        const _aEnf = enforceReservedName(ws, desired, azha_meta.name, azha_meta.id, "azha");
-        desired = _aEnf.name;
-        const used = new Set();
-        for (const meta of nextRoom.clients.values()) {
-          if (meta && meta.name) used.add(normNameKey(meta.name));
-        }
-        let finalName = desired;
-        if (finalName && used.has(normNameKey(finalName))) {
-          for (let i = 0; i < 12; i++) {
-            const suf = "-" + Math.random().toString(36).slice(2, 5).toUpperCase();
-            const cut = Math.max(1, 24 - suf.length);
-            const cand = finalName.slice(0, cut) + suf;
-            if (!used.has(normNameKey(cand))) { finalName = cand; break; }
-          }
-        }
-        azha_meta.name = finalName;
-        azha_meta.ready = false;
-        azha_meta.state = null;
-        room.clients.set(ws, azha_meta);
-        azhaSyncLobby(room, nextRoomId);
-        return;
-      }
-      if (type === "ready") {
-        azha_meta.ready = !!m.ready;
-        azhaSyncLobby(room, ws._roomName);
-        azhaMaybeStart(room, ws._roomName);
-        return;
-      }
-      if (type === "mission_request") {
-        azhaEnsureMission(room);
-        return;
-      }
-      if (type === "chat") {
-        const text = String(m.text || "").slice(0, 200).trim();
-        if (!text) return;
-        let as = String(m.as || "").slice(0, 24).trim();
-        if (as && isReservedName(as) && !isSkeletonAuthorized(ws._ip)) {
-          try { ws.send(JSON.stringify({ type: "error", message: `Name "${as}" is reserved.` })); } catch {}
-          as = "";
-        }
-        const from = as ? as : azha_meta.id;
-        const name = as ? as : (azha_meta.name || azha_meta.id);
-        azhaBroadcast(room, { type: "chat", from, name, text, ts: Date.now() });
-        return;
-      }
-      if (!room.started) return;
-      if (type === "state") {
-        if (m.s && Number.isFinite(m.s.x) && Number.isFinite(m.s.y)) {
-          azha_meta.state = { x: Number(m.s.x), y: Number(m.s.y), ang: Number(m.s.ang) };
-          if (m.name != null) azha_meta.name = String(m.name || azha_meta.name || "").slice(0, 24);
-          azha_meta._dirty = true;
-          azhaMaybeAdvanceMission(room);
-        }
-        return;
-      }
-      if (type === "m_hit") {
-        const eid = m.eid | 0;
-        if (!eid) return;
-        const idx = room.mission.entities.findIndex(e => e.id === eid && e.type === "enemy");
-        if (idx === -1) return;
-        const ent = room.mission.entities[idx];
-        ent.hp = (ent.hp | 0) - 1;
-        if (ent.hp <= 0) {
-          room.mission.entities.splice(idx, 1);
-          azhaBroadcast(room, { type: "m_update", op: "remove", eid, by: azha_meta.id });
-        } else {
-          azhaBroadcast(room, { type: "m_update", op: "hp", eid, hp: ent.hp, by: azha_meta.id });
-        }
-        azhaMaybeAdvanceMission(room);
-        return;
-      }
-      if (type === "m_collect") {
-        const eid = m.eid | 0;
-        if (!eid) return;
-        const idx = room.mission.entities.findIndex(e => e.id === eid && e.type === "datnode");
-        if (idx === -1) return;
-        room.mission.entities.splice(idx, 1);
-        azhaBroadcast(room, { type: "m_update", op: "remove", eid, by: azha_meta.id });
-        azhaMaybeAdvanceMission(room);
-        return;
-      }
-      return;
-    }
-  });
-  ws.on("close", () => {
-    try { prisonDetach(ws, true); } catch {}
-    try { stugDetach(ws, true); } catch {}
-    try { growthDetach(ws); } catch {}
-    try { twoDetach(ws); } catch {}
-    detachFromCurrentRoom();
-  });
-});
 
 // -----------------------------
 // [2] Hunters enemy AI tick
