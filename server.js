@@ -2066,6 +2066,39 @@ function twoRoleForId(room, id) {
   if (String(room.roles.shooter || "") === id) return "shooter";
   return null;
 }
+function twoMetaById(room, id) {
+  id = String(id || "");
+  if (!room || !id) return null;
+  for (const meta of room.clients.values()) if (String(meta.id || "") === id) return meta;
+  return null;
+}
+function twoMetaTankAC(meta, fallback = 16) {
+  const d = (meta && meta.dnd5e && typeof meta.dnd5e === "object") ? meta.dnd5e : {};
+  const ac = Number(d.ac != null ? d.ac : d.tank_ac);
+  if (Number.isFinite(ac)) return clamp(Math.round(ac), 10, 25);
+  return clamp(Math.round(Number(fallback || 16)), 10, 25);
+}
+function twoSharedTankAC(room, fallback = 16) {
+  if (!room) return clamp(Math.round(Number(fallback || 16)), 10, 25);
+  twoCleanRoles(room);
+  const driver = twoMetaById(room, room.roles.driver);
+  const shooter = twoMetaById(room, room.roles.shooter);
+  if (driver && shooter && String(driver.id) !== String(shooter.id)) {
+    return clamp(Math.round((twoMetaTankAC(driver, fallback) + twoMetaTankAC(shooter, fallback)) / 2), 10, 25);
+  }
+  const only = driver || shooter || Array.from(room.clients.values())[0] || null;
+  return twoMetaTankAC(only, fallback);
+}
+function twoSharedMissionLevel(room, fallback = 1) {
+  let best = clamp(Number(fallback || 1), 1, 20);
+  if (!room) return best;
+  for (const meta of room.clients.values()) {
+    const d = (meta && meta.dnd5e && typeof meta.dnd5e === "object") ? meta.dnd5e : {};
+    const lvl = Number(d.level || 1);
+    if (Number.isFinite(lvl)) best = Math.max(best, clamp(lvl, 1, 20));
+  }
+  return best;
+}
 function twoSendRoleSync(room) {
   if (!room) return;
   for (const [ws, meta] of room.clients.entries()) {
@@ -2220,6 +2253,111 @@ function twoFindOpen(map, rnd, nearX, nearY) {
     if (map[y] && map[y][x] === "0") return { x: x + 0.5, y: y + 0.5, mx: x, my: y };
   }
   return { x: 2.5, y: 2.5, mx: 2, my: 2 };
+}
+
+function twoWaveDieForLevel(level) {
+  level = Math.max(1, Math.min(20, Number(level || 1) | 0));
+  if (level >= 17) return 12;
+  if (level >= 13) return 10;
+  if (level >= 9) return 8;
+  if (level >= 5) return 6;
+  return 4;
+}
+function twoInitMissionWaves(mission, level) {
+  if (!mission || typeof mission !== "object") return {};
+  if (mission.waves && Number(mission.waves.total || 0) > 0) return mission.waves;
+  const die = twoWaveDieForLevel(level);
+  const total = 1 + Math.floor(Math.random() * die) + 1; // 1dN + 1
+  mission.waves = { total, die, current: 1, spawned: 1, cleared: 0, level_gate: Math.max(1, Math.min(20, Number(level || 1) | 0)) };
+  mission.base_wave_size = Math.max(5, Math.min(10, Array.isArray(mission.enemies) ? mission.enemies.length : 7));
+  mission.next_enemy_serial = Math.max(100, Number(mission.next_enemy_serial || 100) | 0);
+  return mission.waves;
+}
+function twoMissionHasNextWave(mission) {
+  const w = mission && mission.waves;
+  return !!(w && Number(w.current || 1) < Number(w.total || 1));
+}
+function twoGridWalkable(map, x, y) {
+  const gx = Math.floor(Number(x)), gy = Math.floor(Number(y));
+  return !!(map && map[gy] && map[gy][gx] === "0");
+}
+function twoGridNearWall(map, x, y) {
+  const gx = Math.floor(Number(x)), gy = Math.floor(Number(y));
+  const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,1],[1,-1],[-1,-1]];
+  for (const [ox, oy] of dirs) if (!twoGridWalkable(map, gx + ox, gy + oy)) return true;
+  return false;
+}
+function twoWaveSpawnCandidates(room) {
+  const m = room && room.mission;
+  const map = m && Array.isArray(m.map) ? m.map : [];
+  const v = room.vehicle || { x: 2.5, y: 2.5 };
+  const px = Number(v.x || 2.5), py = Number(v.y || 2.5);
+  const h = map.length, w = h ? map[0].length : 0;
+  const out = [];
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      if (!twoGridWalkable(map, x, y)) continue;
+      const cx = x + 0.5, cy = y + 0.5;
+      const d = Math.hypot(cx - px, cy - py);
+      if (d < 8.25 || (x <= 7 && y <= 7)) continue; // never around the player picture/start area
+      const edgeDist = Math.min(x, y, w - 1 - x, h - 1 - y);
+      const outer = edgeDist <= 3;
+      const wallish = twoGridNearWall(map, x, y);
+      if (!outer && !wallish) continue;
+      const visible = twoLineClear(room, px, py, cx, cy);
+      const score = d + (outer ? 7 : 0) + (wallish ? 3.5 : 0) - (visible ? 9 : 0) - edgeDist * 0.2;
+      out.push({ score, x: cx, y: cy, mx: x, my: y });
+    }
+  }
+  out.sort((a, b) => b.score - a.score);
+  return out;
+}
+function twoSpawnNextWave(room, level) {
+  if (!room || !room.mission) return [];
+  const mission = room.mission;
+  const waves = twoInitMissionWaves(mission, level);
+  if (!twoMissionHasNextWave(mission)) return [];
+  waves.cleared = Number(waves.cleared || 0) + 1;
+  waves.current = Number(waves.current || 1) + 1;
+  waves.spawned = Number(waves.spawned || 1) + 1;
+  const cands = twoWaveSpawnCandidates(room);
+  if (!cands.length) return [];
+  const waveNo = Number(waves.current || 1);
+  const base = Number(mission.base_wave_size || 7) | 0;
+  const lvl = Math.max(1, Math.min(20, Number(level || waves.level_gate || 1) | 0));
+  const total = Math.max(5, Math.min(12, base + Math.floor(waveNo / 3) + Math.floor(lvl / 7)));
+  const lichCount = Math.max(1, Math.min(Math.floor(total / 4), total - 2));
+  const lichSlots = new Set();
+  while (lichSlots.size < lichCount) lichSlots.add(Math.floor(Math.random() * total));
+  let serial = Math.max(100, Number(mission.next_enemy_serial || 100) | 0);
+  const pool = cands.slice(0, Math.max(18, Math.min(cands.length, total * 9)));
+  const used = new Set();
+  const enemies = [];
+  for (let i = 0; i < total; i++) {
+    let p = null;
+    for (let tries = 0; tries < 80; tries++) {
+      const cand = pool[Math.floor(Math.random() * pool.length)];
+      const key = `${cand.mx},${cand.my}`;
+      if (used.has(key)) continue;
+      if (enemies.some(e => Math.hypot(cand.x - e.x, cand.y - e.y) < 1.25)) continue;
+      used.add(key);
+      p = cand;
+      break;
+    }
+    if (!p) p = pool[Math.min(i, pool.length - 1)];
+    serial += 1;
+    let enemyId;
+    if (lichSlots.has(i)) {
+      enemyId = (serial % 2 === 0) ? serial : serial + 1;
+    } else {
+      enemyId = (serial % 2 === 1) ? serial : serial + 1;
+    }
+    serial = enemyId;
+    enemies.push(twoPrepareEnemy({ id: enemyId, x: Math.round(p.x * 1000) / 1000, y: Math.round(p.y * 1000) / 1000, militia_delay: 0.65 + Math.random() * 1.2 }, Math.random));
+  }
+  mission.next_enemy_serial = serial + 1;
+  mission.enemies = enemies;
+  return enemies;
 }
 function twoNosferatuTrait(eid) {
   const odd = ((Math.max(1, Number(eid || 1) | 0) % 2) === 1);
@@ -2399,6 +2537,61 @@ function twoMoveEnemy(room, e, nx, ny, enemies, vehicle) {
   return false;
 }
 
+function twoBodyPressureScore(e, nx, ny, enemies, vehicle) {
+  const radius = Number(e.body_radius || TWO_ENEMY_RADIUS);
+  let score = 0;
+  const v = vehicle || { x: 2.5, y: 2.5 };
+  const pd = Math.hypot(nx - Number(v.x || 2.5), ny - Number(v.y || 2.5));
+  const pmin = radius + Number(v.body_radius || TWO_TANK_RADIUS) + 0.12;
+  if (pd < pmin + 0.85) score -= (pmin + 0.85 - pd) * 4.5;
+  for (const o of enemies || []) {
+    if (!o || o === e || Number(o.hp || 1) <= 0) continue;
+    const d = Math.hypot(nx - Number(o.x || nx), ny - Number(o.y || ny));
+    const minD = radius + Number(o.body_radius || TWO_ENEMY_RADIUS) + 0.14;
+    if (d < minD + 0.90) score -= (minD + 0.90 - d) * 5.25;
+  }
+  return score;
+}
+function twoWallForwardClear(room, nx, ny, ux, uy, radius) {
+  const probe = Math.max(0.18, Number(radius || TWO_ENEMY_RADIUS) * 0.92);
+  const side = Math.max(0.12, Number(radius || TWO_ENEMY_RADIUS) * 0.55);
+  const px = nx + ux * probe, py = ny + uy * probe;
+  const sx = -uy * side, sy = ux * side;
+  return !twoIsWall(room, px, py) && !twoIsWall(room, px + sx, py + sy) && !twoIsWall(room, px - sx, py - sy);
+}
+function twoSteeredMove(room, e, ex, ey, mx, my, step, tx, ty, enemies, vehicle) {
+  if (!Number.isFinite(step) || step <= 0.0001) return false;
+  const base = Math.atan2(my, mx);
+  const radius = Number(e.body_radius || TWO_ENEMY_RADIUS);
+  const flank = Number(e.flank_dir || 1) < 0 ? -1 : 1;
+  const oldD = Math.hypot(tx - ex, ty - ey);
+  const sideOrder = Number(e.avoidBias || 0) > 0 ? [1, -1] : (Number(e.avoidBias || 0) < 0 ? [-1, 1] : [flank, -flank]);
+  const offsets = [0];
+  for (const mag of [0.34, 0.68, 1.02, 1.38, 1.72]) for (const side of sideOrder) offsets.push(side * mag);
+  offsets.push(Math.PI);
+  let best = null, bestScore = -999999;
+  for (const scale of [1.0, 0.72, 0.48]) {
+    const ds = step * scale;
+    for (const off of offsets) {
+      const ang = base + off, ux = Math.cos(ang), uy = Math.sin(ang);
+      const nx = ex + ux * ds, ny = ey + uy * ds;
+      if (!twoEnemyBodyClear(room, e, nx, ny, enemies, vehicle)) continue;
+      const wallClear = twoWallForwardClear(room, nx, ny, ux, uy, radius);
+      if (!wallClear && scale > 0.50) continue;
+      const progress = (oldD - Math.hypot(tx - nx, ty - ny)) * 8.0;
+      const pressure = twoBodyPressureScore(e, nx, ny, enemies, vehicle);
+      const score = progress + pressure + (wallClear ? 0.45 : -0.85) - Math.abs(off) * 0.42 - (Math.abs(off) > 2.4 ? 1.2 : 0) + scale * 0.16;
+      if (score > bestScore) { bestScore = score; best = { nx, ny, off }; }
+    }
+  }
+  if (!best) return false;
+  e.x = Math.round(best.nx * 1000) / 1000;
+  e.y = Math.round(best.ny * 1000) / 1000;
+  if (Math.abs(best.off) > 0.30) { e.avoidBias = best.off > 0 ? 1 : -1; e.avoidT = 0.40; }
+  else { e.avoidT = Math.max(0, Number(e.avoidT || 0) - 0.08); if (e.avoidT <= 0) e.avoidBias = 0; }
+  return true;
+}
+
 function twoFindCoverPoint(room, ex, ey, px, py) {
   const away = Math.atan2(ey - py, ex - px);
   let best = null;
@@ -2539,6 +2732,12 @@ function twoHandle(ws, payloadStr) {
     desired = enf.name;
     const meta = room.clients.get(ws) || { ws, id, name: desired, sprite: 1, x: 250, y: 190, dir: "down", moving: false };
     meta.ws = ws; meta.id = id; meta.name = desired; meta.sprite = clamp(Number(m.sprite || meta.sprite || 1), 1, 4);
+    if (m.dnd5e && typeof m.dnd5e === "object") {
+      meta.dnd5e = {
+        level: clamp(Number(m.dnd5e.level || 1), 1, 20),
+        ac: clamp(Math.round(Number(m.dnd5e.ac || m.dnd5e.tank_ac || 16)), 10, 25)
+      };
+    }
     room.clients.set(ws, meta);
     ws._twoId = id;
     twoSend(ws, { t: "welcome", id, room: room.name, roles: room.roles, role: twoRoleForId(room, id), ip: ws._ip || "", ts: Date.now() });
@@ -2567,6 +2766,12 @@ function twoHandle(ws, payloadStr) {
     meta.moving = !!m.moving;
     meta.sprite = clamp(Number(m.sprite || meta.sprite || 1), 1, 4);
     if (m.name != null) meta.name = String(m.name || meta.name || meta.id).replace(/\s+/g, " ").trim().slice(0, 20) || meta.id;
+    if (m.dnd5e && typeof m.dnd5e === "object") {
+      meta.dnd5e = {
+        level: clamp(Number(m.dnd5e.level || (meta.dnd5e && meta.dnd5e.level) || 1), 1, 20),
+        ac: clamp(Math.round(Number(m.dnd5e.ac || m.dnd5e.tank_ac || (meta.dnd5e && meta.dnd5e.ac) || 16)), 10, 25)
+      };
+    }
     twoSyncLobby(room);
     return;
   }
@@ -2596,9 +2801,18 @@ function twoHandle(ws, payloadStr) {
   }
   if (t === "launch") {
     const mission = (room.mission && twoMissionMatchesCampaign(room.mission, m.campaign)) ? room.mission : twoSpawnMission(room, m.campaign);
+    if (m.dnd5e && typeof m.dnd5e === "object") {
+      meta.dnd5e = {
+        level: clamp(Number(m.dnd5e.level || m.level || 1), 1, 20),
+        ac: clamp(Math.round(Number(m.dnd5e.ac || m.dnd5e.tank_ac || 16)), 10, 25)
+      };
+    }
     twoAutoAssignRolesForLaunch(room, meta.id);
+    const partyLevel = twoSharedMissionLevel(room, Number(m.level || 1));
+    twoInitMissionWaves(mission, partyLevel);
+    const sharedAC = twoSharedTankAC(room, 16);
     room.started = true;
-    room.vehicle = { x: 2.5, y: 2.5, a: 0, hp: 100 };
+    room.vehicle = { x: 2.5, y: 2.5, a: 0, hp: 100, ac: sharedAC, tank_ac: sharedAC, shared_tank_ac: true };
     for (const [ows, ometa] of room.clients.entries()) {
       twoSend(ows, { t: "start", mission, vehicle: room.vehicle, roles: room.roles, role: twoRoleForId(room, ometa.id), id: ometa.id, ts: Date.now() });
     }
@@ -2616,11 +2830,15 @@ function twoHandle(ws, payloadStr) {
     if (twoVehicleCanStand(room, wantX, wantY, oldX, oldY)) { finalX = wantX; finalY = wantY; }
     else if (twoVehicleCanStand(room, wantX, oldY, oldX, oldY)) finalX = wantX;
     else if (twoVehicleCanStand(room, oldX, wantY, oldX, oldY)) finalY = wantY;
+    const sharedAC = twoSharedTankAC(room, room.vehicle.ac || 16);
     room.vehicle = {
       x: finalX,
       y: finalY,
       a: clamp(Number(v.a != null ? v.a : room.vehicle.a), -999999, 999999),
       hp: clamp(Number(v.hp != null ? v.hp : room.vehicle.hp), 0, 100),
+      ac: sharedAC,
+      tank_ac: sharedAC,
+      shared_tank_ac: true,
       body_radius: TWO_TANK_RADIUS
     };
     twoBroadcast(room, { t: "vehicle", v: room.vehicle, by: meta.id, ts: Date.now() });
@@ -2656,10 +2874,17 @@ function twoHandle(ws, payloadStr) {
         const dead = room.mission.enemies.splice(bestIdx, 1)[0];
         twoBroadcast(room, { t: "enemy_remove", id: dead.id, by: meta.id, ts: Date.now() });
         if (room.mission.enemies.length === 0) {
-          room.started = false;
-          room.mission.complete = true;
-          twoBroadcast(room, { t: "complete", mission: room.mission, by: meta.id, ts: Date.now() });
-          room.mission = null;
+          const nextWave = twoSpawnNextWave(room, twoSharedMissionLevel(room, Number(m.level || (room.mission.waves && room.mission.waves.level_gate) || 1)));
+          if (nextWave.length) {
+            const wv = room.mission.waves || {};
+            twoBroadcast(room, { t: "chat", from: "COMMAND", name: "COMMAND", text: `Wave ${Number(wv.current || 1)}/${Number(wv.total || 1)} entering from elsewhere on the map.`, ts: Date.now() });
+            twoBroadcast(room, { t: "enemies", enemies: room.mission.enemies, waves: room.mission.waves, ts: Date.now() });
+          } else {
+            room.started = false;
+            room.mission.complete = true;
+            twoBroadcast(room, { t: "complete", mission: room.mission, by: meta.id, ts: Date.now() });
+            room.mission = null;
+          }
         }
       } else {
         twoBroadcast(room, { t: "enemy_update", enemies: [{ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, lunge_t: e.lungeT, casting_t: e.castingT }], ts: Date.now() });
@@ -2675,6 +2900,9 @@ function twoHandle(ws, payloadStr) {
 function twoTickRoom(room, dt) {
   if (!room || !room.started || !room.mission || !Array.isArray(room.mission.enemies)) return;
   const v = room.vehicle || { x: 2.5, y: 2.5, hp: 100 };
+  v.ac = twoSharedTankAC(room, v.ac || 16);
+  v.tank_ac = v.ac;
+  v.shared_tank_ac = true;
   const dtSec = Math.max(0.001, Math.min(0.09, Number(dt || 80) / 1000));
   const moved = [];
   let damaged = false;
@@ -2803,16 +3031,10 @@ function twoTickRoom(room, dt) {
     if (isCaster) speed *= 0.92;
     if (!isCaster && wounded) speed *= 1.08;
     if (Number(e.lungeT || 0) > 0) speed = Math.max(speed, Number(e.lunge_speed || speed));
+    if (Number(e.avoidT || 0) > 0) e.avoidT = Math.max(0, Number(e.avoidT || 0) - dtSec);
+    else e.avoidBias = 0;
     const step = speed * dtSec;
-    const candidates = [
-      [ex + mx * step, ey + my * step],
-      [ex + vx * step, ey + vy * step],
-      [ex + (vx - lx) * step, ey + (vy - ly) * step],
-      [ex + (vx + ly) * step, ey + (vy - lx) * step],
-      [ex + (vx - ly) * step, ey + (vy + lx) * step],
-    ];
-    let ok = false;
-    for (const c of candidates) { if (twoMoveEnemy(room, e, c[0], c[1], room.mission.enemies, v)) { ok = true; break; } }
+    let ok = twoSteeredMove(room, e, ex, ey, mx, my, step, tx, ty, room.mission.enemies, v);
     if (!ok) {
       e.stuckT = Number(e.stuckT || 0) + dtSec;
       if (!isCaster && visible && dist <= meleeAttackRange + 0.18 && e.attackT <= 0) {
@@ -2832,9 +3054,14 @@ function twoTickRoom(room, dt) {
   if (damaged) twoBroadcast(room, { t: "vehicle", v, ts: Date.now() });
   if (v.hp <= 0) {
     room.started = false;
-    v.hp = 100;
-    twoBroadcast(room, { t: "chat", from: "COMMAND", name: "COMMAND", text: "Pod disabled. Emergency recall complete.", ts: Date.now() });
+    v.hp = 0;
+    const failedMission = room.mission;
+    twoBroadcast(room, { t: "chat", from: "COMMAND", name: "COMMAND", text: "Hull at 0%. Mission failed. Emergency recall ordered.", ts: Date.now() });
     twoBroadcast(room, { t: "vehicle", v, ts: Date.now() });
+    twoBroadcast(room, { t: "fail", reason: "HULL_ZERO", mission: failedMission, vehicle: v, ts: Date.now() });
+    room.mission = null;
+    room.vehicle = { x: 2.5, y: 2.5, a: 0, hp: 100, ac: v.ac || 16, tank_ac: v.tank_ac || v.ac || 16, shared_tank_ac: true, body_radius: TWO_TANK_RADIUS };
+    twoSyncLobby(room);
   }
 }
 
