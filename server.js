@@ -1995,7 +1995,7 @@ function growthHandle(ws, payloadStr) {
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// [2] Hunters protocol (2:...)
+// ARMORBOUND protocol (2:...)
 // Small 700x400 co-op vampire-nest game. One room = two hunters, one shared drop-pod vehicle.
 // Clients send:  2:{"t":"join","room":"global","id":"H-XXXX","name":"Hunter","sprite":1}
 //                2:{"t":"chat","text":"..."}
@@ -2033,6 +2033,8 @@ function twoGetRoom(roomName) {
       mission: null,
       started: false,
       vehicle: { x: 2.5, y: 2.5, a: 0, hp: 100 },
+      buffPickups: [],
+      activeBuffs: [],
       seed: nowSeed(),
       lastTick: Date.now()
     });
@@ -2088,6 +2090,83 @@ function twoSharedTankAC(room, fallback = 16) {
   }
   const only = driver || shooter || Array.from(room.clients.values())[0] || null;
   return twoMetaTankAC(only, fallback);
+}
+function twoActiveBuffCount(room, type) {
+  if (!room || !Array.isArray(room.activeBuffs)) return 0;
+  const wave = room.mission && room.mission.waves ? Number(room.mission.waves.current || 1) : 1;
+  return room.activeBuffs.filter(b => Number(b.type || 0) === Number(type) && Number(b.target_wave || wave) === wave).length;
+}
+function twoPruneBuffs(room) {
+  if (!room) return;
+  const wave = room.mission && room.mission.waves ? Number(room.mission.waves.current || 1) : 1;
+  room.activeBuffs = Array.isArray(room.activeBuffs) ? room.activeBuffs.filter(b => Number(b.target_wave || wave) >= wave) : [];
+  room.buffPickups = Array.isArray(room.buffPickups) ? room.buffPickups.slice(-8) : [];
+}
+function twoBuffName(type) {
+  type = Number(type || 1) | 0;
+  if (type === 1) return "Rubius Redline Ampoule";
+  if (type === 2) return "Aegis Psalm Relay";
+  if (type === 3) return "Gravefire Ballistic Sigil";
+  return "Purge Relic";
+}
+function twoSharedTankACBuffed(room, fallback = 16) {
+  const base = twoSharedTankAC(room, fallback);
+  return clamp(base + twoActiveBuffCount(room, 2), 10, 30);
+}
+function twoDropWaveBuff(room, dead) {
+  if (!room || !room.mission || !dead) return null;
+  room.buffPickups = Array.isArray(room.buffPickups) ? room.buffPickups : [];
+  const waves = room.mission.waves || { current: 1, total: 1 };
+  const dropWave = Number(waves.current || 1) | 0;
+  const existing = room.buffPickups.find(b => Number(b.drop_wave || -1) === dropWave);
+  if (existing) return existing;
+  const type = 1 + Math.floor(Math.random() * 3);
+  const buff = {
+    id: Math.floor(100000 + Math.random() * 899999),
+    type,
+    x: Number(dead.x || 2.5),
+    y: Number(dead.y || 2.5),
+    drop_wave: dropWave,
+    target_wave: Math.min(Number(waves.total || 1), Number(waves.current || 1) + 1),
+    pickup_after: Date.now() + 950,
+    force_visible_until: Date.now() + 3000,
+    name: twoBuffName(type)
+  };
+  room.buffPickups.push(buff);
+  room.buffPickups = room.buffPickups.slice(-8);
+  twoBroadcast(room, { t: "buff_drop", buff, ts: Date.now() });
+  twoBroadcast(room, { t: "buff_state", pickups: room.buffPickups, active: room.activeBuffs || [], ts: Date.now() });
+  twoBroadcast(room, { t: "chat", from: "RELIC", name: "RELIC", text: `${buff.name} dropped from the last guard of wave ${dropWave}.`, ts: Date.now() });
+  return buff;
+}
+function twoApplyBuffPickup(room, buff) {
+  if (!room || !buff) return false;
+  room.activeBuffs = Array.isArray(room.activeBuffs) ? room.activeBuffs : [];
+  const type = Number(buff.type || 1) | 0;
+  if (type === 1) {
+    room.vehicle.hp = 100;
+  } else {
+    room.activeBuffs.push({ type, target_wave: Number(buff.target_wave || ((room.mission && room.mission.waves && room.mission.waves.current) || 1)), name: String(buff.name || twoBuffName(type)), started: Date.now() });
+  }
+  const ac = twoSharedTankACBuffed(room, room.vehicle.ac || 16);
+  room.vehicle.ac = ac;
+  room.vehicle.tank_ac = ac;
+  room.vehicle.shared_tank_ac = true;
+  return true;
+}
+function twoCheckBuffPickup(room) {
+  if (!room || !room.vehicle || !Array.isArray(room.buffPickups)) return;
+  const px = Number(room.vehicle.x || 2.5), py = Number(room.vehicle.y || 2.5);
+  const live = [];
+  for (const b of room.buffPickups) {
+    const d = Math.hypot(Number(b.x || px) - px, Number(b.y || py) - py);
+    if (d <= 0.96 && Date.now() >= Number(b.pickup_after || 0)) {
+      twoApplyBuffPickup(room, b);
+      twoBroadcast(room, { t: "buff_pickup", id: b.id, buff: b, vehicle: room.vehicle, active: room.activeBuffs, ts: Date.now() });
+      twoBroadcast(room, { t: "vehicle", v: room.vehicle, ts: Date.now() });
+    } else live.push(b);
+  }
+  room.buffPickups = live.slice(-8);
 }
 function twoSharedMissionLevel(room, fallback = 1) {
   let best = clamp(Number(fallback || 1), 1, 20);
@@ -2208,15 +2287,51 @@ function twoGenMap(w, h, seed) {
       cells[y][x] = (x === 0 || y === 0 || x === w - 1 || y === h - 1) ? "1" : "0";
     }
   }
-  function isBlockedNeighbor(x, y) {
-    return cells[y][x + 1] === "1" || cells[y][x - 1] === "1" || cells[y + 1][x] === "1" || cells[y - 1][x] === "1";
+  const shapes = [
+    [[0,0],[1,0],[0,1]],
+    [[0,0],[-1,0],[1,0],[0,1]],
+    [[0,0],[0,1],[1,1]],
+    [[0,0],[1,0],[2,0]],
+    [[0,0],[0,1],[0,2]],
+    [[0,0],[1,0],[1,1],[2,1]],
+    [[0,0],[-1,0],[0,1],[1,1]],
+  ];
+  for (let i = 0; i < 18; i++) {
+    const shape = shapes[Math.floor(rnd() * shapes.length)];
+    const ox = 3 + Math.floor(rnd() * (w - 6));
+    const oy = 3 + Math.floor(rnd() * (h - 6));
+    if (ox <= 7 && oy <= 7) continue;
+    let ok = true;
+    const pts = [];
+    for (const [dx, dy] of shape) {
+      const x = ox + dx, y = oy + dy;
+      if (x <= 0 || y <= 0 || x >= w - 1 || y >= h - 1 || (x <= 6 && y <= 6)) { ok = false; break; }
+      pts.push([x, y]);
+    }
+    if (!ok) continue;
+    for (const [x, y] of pts) cells[y][x] = "1";
   }
-  for (let i = 0; i < 42; i++) {
-    const x = 2 + Math.floor(rnd() * (w - 4));
-    const y = 2 + Math.floor(rnd() * (h - 4));
-    if (x <= 6 && y <= 6) continue;
-    if (isBlockedNeighbor(x, y)) continue;
-    cells[y][x] = "1";
+  for (let i = 0; i < 18; i++) {
+    const x = 3 + Math.floor(rnd() * (w - 6));
+    const y = 3 + Math.floor(rnd() * (h - 6));
+    if (x <= 7 && y <= 7) continue;
+    const n = (cells[y][x+1] === "1" ? 1 : 0) + (cells[y][x-1] === "1" ? 1 : 0) + (cells[y+1][x] === "1" ? 1 : 0) + (cells[y-1][x] === "1" ? 1 : 0);
+    if (n <= 1) cells[y][x] = "1";
+  }
+  for (let y = 1; y <= 5; y++) for (let x = 1; x <= 5; x++) cells[y][x] = "0";
+  const seen = new Set();
+  const stack = [[2, 2]];
+  while (stack.length) {
+    const [x, y] = stack.pop();
+    const key = `${x},${y}`;
+    if (seen.has(key) || x < 0 || y < 0 || x >= w || y >= h || cells[y][x] === "1") continue;
+    seen.add(key);
+    stack.push([x+1,y],[x-1,y],[x,y+1],[x,y-1]);
+  }
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      if (cells[y][x] === "0" && !seen.has(`${x},${y}`)) cells[y][x] = "1";
+    }
   }
   for (let y = 1; y <= 5; y++) for (let x = 1; x <= 5; x++) cells[y][x] = "0";
   return cells.map(row => row.join(""));
@@ -2312,6 +2427,118 @@ function twoWaveSpawnCandidates(room) {
   out.sort((a, b) => b.score - a.score);
   return out;
 }
+
+const TOXIC_GREEN_HEX = "#75e398";
+function twoMarkEliteTrait(tr, eliteType) {
+  tr = Object.assign({}, tr || {});
+  tr.stats = Object.assign({}, tr.stats || {});
+  eliteType = (String(eliteType) === "lich") ? "lich" : "paladin";
+  tr.elite = true;
+  tr.elite_type = eliteType;
+  tr.crit_immune = true;
+  tr.aggro_immune = true;
+  tr.rally_radius = 3.0;
+  tr.rally_bonus = 0.001;
+  tr.scale = 1.333;
+  tr.hp = Math.max(1, Math.round(Number(tr.hp || 20) * 1.18));
+  tr.ac = Number(tr.ac || 12) + 1;
+  if (eliteType === "lich") {
+    for (const k of ["DEX", "INT", "WIS"]) tr.stats[k] = Number(tr.stats[k] || 10) + 1 + Math.floor(Math.random() * 4);
+    tr.kind = "gem-head-vampire-lich";
+    tr.role = "Gem-head Chaotic Evil vampire lich officer";
+    tr.rank = "gem-head officer";
+    tr.save_dc = Number(tr.save_dc || 14) + 1;
+    tr.spell_slots = Number(tr.spell_slots || 4) + 1;
+    tr.xp = Math.round(Number(tr.xp || 325) * 1.55);
+  } else {
+    for (const k of ["STR", "CON", "CHA"]) tr.stats[k] = Number(tr.stats[k] || 10) + 1 + Math.floor(Math.random() * 6);
+    tr.kind = "gem-head-vampire-paladin";
+    tr.role = "Gem-head Lawful Evil vampire paladin shock elite";
+    tr.rank = "gem-head guard";
+    tr.attack_bonus = Number(tr.attack_bonus || 7) + 1;
+    tr.damage_bonus = Number(tr.damage_bonus || 5) + 2;
+    tr.xp = Math.round(Number(tr.xp || 225) * 1.50);
+  }
+  return tr;
+}
+function twoApplyRally(room) {
+  const enemies = (room && room.mission && Array.isArray(room.mission.enemies)) ? room.mission.enemies : [];
+  for (const e of enemies) { e.rallied = false; e.rally_bonus_active = 0; }
+  const elites = enemies.filter(e => e && e.elite && Number(e.hp || 0) > 0);
+  for (const elite of elites) {
+    const ex = Number(elite.x || 0), ey = Number(elite.y || 0);
+    const radius = Number(elite.rally_radius || 3.0);
+    const bonus = Number(elite.rally_bonus || 0.001);
+    for (const other of enemies) {
+      if (!other || other === elite || Number(other.hp || 0) <= 0) continue;
+      if (Math.hypot(Number(other.x || 0) - ex, Number(other.y || 0) - ey) <= radius) {
+        other.rallied = true;
+        other.rally_bonus_active = Number(other.rally_bonus_active || 0) + bonus;
+      }
+    }
+  }
+}
+function twoAddAcidStack(v) {
+  if (!v) return 0;
+  let stacks = Array.isArray(v.acid_stacks) ? v.acid_stacks.slice(-5) : [];
+  const total = Math.max(0, (1 + Math.floor(Math.random() * 6)) - 1);
+  stacks.push({ total, remaining: 6.0, source: "acid" });
+  v.acid_stacks = stacks.slice(0, 6);
+  return total;
+}
+function twoUpdateAcidStacks(v, dtSec) {
+  if (!v || !Array.isArray(v.acid_stacks) || !v.acid_stacks.length) return 0;
+  let dmg = 0;
+  const live = [];
+  for (const st of v.acid_stacks.slice(0, 6)) {
+    let rem = Number(st.remaining || 0);
+    const total = Number(st.total || 0);
+    if (rem <= 0 || total <= 0) continue;
+    const tick = Math.min(rem, dtSec);
+    dmg += (total / 6.0) * tick;
+    rem -= tick;
+    if (rem > 0) live.push({ total, remaining: rem, source: "acid" });
+  }
+  if (dmg > 0) v.hp = clamp(Number(v.hp || 100) - dmg, 0, 100);
+  v.acid_stacks = live;
+  return dmg;
+}
+function twoSpawnWaveElite(room, level) {
+  if (!room || !room.mission) return null;
+  const mission = room.mission;
+  const waves = mission.waves || { current: 1 };
+  const waveNo = Number(waves.current || 1) | 0;
+  const cands = twoWaveSpawnCandidates(room);
+  if (!cands.length) return null;
+  const pool = cands.slice(0, Math.max(12, Math.min(cands.length, 36)));
+  const p = pool[Math.floor(Math.random() * pool.length)];
+  let serial = Math.max(500, Number(mission.next_enemy_serial || 500) | 0) + 1;
+  const eliteType = Math.random() < 0.35 ? "lich" : "paladin";
+  let enemyId = eliteType === "lich" ? ((serial % 2 === 0) ? serial : serial + 1) : ((serial % 2 === 1) ? serial : serial + 1);
+  const e = twoPrepareEnemy({ id: enemyId, x: Math.round(p.x * 1000) / 1000, y: Math.round(p.y * 1000) / 1000, elite: true, elite_type: eliteType, militia_delay: 0, enemy_level: level, enemy_wave: waveNo }, Math.random);
+  mission.next_enemy_serial = enemyId + 1;
+  return e;
+}
+function twoMaybeSpawnWaveElite(room, level) {
+  if (!room || !room.mission || !Array.isArray(room.mission.enemies)) return null;
+  const mission = room.mission;
+  const waves = mission.waves || { current: 1 };
+  const waveNo = Number(waves.current || 1) | 0;
+  const key = `elite_wave_${waveNo}`;
+  if (mission[`${key}_rolled`] || mission[`${key}_spawned`]) return null;
+  const start = Math.max(1, Number(mission.wave_start_count || mission.base_wave_size || (mission.enemies.length + 1)) | 0);
+  mission.wave_start_count = start;
+  const remaining = mission.enemies.filter(e => e && Number(e.hp || 0) > 0).length;
+  const killed = Math.max(0, start - remaining);
+  if (killed < Math.max(1, Math.ceil(start / 2))) return null;
+  const roll = 1 + Math.floor(Math.random() * 20);
+  mission[`${key}_rolled`] = roll;
+  if (roll < 15) return null;
+  const elite = twoSpawnWaveElite(room, level);
+  if (elite) mission[`${key}_spawned`] = true;
+  return elite;
+}
+
 function twoSpawnNextWave(room, level) {
   if (!room || !room.mission) return [];
   const mission = room.mission;
@@ -2353,31 +2580,36 @@ function twoSpawnNextWave(room, level) {
       enemyId = (serial % 2 === 1) ? serial : serial + 1;
     }
     serial = enemyId;
-    enemies.push(twoPrepareEnemy({ id: enemyId, x: Math.round(p.x * 1000) / 1000, y: Math.round(p.y * 1000) / 1000, militia_delay: 0.65 + Math.random() * 1.2 }, Math.random));
+    enemies.push(twoPrepareEnemy({ id: enemyId, x: Math.round(p.x * 1000) / 1000, y: Math.round(p.y * 1000) / 1000, militia_delay: 0.65 + Math.random() * 1.2, enemy_level: lvl, enemy_wave: waveNo }, Math.random));
   }
   mission.next_enemy_serial = serial + 1;
   mission.enemies = enemies;
+  mission.wave_start_count = enemies.length;
+  delete mission[`elite_wave_${waveNo}_rolled`];
+  delete mission[`elite_wave_${waveNo}_spawned`];
   return enemies;
 }
 function twoNosferatuTrait(eid) {
   const odd = ((Math.max(1, Number(eid || 1) | 0) % 2) === 1);
   if (odd) {
     return {
-      archetype: "brute", kind: "rage-brute", role: "tanky fearless monstrous rage machine",
-      stats: { STR: 18, DEX: 11, CON: 18, INT: 6, WIS: 11, CHA: 8 },
-      ac: 14, hp: 34, speed: 1.34, lunge: 2.18,
-      attack_bonus: 6, damage_dice: [2, 8], damage_bonus: 4,
-      attack: 13, range: 0.58, prefer_range: 0, cooldown: 0.62, flank: 0.38,
-      xp: 200, save_dc: 0, attack_mode: "melee"
+      archetype: "brute", kind: "vampire-paladin-ogre", role: "Lawful Evil ogre-sized vampire paladin shock trooper loyal to the lich officer",
+      class: "Paladin", alignment: "Lawful Evil", size: "Ogre", creature_type: "Undead Vampire Paladin", rank: "guard",
+      stats: { STR: 19, DEX: 11, CON: 18, INT: 9, WIS: 12, CHA: 15 },
+      ac: 16, hp: 42, speed: 1.25, lunge: 2.18,
+      attack_bonus: 7, damage_dice: [2, 8], damage_bonus: 5,
+      attack: 14, range: 0.64, prefer_range: 0, cooldown: 0.64, flank: 0.28,
+      xp: 225, save_dc: 0, attack_mode: "melee"
     };
   }
   return {
-    archetype: "caster", kind: "eldritch-caster", role: "intelligent wary ranged Nosferatu",
-    stats: { STR: 9, DEX: 16, CON: 12, INT: 17, WIS: 15, CHA: 14 },
-    ac: 13, hp: 24, speed: 0.62, lunge: 0.90,
-    attack_bonus: 6, damage_dice: [2, 6], damage_bonus: 3,
-    attack: 10, range: 6.15, prefer_range: 4.10, cooldown: 1.18, flank: 0.72, spell_slots: 3, spell_recharge: 2.75,
-    xp: 250, save_dc: 13, attack_mode: "wis_save"
+    archetype: "caster", kind: "vampire-lich-officer", role: "higher-rank Chaotic Evil orcish vampire lich officer",
+    class: "Lich", alignment: "Chaotic Evil", size: "Orcish", creature_type: "Undead Vampire Lich", rank: "officer",
+    stats: { STR: 10, DEX: 16, CON: 12, INT: 19, WIS: 16, CHA: 17 },
+    ac: 14, hp: 26, speed: 0.72, lunge: 0.90,
+    attack_bonus: 7, damage_dice: [2, 6], damage_bonus: 4,
+    attack: 11, range: 6.45, prefer_range: 4.65, cooldown: 1.25, flank: 0.80, spell_slots: 4, spell_recharge: 3.35,
+    xp: 325, save_dc: 14, attack_mode: "wis_save"
   };
 }
 function twoRollDice(count, sides) {
@@ -2394,11 +2626,13 @@ function twoResolveShotDamage(dnd, enemy) {
   const dc = Math.max(1, Math.min(8, Number(dice[0] || 2) | 0));
   const ds = Math.max(2, Math.min(20, Number(dice[1] || 8) | 0));
   const bonus = clamp(Number(dnd.damage_bonus != null ? dnd.damage_bonus : 2), -5, 20);
-  const d20 = 1 + Math.floor(Math.random() * 20);
+  let d20 = 1 + Math.floor(Math.random() * 20);
+  if (d20 === 20 && (enemy.elite || enemy.crit_immune)) d20 = 1;
   const ac = Number(enemy.ac || 12);
   const hit = d20 !== 1 && (d20 === 20 || d20 + atk >= ac);
   const crit = hit && d20 === 20;
-  const damage = hit ? Math.max(1, twoRollDice(dc * (crit ? 2 : 1), ds) + bonus) : 0;
+  const extraD4 = Math.max(0, Math.min(8, Number(dnd.buff_damage_d4 || 0) | 0));
+  const damage = hit ? Math.max(1, twoRollDice(dc * (crit ? 2 : 1), ds) + bonus + (extraD4 ? twoRollDice(extraD4, 4) : 0)) : 0;
   return { d20, attack_bonus: atk, ac, hit, crit, damage };
 }
 function twoResolveEnemyDamage(e, v) {
@@ -2409,8 +2643,9 @@ function twoResolveEnemyDamage(e, v) {
     const d20 = 1 + Math.floor(Math.random() * 20);
     const saved = d20 !== 1 && (d20 === 20 || d20 + bonus >= dc);
     const dice = Array.isArray(e.damage_dice) ? e.damage_dice : [2, 6];
-    const raw = twoRollDice(dice[0], dice[1]) + Number(e.damage_bonus || 0);
-    return Math.max(1, saved ? Math.floor(raw / 2) : raw);
+    let raw = twoRollDice(dice[0], dice[1]) + Number(e.damage_bonus || 0);
+    raw *= (1.0 + Number(e.rally_bonus_active || 0));
+    return Math.max(1, saved ? Math.floor(raw / 2) : Math.floor(raw));
   }
   const ac = Number(v.ac || 16);
   const d20 = 1 + Math.floor(Math.random() * 20);
@@ -2418,20 +2653,59 @@ function twoResolveEnemyDamage(e, v) {
   const hit = d20 !== 1 && (d20 === 20 || d20 + atk >= ac);
   if (!hit) return 0;
   const dice = Array.isArray(e.damage_dice) ? e.damage_dice : [2, 6];
-  return Math.max(1, twoRollDice(dice[0] * (d20 === 20 ? 2 : 1), dice[1]) + Number(e.damage_bonus || 0));
+  let out = twoRollDice(dice[0] * (d20 === 20 ? 2 : 1), dice[1]) + Number(e.damage_bonus || 0);
+  out *= (1.0 + Number(e.rally_bonus_active || 0));
+  return Math.max(1, Math.floor(out));
 }
+
+function twoScaleTraitForLevel(tr, level, wave) {
+  tr = Object.assign({}, tr || {});
+  tr.stats = Object.assign({}, tr.stats || {});
+  level = Math.max(1, Math.min(20, Number(level || tr.enemy_level || 1) | 0));
+  wave = Math.max(1, Math.min(99, Number(wave || tr.enemy_wave || 1) | 0));
+  const l = level - 1;
+  const w = Math.max(0, wave - 1);
+  const officer = String(tr.archetype || "") === "caster" || String(tr.rank || "") === "officer";
+  let hpMult = 1.0 + 0.135 * l + 0.040 * w;
+  if (officer) hpMult += 0.025 * l;
+  tr.hp = Math.max(1, Math.round(Number(tr.hp || 20) * hpMult));
+  tr.ac = Math.max(8, Math.min(28, Number(tr.ac || 12) + Math.floor(l / 4) + Math.floor(w / 6)));
+  tr.attack_bonus = Number(tr.attack_bonus || 4) + Math.floor(l / 3) + Math.floor(w / 5);
+  tr.damage_bonus = Number(tr.damage_bonus || 0) + Math.floor(l / 2) + Math.floor(w / 3);
+  if (officer) {
+    tr.save_dc = Number(tr.save_dc || 13) + Math.floor(l / 4) + Math.floor(w / 7);
+    tr.spell_slots = Number(tr.spell_slots || 4) + Math.floor(l / 6) + Math.floor(w / 8);
+    tr.spell_recharge = Math.max(1.45, Number(tr.spell_recharge || 3.35) - 0.045 * l - 0.020 * w);
+    tr.speed = Math.min(Number(tr.speed || 0.72) * (1.0 + Math.min(0.18, 0.006 * l)), 1.05);
+  } else {
+    tr.speed = Math.min(Number(tr.speed || 1.25) * (1.0 + Math.min(0.22, 0.007 * l)), 1.70);
+    tr.lunge = Math.min(Number(tr.lunge || 2.18) * (1.0 + Math.min(0.18, 0.006 * l)), 2.85);
+  }
+  tr.attack = tr.damage_bonus + (Array.isArray(tr.damage_dice) ? tr.damage_dice[0] * ((tr.damage_dice[1] + 1) / 2) : Number(tr.attack || 10));
+  tr.xp = Math.round(Number(tr.xp || 100) * (1.0 + 0.055 * l + 0.018 * w));
+  tr.enemy_level = level;
+  tr.enemy_wave = wave;
+  return tr;
+}
+
 function twoPrepareEnemy(e, rnd) {
   e = (e && typeof e === "object") ? e : {};
   const eid = Math.max(1, Number(e.id || 1) | 0);
-  const tr = twoNosferatuTrait(eid);
+  let tr = twoNosferatuTrait(eid);
+  const eLevel = Math.max(1, Math.min(20, Number(e.enemy_level || e.level || 1) | 0));
+  const eWave = Math.max(1, Math.min(99, Number(e.enemy_wave || e.wave || 1) | 0));
+  tr = twoScaleTraitForLevel(tr, eLevel, eWave);
+  if (e.elite) tr = twoMarkEliteTrait(tr, e.elite_type || (String(tr.archetype) === "caster" ? "lich" : "paladin"));
   const fresh = !e.dnd5e;
   e.id = eid;
   e.dnd5e = true;
+  e.enemy_level = Number(tr.enemy_level || eLevel || 1) | 0;
+  e.enemy_wave = Number(tr.enemy_wave || eWave || 1) | 0;
   // ID owns the rules archetype; do not preserve stale mission/cached packets.
   e.archetype = String(tr.archetype);
   e.kind = String(tr.kind);
   e.role = String(tr.role);
-  e.stats = (e.stats && typeof e.stats === "object") ? e.stats : tr.stats;
+  e.stats = e.elite ? tr.stats : ((e.stats && typeof e.stats === "object") ? e.stats : tr.stats);
   e.ac = Number(tr.ac);
   e.max_hp = Math.max(Number(e.max_hp || 0) | 0, Number(tr.hp || 20) | 0);
   const hasHp = Object.prototype.hasOwnProperty.call(e, "hp") && e.hp !== null && e.hp !== undefined;
@@ -2446,6 +2720,13 @@ function twoPrepareEnemy(e, rnd) {
   e.attack_range = Number(tr.range);
   e.prefer_range = Number(tr.prefer_range || 0);
   e.body_radius = Number(e.body_radius || TWO_ENEMY_RADIUS);
+  if (tr.elite) {
+    e.elite = true; e.elite_type = String(tr.elite_type || (String(e.archetype) === "caster" ? "lich" : "paladin"));
+    e.crit_immune = true; e.aggro_immune = true; e.scale = 1.333;
+    e.rally_radius = 3.0; e.rally_bonus = 0.001;
+    e.body_radius = TWO_ENEMY_RADIUS * 1.333;
+    if (String(e.archetype) === "caster") e.acid_dot = true;
+  }
   e.attack_cooldown = Number(tr.cooldown);
   e.flank_bias = Number(tr.flank);
   e.flank_dir = Number(e.flank_dir || ((eid % 2) ? -1 : 1));
@@ -2654,7 +2935,7 @@ function twoMissionMatchesCampaign(mission, campaignReq = null) {
   return true;
 }
 
-function twoSpawnMission(room, campaignReq = null) {
+function twoSpawnMission(room, campaignReq = null, level = 1) {
   const seed = nowSeed();
   const rnd = twoRnd(seed);
   const w = 32, h = 22;
@@ -2680,15 +2961,14 @@ function twoSpawnMission(room, campaignReq = null) {
     }
     if (!p) p = { x: 2.5 + i * 0.35, y: 7.5, mx: 2 + i, my: 7 };
     const tr = twoNosferatuTrait(i + 1);
-    const hp = tr.hp + (rnd() < 0.28 ? 1 : 0);
     enemies.push(twoPrepareEnemy({
       id: i + 1,
       x: Math.round(p.x * 1000) / 1000,
       y: Math.round(p.y * 1000) / 1000,
-      hp, max_hp: hp, kind: tr.kind,
-      speed: tr.speed, lunge_speed: tr.lunge,
-      attack_damage: tr.attack, attack_range: tr.range, attack_cooldown: tr.cooldown,
-      flank_bias: tr.flank, flank_dir: ((i % 2) ? 1 : -1)
+      enemy_level: level || 1,
+      enemy_wave: 1,
+      kind: tr.kind,
+      flank_dir: ((i % 2) ? 1 : -1)
     }, rnd));
   }
   room.mission = {
@@ -2696,6 +2976,7 @@ function twoSpawnMission(room, campaignReq = null) {
     raid_code: raidCode,
     location: campaign ? campaign.location : "Unknown Exclusion Zone",
     campaign: campaign || { enabled: false },
+    objective: campaign ? "Armorbound drop: sever the blood node, recover the fragment, and survive the nest." : "Dark-zone cleanup: eradicate Nosferatu activity.",
     mapW: w, mapH: h, map,
     target: {
       x: campaign ? Math.round(campaign.lon * 1000) / 1000 : Math.round((rnd() * 900 + 50) * 10) / 10,
@@ -2706,6 +2987,8 @@ function twoSpawnMission(room, campaignReq = null) {
     complete: false
   };
   room.vehicle = { x: 2.5, y: 2.5, a: 0, hp: 100 };
+  room.buffPickups = [];
+  room.activeBuffs = [];
   room.started = false;
   return room.mission;
 }
@@ -2795,12 +3078,14 @@ function twoHandle(ws, payloadStr) {
     return;
   }
   if (t === "mission_request") {
-    const mission = (room.mission && twoMissionMatchesCampaign(room.mission, m.campaign)) ? room.mission : twoSpawnMission(room, m.campaign);
+    const partyLevelForSpawn = twoSharedMissionLevel(room, Number(m.level || 1));
+    const mission = (room.mission && twoMissionMatchesCampaign(room.mission, m.campaign)) ? room.mission : twoSpawnMission(room, m.campaign, partyLevelForSpawn);
     twoBroadcast(room, { t: "mission", mission, ts: Date.now() });
     return;
   }
   if (t === "launch") {
-    const mission = (room.mission && twoMissionMatchesCampaign(room.mission, m.campaign)) ? room.mission : twoSpawnMission(room, m.campaign);
+    const partyLevelForSpawn = twoSharedMissionLevel(room, Number(m.level || 1));
+    const mission = (room.mission && twoMissionMatchesCampaign(room.mission, m.campaign)) ? room.mission : twoSpawnMission(room, m.campaign, partyLevelForSpawn);
     if (m.dnd5e && typeof m.dnd5e === "object") {
       meta.dnd5e = {
         level: clamp(Number(m.dnd5e.level || m.level || 1), 1, 20),
@@ -2810,7 +3095,10 @@ function twoHandle(ws, payloadStr) {
     twoAutoAssignRolesForLaunch(room, meta.id);
     const partyLevel = twoSharedMissionLevel(room, Number(m.level || 1));
     twoInitMissionWaves(mission, partyLevel);
-    const sharedAC = twoSharedTankAC(room, 16);
+    if (Array.isArray(mission.enemies)) mission.wave_start_count = mission.enemies.length;
+    room.buffPickups = [];
+    room.activeBuffs = [];
+    const sharedAC = twoSharedTankACBuffed(room, 16);
     room.started = true;
     room.vehicle = { x: 2.5, y: 2.5, a: 0, hp: 100, ac: sharedAC, tank_ac: sharedAC, shared_tank_ac: true };
     for (const [ows, ometa] of room.clients.entries()) {
@@ -2830,7 +3118,8 @@ function twoHandle(ws, payloadStr) {
     if (twoVehicleCanStand(room, wantX, wantY, oldX, oldY)) { finalX = wantX; finalY = wantY; }
     else if (twoVehicleCanStand(room, wantX, oldY, oldX, oldY)) finalX = wantX;
     else if (twoVehicleCanStand(room, oldX, wantY, oldX, oldY)) finalY = wantY;
-    const sharedAC = twoSharedTankAC(room, room.vehicle.ac || 16);
+    twoPruneBuffs(room);
+    const sharedAC = twoSharedTankACBuffed(room, room.vehicle.ac || 16);
     room.vehicle = {
       x: finalX,
       y: finalY,
@@ -2841,7 +3130,19 @@ function twoHandle(ws, payloadStr) {
       shared_tank_ac: true,
       body_radius: TWO_TANK_RADIUS
     };
+    twoCheckBuffPickup(room);
     twoBroadcast(room, { t: "vehicle", v: room.vehicle, by: meta.id, ts: Date.now() });
+    return;
+  }
+  if (t === "buff_pickup") {
+    const bid = Number(m.id || 0) | 0;
+    const b = (room.buffPickups || []).find(x => Number(x.id || 0) === bid);
+    if (b && Date.now() >= Number(b.pickup_after || 0)) {
+      room.buffPickups = (room.buffPickups || []).filter(x => Number(x.id || 0) !== bid);
+      twoApplyBuffPickup(room, b);
+      twoBroadcast(room, { t: "buff_pickup", id: b.id, buff: b, vehicle: room.vehicle, active: room.activeBuffs, ts: Date.now() });
+      twoBroadcast(room, { t: "vehicle", v: room.vehicle, ts: Date.now() });
+    }
     return;
   }
   if (t === "shot") {
@@ -2864,7 +3165,8 @@ function twoHandle(ws, payloadStr) {
     twoBroadcast(room, { t: "shot", by: meta.id, a, ts: Date.now() });
     if (bestIdx >= 0) {
       const e = room.mission.enemies[bestIdx];
-      const shotRoll = twoResolveShotDamage(m.dnd, e);
+      const shotDnd = Object.assign({}, (m.dnd && typeof m.dnd === "object") ? m.dnd : {}, { buff_damage_d4: twoActiveBuffCount(room, 3) });
+      const shotRoll = twoResolveShotDamage(shotDnd, e);
       if (!shotRoll.hit) {
         twoBroadcast(room, { t: "enemy_update", enemies: [{ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, miss: true }], ts: Date.now() });
         return;
@@ -2873,21 +3175,31 @@ function twoHandle(ws, payloadStr) {
       if (e.hp <= 0) {
         const dead = room.mission.enemies.splice(bestIdx, 1)[0];
         twoBroadcast(room, { t: "enemy_remove", id: dead.id, by: meta.id, ts: Date.now() });
+        const elite = twoMaybeSpawnWaveElite(room, twoSharedMissionLevel(room, Number(m.level || (room.mission.waves && room.mission.waves.level_gate) || 1)));
+        if (elite) {
+          room.mission.enemies.push(elite);
+          twoBroadcast(room, { t: "chat", from: "COMMAND", name: "COMMAND", text: "Gem-head elite rally signature entering the nest.", ts: Date.now() });
+          twoBroadcast(room, { t: "enemies", enemies: room.mission.enemies, waves: room.mission.waves, ts: Date.now() });
+        }
         if (room.mission.enemies.length === 0) {
+          if (twoMissionHasNextWave(room.mission)) twoDropWaveBuff(room, dead);
           const nextWave = twoSpawnNextWave(room, twoSharedMissionLevel(room, Number(m.level || (room.mission.waves && room.mission.waves.level_gate) || 1)));
           if (nextWave.length) {
             const wv = room.mission.waves || {};
             twoBroadcast(room, { t: "chat", from: "COMMAND", name: "COMMAND", text: `Wave ${Number(wv.current || 1)}/${Number(wv.total || 1)} entering from elsewhere on the map.`, ts: Date.now() });
             twoBroadcast(room, { t: "enemies", enemies: room.mission.enemies, waves: room.mission.waves, ts: Date.now() });
+            twoBroadcast(room, { t: "buff_state", pickups: room.buffPickups || [], active: room.activeBuffs || [], ts: Date.now() });
           } else {
             room.started = false;
             room.mission.complete = true;
             twoBroadcast(room, { t: "complete", mission: room.mission, by: meta.id, ts: Date.now() });
             room.mission = null;
+            room.buffPickups = [];
+            room.activeBuffs = [];
           }
         }
       } else {
-        twoBroadcast(room, { t: "enemy_update", enemies: [{ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, lunge_t: e.lungeT, casting_t: e.castingT }], ts: Date.now() });
+        twoBroadcast(room, { t: "enemy_update", enemies: [{ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, lunge_t: e.lungeT, casting_t: e.castingT, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot }], ts: Date.now() });
       }
     }
     return;
@@ -2900,12 +3212,17 @@ function twoHandle(ws, payloadStr) {
 function twoTickRoom(room, dt) {
   if (!room || !room.started || !room.mission || !Array.isArray(room.mission.enemies)) return;
   const v = room.vehicle || { x: 2.5, y: 2.5, hp: 100 };
-  v.ac = twoSharedTankAC(room, v.ac || 16);
+  const dtSec = Math.max(0.001, Math.min(0.09, Number(dt || 80) / 1000));
+  twoPruneBuffs(room);
+  const regen = twoActiveBuffCount(room, 2);
+  if (regen > 0) v.hp = clamp(Number(v.hp || 100) + 0.1 * regen * dtSec, 0, 100);
+  const acidDamage = twoUpdateAcidStacks(v, dtSec);
+  twoApplyRally(room);
+  v.ac = twoSharedTankACBuffed(room, v.ac || 16);
   v.tank_ac = v.ac;
   v.shared_tank_ac = true;
-  const dtSec = Math.max(0.001, Math.min(0.09, Number(dt || 80) / 1000));
   const moved = [];
-  let damaged = false;
+  let damaged = acidDamage > 0;
 
   for (let idx = 0; idx < room.mission.enemies.length; idx++) {
     const e = twoPrepareEnemy(room.mission.enemies[idx]);
@@ -2955,7 +3272,12 @@ function twoTickRoom(room, dt) {
     const effectiveAttackRange = isCaster ? Number(e.attack_range || 0.74) : meleeAttackRange;
     if (visible && dist <= effectiveAttackRange && hasCharge) {
       if (e.attackT <= 0) {
-        const dmg = twoResolveEnemyDamage(e, v);
+        let dmg = twoResolveEnemyDamage(e, v);
+        if (e.elite && isCaster) {
+          twoAddAcidStack(v);
+          dmg = 0;
+          damaged = true;
+        }
         if (dmg > 0) {
           v.hp = clamp(Number(v.hp || 100) - dmg, 0, 100);
           damaged = true;
@@ -2971,7 +3293,7 @@ function twoTickRoom(room, dt) {
           e.lungeT = 0.16;
         }
       }
-      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: false, lunge_t: e.lungeT, casting_t: e.castingT, cast: didCast, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max });
+      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: false, lunge_t: e.lungeT, casting_t: e.castingT, cast: didCast, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot });
       if (!isCaster || dist >= Math.max(1.0, Number(e.prefer_range || 0) * 0.65)) continue;
     }
 
@@ -3043,11 +3365,11 @@ function twoTickRoom(room, dt) {
         e.attackT = Number(e.attack_cooldown || 0.45) * (0.82 + Math.random() * 0.34);
         e.lungeT = 0.16;
       }
-      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: false, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max });
+      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: false, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot });
       if (e.stuckT > 0.18) { e.flank_dir = -fd; e.stuckT = 0; }
     } else {
       e.stuckT = 0;
-      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: true, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max });
+      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: true, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot });
     }
   }
   if (moved.length) twoBroadcast(room, { t: "enemy_update", enemies: moved, ts: Date.now() });
@@ -3060,6 +3382,8 @@ function twoTickRoom(room, dt) {
     twoBroadcast(room, { t: "vehicle", v, ts: Date.now() });
     twoBroadcast(room, { t: "fail", reason: "HULL_ZERO", mission: failedMission, vehicle: v, ts: Date.now() });
     room.mission = null;
+    room.buffPickups = [];
+    room.activeBuffs = [];
     room.vehicle = { x: 2.5, y: 2.5, a: 0, hp: 100, ac: v.ac || 16, tank_ac: v.tank_ac || v.ac || 16, shared_tank_ac: true, body_radius: TWO_TANK_RADIUS };
     twoSyncLobby(room);
   }
@@ -3128,7 +3452,7 @@ wss.on("connection", (ws, req) => {
 });
 
 // -----------------------------
-// [2] Hunters enemy AI tick
+// ARMORBOUND enemy AI tick
 // -----------------------------
 const TWO_TICK_MS = 80;
 setInterval(() => {
