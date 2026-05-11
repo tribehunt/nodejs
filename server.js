@@ -2032,9 +2032,12 @@ function twoGetRoom(roomName) {
       roles: { driver: null, shooter: null },
       mission: null,
       started: false,
-      vehicle: { x: 2.5, y: 2.5, a: 0, hp: 100 },
+      vehicle: { x: 2.5, y: 2.5, a: 0, hp: 100, max_hp: 100 },
+      mainGarage: null,
+      mainGarageOwnerId: null,
       buffPickups: [],
       activeBuffs: [],
+      nesting: null,
       seed: nowSeed(),
       lastTick: Date.now()
     });
@@ -2055,7 +2058,8 @@ function twoUsers(room) {
       y: meta.y,
       dir: meta.dir,
       moving: !!meta.moving,
-      role
+      role,
+      garage: meta.garage || (meta.dnd5e && meta.dnd5e.garage) || null
     });
   }
   out.sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id)));
@@ -2074,19 +2078,110 @@ function twoMetaById(room, id) {
   for (const meta of room.clients.values()) if (String(meta.id || "") === id) return meta;
   return null;
 }
+function twoCleanGaragePayload(raw) {
+  try {
+    if (!raw || typeof raw !== "object") return null;
+    const effIn = (raw.effects && typeof raw.effects === "object") ? raw.effects : {};
+    const allowed = ["max_hull", "ac", "drive", "turn", "regen", "salvage_gain", "salvage_flat", "crit", "wis_save", "cannon_attack", "cannon_damage", "dice_bonus", "aggro", "pickup_radius"];
+    const effects = {};
+    for (const k of allowed) {
+      const v = Number(effIn[k] || 0);
+      if (Number.isFinite(v) && Math.abs(v) > 0.000001) effects[k] = v;
+    }
+    const nodeCount = Math.max(0, Math.min(256, Number(raw.node_count != null ? raw.node_count : raw.install_count) | 0));
+    const installCount = Math.max(nodeCount, Math.max(0, Math.min(256, Number(raw.install_count || nodeCount) | 0)));
+    const spentLifetime = Math.max(0, Math.min(999999, Number(raw.spent_lifetime || 0) | 0));
+    const maxHull = Math.max(50, Math.min(280, Math.round(Number(raw.max_hull || (100 + Number(effects.max_hull || 0))) || 100)));
+    return {
+      owner_id: String(raw.owner_id || "").slice(0, 64),
+      owner_name: String(raw.owner_name || "Hunter").replace(/\s+/g, " ").trim().slice(0, 20) || "Hunter",
+      node_count: nodeCount,
+      install_count: installCount,
+      spent_lifetime: spentLifetime,
+      max_hull: maxHull,
+      effects
+    };
+  } catch (_) { return null; }
+}
+function twoStoreDndPayload(meta, payload, fallbackLevel = 1) {
+  if (!meta) return;
+  const d = (payload && typeof payload === "object") ? payload : {};
+  const cleanGarage = twoCleanGaragePayload(d.garage);
+  const cleanStats = {};
+  const rawStats = (d.stats && typeof d.stats === "object") ? d.stats : {};
+  for (const k of ["STR", "DEX", "CON", "INT", "WIS", "CHA"]) {
+    const v = Math.max(1, Math.min(99, Math.round(Number(rawStats[k] || 10))));
+    cleanStats[k] = Number.isFinite(v) ? v : 10;
+  }
+  meta.dnd5e = {
+    level: clamp(Number(d.level || fallbackLevel || 1), 1, 20),
+    ac: clamp(Math.round(Number(d.ac || d.tank_ac || (meta.dnd5e && meta.dnd5e.ac) || 16)), 10, 35),
+    stats: cleanStats
+  };
+  if (cleanGarage) {
+    cleanGarage.owner_id = cleanGarage.owner_id || String(meta.id || "").slice(0, 64);
+    cleanGarage.owner_name = cleanGarage.owner_name || String(meta.name || "Hunter").slice(0, 20);
+    meta.garage = cleanGarage;
+    meta.dnd5e.garage = cleanGarage;
+  } else if (meta.garage) {
+    meta.dnd5e.garage = meta.garage;
+  }
+}
+function twoMetaGarage(meta) {
+  if (!meta) return null;
+  return twoCleanGaragePayload(meta.garage || (meta.dnd5e && meta.dnd5e.garage));
+}
+function twoSelectedGarageMeta(room) {
+  if (!room) return null;
+  twoCleanRoles(room);
+  const ids = [];
+  if (room.roles.driver) ids.push(String(room.roles.driver));
+  if (room.roles.shooter && String(room.roles.shooter) !== String(room.roles.driver || "")) ids.push(String(room.roles.shooter));
+  for (const meta of room.clients.values()) if (ids.indexOf(String(meta.id || "")) < 0) ids.push(String(meta.id || ""));
+  let best = null;
+  let bestScore = -1;
+  for (const id of ids) {
+    const meta = twoMetaById(room, id);
+    const g = twoMetaGarage(meta);
+    if (!meta || !g) continue;
+    const d = (meta.dnd5e && typeof meta.dnd5e === "object") ? meta.dnd5e : {};
+    const score = Number(g.node_count || 0) * 100000 + Number(g.install_count || 0) * 1000 + Number(g.spent_lifetime || 0) + Number(d.level || 1) * 0.01;
+    if (score > bestScore) {
+      bestScore = score;
+      best = { meta, garage: Object.assign({}, g, { owner_id: String(meta.id || g.owner_id || ""), owner_name: String(meta.name || g.owner_name || "Hunter").slice(0, 20) }) };
+    }
+  }
+  return best;
+}
+function twoSharedGarage(room) {
+  const sel = twoSelectedGarageMeta(room);
+  return sel ? sel.garage : null;
+}
+function twoSharedTankMaxHull(room, fallback = 100) {
+  const g = (room && room.mainGarage) ? room.mainGarage : twoSharedGarage(room);
+  if (g && Number.isFinite(Number(g.max_hull))) return Math.max(50, Math.min(280, Math.round(Number(g.max_hull))));
+  return Math.max(50, Math.min(280, Math.round(Number(fallback || 100))));
+}
 function twoMetaTankAC(meta, fallback = 16) {
   const d = (meta && meta.dnd5e && typeof meta.dnd5e === "object") ? meta.dnd5e : {};
   const ac = Number(d.ac != null ? d.ac : d.tank_ac);
-  if (Number.isFinite(ac)) return clamp(Math.round(ac), 10, 25);
-  return clamp(Math.round(Number(fallback || 16)), 10, 25);
+  if (Number.isFinite(ac)) return clamp(Math.round(ac), 10, 35);
+  return clamp(Math.round(Number(fallback || 16)), 10, 35);
 }
 function twoSharedTankAC(room, fallback = 16) {
-  if (!room) return clamp(Math.round(Number(fallback || 16)), 10, 25);
+  if (!room) return clamp(Math.round(Number(fallback || 16)), 10, 35);
   twoCleanRoles(room);
+  const mainId = String(room.mainGarageOwnerId || "");
+  if (mainId) {
+    const mainMeta = twoMetaById(room, mainId);
+    if (mainMeta) return clamp(Math.round(twoMetaTankAC(mainMeta, fallback)), 10, 35);
+  }
+  const selected = twoSelectedGarageMeta(room);
+  if (selected && selected.meta) return clamp(Math.round(twoMetaTankAC(selected.meta, fallback)), 10, 35);
   const driver = twoMetaById(room, room.roles.driver);
   const shooter = twoMetaById(room, room.roles.shooter);
   if (driver && shooter && String(driver.id) !== String(shooter.id)) {
-    return clamp(Math.round((twoMetaTankAC(driver, fallback) + twoMetaTankAC(shooter, fallback)) / 2), 10, 25);
+    return clamp(Math.round((twoMetaTankAC(driver, fallback) + twoMetaTankAC(shooter, fallback)) / 2), 10, 35);
   }
   const only = driver || shooter || Array.from(room.clients.values())[0] || null;
   return twoMetaTankAC(only, fallback);
@@ -2111,7 +2206,7 @@ function twoBuffName(type) {
 }
 function twoSharedTankACBuffed(room, fallback = 16) {
   const base = twoSharedTankAC(room, fallback);
-  return clamp(base + twoActiveBuffCount(room, 2), 10, 30);
+  return clamp(base + twoActiveBuffCount(room, 2), 10, 35);
 }
 function twoDropWaveBuff(room, dead) {
   if (!room || !room.mission || !dead) return null;
@@ -2144,9 +2239,17 @@ function twoApplyBuffPickup(room, buff) {
   room.activeBuffs = Array.isArray(room.activeBuffs) ? room.activeBuffs : [];
   const type = Number(buff.type || 1) | 0;
   if (type === 1) {
-    room.vehicle.hp = 100;
+    room.vehicle.hp = Number(room.vehicle.max_hp || twoSharedTankMaxHull(room, 100) || 100);
   } else {
     room.activeBuffs.push({ type, target_wave: Number(buff.target_wave || ((room.mission && room.mission.waves && room.mission.waves.current) || 1)), name: String(buff.name || twoBuffName(type)), started: Date.now() });
+    if (type === 3) {
+      const cap = Number(room.vehicle.max_hp || twoSharedTankMaxHull(room, 100) || 100);
+      const roll = 1 + Math.floor(Math.random() * 20);
+      const gain = roll + cap * 0.02;
+      room.vehicle.hp = clamp(Number(room.vehicle.hp || cap) + gain, 0, cap);
+      buff.hull_roll = roll;
+      buff.hull_gain = gain;
+    }
   }
   const ac = twoSharedTankACBuffed(room, room.vehicle.ac || 16);
   room.vehicle.ac = ac;
@@ -2177,6 +2280,79 @@ function twoSharedMissionLevel(room, fallback = 1) {
     if (Number.isFinite(lvl)) best = Math.max(best, clamp(lvl, 1, 20));
   }
   return best;
+}
+
+function twoKinguStatsFromParty(room) {
+  const keys = ["STR", "DEX", "CON", "INT", "WIS", "CHA"];
+  const blocks = [];
+  if (room) {
+    twoCleanRoles(room);
+    const ids = [];
+    if (room.roles.driver) ids.push(String(room.roles.driver));
+    if (room.roles.shooter && String(room.roles.shooter) !== String(room.roles.driver || "")) ids.push(String(room.roles.shooter));
+    if (!ids.length) for (const meta of room.clients.values()) ids.push(String(meta.id || ""));
+    for (const id of ids) {
+      const meta = twoMetaById(room, id);
+      const st = meta && meta.dnd5e && meta.dnd5e.stats && typeof meta.dnd5e.stats === "object" ? meta.dnd5e.stats : null;
+      if (st) blocks.push(st);
+    }
+  }
+  if (!blocks.length) blocks.push({ STR: 10, DEX: 10, CON: 10, INT: 10, WIS: 10, CHA: 10 });
+  const out = {};
+  for (const k of keys) out[k] = Math.round((blocks.reduce((a, b) => a + Number(b[k] || 10), 0) / blocks.length) * 3);
+  return out;
+}
+function twoApplyKinguBalance(e, stats) {
+  if (!e) return e;
+  stats = stats && typeof stats === "object" ? stats : twoKinguStatsFromParty(null);
+  e.kingu = true;
+  e.elite = true;
+  e.elite_type = "kingu";
+  e.id = Number(e.id || 9002) | 0;
+  if (e.id % 2) e.id += 1;
+  e.kind = "Kingu"; e.name = "Kingu"; e.role = "Prime-sire Kingu, original blood-line breach"; e.rank = "prime-sire"; e.class = "Kingu";
+  e.archetype = "caster"; e.attack_mode = "wis_save"; e.stats = Object.assign({}, stats);
+  const con = Number(stats.CON || 30), str = Number(stats.STR || 30), dex = Number(stats.DEX || 30), intel = Number(stats.INT || 30), wis = Number(stats.WIS || 30), cha = Number(stats.CHA || 30);
+  e.max_hp = Math.max(Number(e.max_hp || 0) | 0, 90 + con * 5 + str * 2);
+  e.hp = Math.max(Number(e.hp || 0) | 0, e.max_hp);
+  e.ac = Math.max(Number(e.ac || 0) | 0, Math.min(35, 15 + Math.max(0, Math.floor((dex - 10) / 6))));
+  e.save_dc = Math.max(Number(e.save_dc || 0) | 0, Math.min(35, 8 + Math.max(0, Math.floor((wis - 10) / 3)) + Math.max(0, Math.floor((cha - 10) / 4))));
+  e.attack_bonus = Math.max(Number(e.attack_bonus || 0) | 0, Math.min(30, 6 + Math.max(0, Math.floor((intel - 10) / 4)) + Math.max(0, Math.floor((dex - 10) / 6))));
+  e.damage_dice = [4, 10];
+  e.damage_bonus = Math.max(Number(e.damage_bonus || 0) | 0, 8 + Math.max(0, Math.floor((intel - 10) / 5)) + Math.max(0, Math.floor((cha - 10) / 6)));
+  e.attack_range = Math.max(Number(e.attack_range || 0), 7.25); e.prefer_range = Math.max(Number(e.prefer_range || 0), 5.10);
+  e.spell_slots_max = Math.max(Number(e.spell_slots_max || 0) | 0, 7); e.spell_slots = Math.max(Number(e.spell_slots || 0) | 0, e.spell_slots_max);
+  e.rally_radius = 5.0; e.rally_bonus = 0.0025; e.scale = 1.55; e.body_radius = TWO_ENEMY_RADIUS * 1.55; e.crit_immune = true; e.aggro_immune = true; e.acid_dot = true;
+  e.xp = 0;
+  return e;
+}
+
+function twoMissionIsKinguStage(mission) {
+  const c = mission && mission.campaign && typeof mission.campaign === "object" ? mission.campaign : {};
+  return !!(c && (Number(c.stage || -1) === 5 || c.final));
+}
+function twoEnsureKinguForMission(room) {
+  if (!room || !room.mission || !twoMissionIsKinguStage(room.mission)) return false;
+  const mission = room.mission;
+  mission.enemies = Array.isArray(mission.enemies) ? mission.enemies : [];
+  const ks = twoKinguStatsFromParty(room);
+  let found = false;
+  for (const e of mission.enemies) {
+    if (e && (e.kingu || String(e.elite_type || "").toLowerCase() === "kingu")) {
+      twoApplyKinguBalance(e, ks);
+      found = true;
+    }
+  }
+  if (!found) {
+    const rnd = twoRnd(Number(mission.seed || nowSeed()) ^ 0x6b1f);
+    const target = mission.target || {};
+    const p = twoFindOpen(mission.map || [["0"]], rnd, Number(target.mx || target.x || 24), Number(target.my || target.y || 15));
+    const rawKingu = { id: 9002, x: Math.round(Number(p.x || 24.5) * 1000) / 1000, y: Math.round(Number(p.y || 15.5) * 1000) / 1000, elite: true, elite_type: "kingu", kingu: true, kingu_stats: ks, militia_delay: 0, enemy_level: twoSharedMissionLevel(room, 20), enemy_wave: 1 };
+    mission.enemies.push(twoApplyKinguBalance(twoPrepareEnemy(rawKingu, rnd), ks));
+    mission.kingu_spawned = true;
+    found = true;
+  }
+  return found;
 }
 function twoSendRoleSync(room) {
   if (!room) return;
@@ -2378,6 +2554,1295 @@ function twoLineClear(room, x0, y0, x1, y1) {
   }
   return true;
 }
+
+const TWO_NEST_DELAY_SEC = 12.0;
+const TWO_NEST_BUILD_INTERVAL_SEC = 0.72;
+const TWO_NEST_RADIUS = 3;
+const TWO_NEST_BUILDER_COUNT = 3;
+const TWO_NEST_BUILD_RANGE = 1.55;
+const TWO_NEST_RALLY_RADIUS = 1.85;
+
+function twoMapCell(map, x, y, fallback = "1") {
+  try {
+    x = Math.floor(Number(x)); y = Math.floor(Number(y));
+    if (!map || y < 0 || y >= map.length || x < 0 || x >= String(map[y] || "").length) return fallback;
+    return String(map[y] || "").charAt(x) || fallback;
+  } catch { return fallback; }
+}
+function twoSetMapCell(map, x, y, ch) {
+  try {
+    x = Math.floor(Number(x)); y = Math.floor(Number(y)); ch = String(ch || "0").charAt(0);
+    if (!map || y < 0 || y >= map.length) return false;
+    const row = String(map[y] || "");
+    if (x < 0 || x >= row.length || row.charAt(x) === ch) return false;
+    map[y] = row.slice(0, x) + ch + row.slice(x + 1);
+    return true;
+  } catch { return false; }
+}
+function twoReachableCells(map, sx = 2, sy = 2) {
+  const h = map ? map.length : 0, w = h ? String(map[0] || "").length : 0;
+  sx = Math.max(1, Math.min(w - 2, Math.floor(Number(sx || 2))));
+  sy = Math.max(1, Math.min(h - 2, Math.floor(Number(sy || 2))));
+  if (twoMapCell(map, sx, sy) === "1") { sx = 2; sy = 2; }
+  const seen = new Set();
+  const stack = [[sx, sy]];
+  while (stack.length) {
+    const [x, y] = stack.pop();
+    const key = x + "," + y;
+    if (seen.has(key) || x < 0 || y < 0 || x >= w || y >= h || twoMapCell(map, x, y) === "1") continue;
+    seen.add(key);
+    stack.push([x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]);
+  }
+  return seen;
+}
+function twoSharedInfectedTree(mission) {
+  try {
+    if (mission && mission.infected_tree && typeof mission.infected_tree === "object") return mission.infected_tree;
+    const map = mission && Array.isArray(mission.map) ? mission.map : [];
+    const h = map.length, w = h ? String(map[0] || "").length : 0;
+    if (w < 5 || h < 5) return null;
+    const rnd = twoRnd((Number(mission.seed || 1) ^ 0xB1A6A7E) >>> 0);
+    const candidates = [], fallback = [];
+    for (let yy = 1; yy < h - 1; yy++) {
+      for (let xx = 1; xx < w - 1; xx++) {
+        if (twoMapCell(map, xx, yy) === "1" || (xx < 3 && yy < 3)) continue;
+        let nearWalls = 0, open = 0;
+        for (let oy = -2; oy <= 2; oy++) {
+          for (let ox = -2; ox <= 2; ox++) {
+            if (ox * ox + oy * oy > 8) continue;
+            const c = twoMapCell(map, xx + ox, yy + oy);
+            if (c === "1") nearWalls++; else open++;
+          }
+        }
+        if (open >= 5) fallback.push({ x: xx, y: yy, nearWalls });
+        if (nearWalls >= 3 && open >= 5) {
+          const copies = Math.max(1, Math.min(5, nearWalls));
+          for (let n = 0; n < copies; n++) candidates.push({ x: xx, y: yy, nearWalls });
+        }
+      }
+    }
+    const pool = candidates.length ? candidates : fallback;
+    if (!pool.length) return null;
+    const pick = pool[Math.floor(rnd() * pool.length)] || pool[0];
+    const tree = {
+      kind: "tree", tree_class: "large", infected: true, shared: true,
+      x: Number((pick.x + 0.22 + rnd() * 0.56).toFixed(3)),
+      y: Number((pick.y + 0.22 + rnd() * 0.56).toFixed(3)),
+      size: Number((1.48 + rnd() * 0.24).toFixed(3)),
+      trunk_radius: 0.48, rot: Number((-0.26 + rnd() * 0.52).toFixed(3)),
+      seed: Math.floor(1 + rnd() * 999999)
+    };
+    mission.infected_tree = tree;
+    return tree;
+  } catch { return null; }
+}
+function twoChooseNestEntrance(map, cx, cy, radius, px, py) {
+  const h = map ? map.length : 0, w = h ? String(map[0] || "").length : 0;
+  const choices = [
+    { x: cx, y: cy - radius, side: "north", outside: [cx, cy - radius - 1], inside: [cx, cy - radius + 1] },
+    { x: cx, y: cy + radius, side: "south", outside: [cx, cy + radius + 1], inside: [cx, cy + radius - 1] },
+    { x: cx - radius, y: cy, side: "west", outside: [cx - radius - 1, cy], inside: [cx - radius + 1, cy] },
+    { x: cx + radius, y: cy, side: "east", outside: [cx + radius + 1, cy], inside: [cx + radius - 1, cy] },
+  ];
+  const seen = twoReachableCells(map, px, py);
+  let best = null, bestScore = -999999;
+  for (const c of choices) {
+    if (c.x <= 0 || c.y <= 0 || c.x >= w - 1 || c.y >= h - 1) continue;
+    const [ox, oy] = c.outside;
+    const [ix, iy] = c.inside;
+    let score = 0;
+    if (seen.has(ox + "," + oy)) score += 500;
+    if (twoMapCell(map, ox, oy) !== "1") score += 90;
+    if (twoMapCell(map, ix, iy) !== "1") score += 40;
+    score -= Math.hypot((ox + 0.5) - Number(px || 2.5), (oy + 0.5) - Number(py || 2.5));
+    if (score > bestScore) { bestScore = score; best = c; }
+  }
+  return best || choices[0];
+}
+
+function twoNestEntranceUnit(state) {
+  try {
+    const side = String((state && state.entrance && state.entrance.side) || "north").toLowerCase();
+    if (side === "south") return { x: 0, y: 1 };
+    if (side === "west") return { x: -1, y: 0 };
+    if (side === "east") return { x: 1, y: 0 };
+  } catch {}
+  return { x: 0, y: -1 };
+}
+function twoNestTreeInfo(state) {
+  try {
+    const a = (state && state.anchor) || {};
+    const t = (state && state.tree) || {};
+    return {
+      x: Number(t.x ?? a.x ?? a.cell_x ?? 0),
+      y: Number(t.y ?? a.y ?? a.cell_y ?? 0),
+      r: Math.max(0.36, Number(t.trunk_radius ?? 0.48) || 0.48)
+    };
+  } catch { return { x: 0, y: 0, r: 0.48 }; }
+}
+function twoPushPointOffNestTree(state, px, py, extra = 0.88) {
+  const t = twoNestTreeInfo(state);
+  px = Number(px); py = Number(py);
+  let vx = px - t.x, vy = py - t.y;
+  let d = Math.hypot(vx, vy);
+  const clear = Math.max(0.96, t.r + Number(extra || 0.88));
+  if (d >= clear) return { x: px, y: py };
+  if (d <= 0.001) { const u = twoNestEntranceUnit(state); vx = u.x; vy = u.y; d = 1; }
+  return { x: t.x + (vx / d) * clear, y: t.y + (vy / d) * clear };
+}
+function twoSegmentNearNestTree(state, ax, ay, bx, by, extra = 0.82) {
+  try {
+    const t = twoNestTreeInfo(state);
+    ax = Number(ax); ay = Number(ay); bx = Number(bx); by = Number(by);
+    const vx = bx - ax, vy = by - ay;
+    const den = vx * vx + vy * vy;
+    if (den <= 0.0001) return Math.hypot(ax - t.x, ay - t.y) < t.r + extra;
+    const q = Math.max(0, Math.min(1, ((t.x - ax) * vx + (t.y - ay) * vy) / den));
+    const cx = ax + vx * q, cy = ay + vy * q;
+    return Math.hypot(cx - t.x, cy - t.y) < t.r + extra;
+  } catch { return false; }
+}
+function twoNestTreeBypassPoint(room, state, ex, ey, tx, ty) {
+  try {
+    if (!twoSegmentNearNestTree(state, ex, ey, tx, ty)) return null;
+    const map = room && room.mission && Array.isArray(room.mission.map) ? room.mission.map : [];
+    const t = twoNestTreeInfo(state);
+    const u = twoNestEntranceUnit(state);
+    const p1 = { x: u.y, y: -u.x }, p2 = { x: -u.y, y: u.x };
+    const sideDist = Math.max(1.18, t.r + 1.05);
+    const candidates = [];
+    for (const p of [p1, p2]) {
+      for (const fwd of [0.72, 0.20, -0.35]) {
+        const pushed = twoPushPointOffNestTree(state, t.x + p.x * sideDist + u.x * fwd, t.y + p.y * sideDist + u.y * fwd, 0.98);
+        candidates.push(pushed);
+      }
+    }
+    let best = null, bestScore = 999999;
+    for (const c of candidates) {
+      if (twoMapCell(map, Math.floor(c.x), Math.floor(c.y)) === "1") continue;
+      if (twoSegmentNearNestTree(state, ex, ey, c.x, c.y, 0.20)) continue;
+      const score = Math.hypot(c.x - Number(ex), c.y - Number(ey)) + Math.hypot(Number(tx) - c.x, Number(ty) - c.y) * 0.72;
+      if (score < bestScore) { bestScore = score; best = c; }
+    }
+    return best;
+  } catch { return null; }
+}
+function twoFrontHalfNestCell(side, cx, cy, x, y) {
+  side = String(side || "north").toLowerCase();
+  if (side === "south") return Number(y) >= Number(cy);
+  if (side === "west") return Number(x) <= Number(cx);
+  if (side === "east") return Number(x) >= Number(cx);
+  return Number(y) <= Number(cy);
+}
+function twoFrontGatherSortKey(side, cx, cy, entrance, pt) {
+  const ex = Number((entrance && entrance.x) || cx) + 0.5;
+  const ey = Number((entrance && entrance.y) || cy) + 0.5;
+  const x = Number(pt[0]), y = Number(pt[1]);
+  return Math.hypot(x - ex, y - ey) * 1000 + Math.abs(x - (Number(cx) + 0.5)) + Math.abs(y - (Number(cy) + 0.5));
+}
+
+function twoPlanNesting(room) {
+  try {
+    const mission = room && room.mission;
+    const map = mission && Array.isArray(mission.map) ? mission.map : [];
+    const h = map.length, w = h ? String(map[0] || "").length : 0;
+    if (!mission || w < 9 || h < 9) return null;
+    const tree = twoSharedInfectedTree(mission);
+    if (!tree) return null;
+    const radius = TWO_NEST_RADIUS;
+    const cx = Math.max(4, Math.min(w - 5, Math.floor(Number(tree.x || 4))));
+    const cy = Math.max(4, Math.min(h - 5, Math.floor(Number(tree.y || 4))));
+    const v = room.vehicle || { x: 2.5, y: 2.5 };
+    const entrance = twoChooseNestEntrance(map, cx, cy, radius, Number(v.x || 2.5), Number(v.y || 2.5));
+    const keep = new Set();
+    keep.add(entrance.x + "," + entrance.y);
+    keep.add(entrance.outside[0] + "," + entrance.outside[1]);
+    keep.add(entrance.inside[0] + "," + entrance.inside[1]);
+    keep.add(cx + "," + cy);
+    const build = [];
+    for (let y = cy - radius; y <= cy + radius; y++) {
+      for (let x = cx - radius; x <= cx + radius; x++) {
+        if (x <= 0 || y <= 0 || x >= w - 1 || y >= h - 1 || (x <= 6 && y <= 6)) continue;
+        const perimeter = (x === cx - radius || x === cx + radius || y === cy - radius || y === cy + radius);
+        if (!perimeter || keep.has(x + "," + y)) continue;
+        if (twoMapCell(map, x, y) !== "1") build.push([x, y]);
+      }
+    }
+    build.sort((a, b) => (Math.hypot(a[0] - cx, a[1] - cy) - Math.hypot(b[0] - cx, b[1] - cy)) || (Math.atan2(a[1] - cy, a[0] - cx) - Math.atan2(b[1] - cy, b[0] - cx)));
+    const gather = [];
+    const chamberOpen = [];
+    const tempState = {
+      anchor: { x: Number(tree.x || cx + 0.5), y: Number(tree.y || cy + 0.5), cell_x: cx, cell_y: cy },
+      tree,
+      entrance: { x: entrance.x, y: entrance.y, side: entrance.side }
+    };
+    for (let y = cy - radius + 1; y < cy + radius; y++) {
+      for (let x = cx - radius + 1; x < cx + radius; x++) {
+        if (x <= 0 || y <= 0 || x >= w - 1 || y >= h - 1) continue;
+        chamberOpen.push([x, y]);
+        if (x === cx && y === cy) continue;
+        if (!twoFrontHalfNestCell(entrance.side, cx, cy, x, y)) continue;
+        let g = twoPushPointOffNestTree(tempState, x + 0.5, y + 0.5, 0.88);
+        if (twoMapCell(map, Math.floor(g.x), Math.floor(g.y)) === "1") g = { x: x + 0.5, y: y + 0.5 };
+        const ti = twoNestTreeInfo(tempState);
+        if (Math.hypot(g.x - ti.x, g.y - ti.y) < ti.r + 0.74) continue;
+        gather.push([Number(g.x), Number(g.y)]);
+      }
+    }
+    gather.sort((a, b) => twoFrontGatherSortKey(entrance.side, cx, cy, entrance, a) - twoFrontGatherSortKey(entrance.side, cx, cy, entrance, b));
+    if (!gather.length) {
+      const inside = entrance.inside || [cx, cy];
+      const g = twoPushPointOffNestTree(tempState, Number(inside[0]) + 0.5, Number(inside[1]) + 0.5, 0.92);
+      gather.push([g.x, g.y]);
+    }
+    return {
+      enabled: true, phase: "waiting", timer: 0, build_timer: 0, delay: TWO_NEST_DELAY_SEC, interval: TWO_NEST_BUILD_INTERVAL_SEC, radius,
+      anchor: { x: Number(tree.x || cx + 0.5), y: Number(tree.y || cy + 0.5), cell_x: cx, cell_y: cy },
+      tree,
+      entrance: { x: entrance.x, y: entrance.y, side: entrance.side },
+      keep_open: Array.from(keep).map(k => k.split(",").map(n => Number(n))),
+      chamber_open: chamberOpen,
+      build_cells: build, built: [], build_index: 0, gather, ceiling: false, started_at: Date.now(), debug_last: "planned", debug_log: []
+    };
+  } catch { return null; }
+}
+function twoEnsureNesting(room) {
+  if (!room || !room.mission) return null;
+  if (room.nesting && room.nesting.enabled) return room.nesting;
+  if (room.mission.nesting && room.mission.nesting.enabled) { room.nesting = room.mission.nesting; return room.nesting; }
+  room.nesting = twoPlanNesting(room);
+  if (room.nesting) room.mission.nesting = room.nesting;
+  return room.nesting;
+}
+function twoNestAliveEnemies(room) {
+  try {
+    const enemies = room && room.mission && Array.isArray(room.mission.enemies) ? room.mission.enemies : [];
+    return enemies.filter(e => e && Number(e.hp || 0) > 0);
+  } catch { return []; }
+}
+function twoNestEnemyKey(e, fallback) {
+  const n = Number(e && e.id);
+  return Number.isFinite(n) && n !== 0 ? n : Number(fallback || 0);
+}
+function twoNestBuilderIds(room, state) {
+  const enemies = twoNestAliveEnemies(room);
+  if (!enemies.length) { state.builder_ids = []; return new Set(); }
+  const ax = Number((state.anchor && (state.anchor.x ?? state.anchor.cell_x)) || 2.5);
+  const ay = Number((state.anchor && (state.anchor.y ?? state.anchor.cell_y)) || 2.5);
+  const cap = Math.max(1, Math.min(TWO_NEST_BUILDER_COUNT, enemies.length));
+  const alive = new Set(enemies.map((e, i) => twoNestEnemyKey(e, i + 1)));
+  const current = Array.isArray(state.builder_ids) ? state.builder_ids.map(v => Number(v)).filter(v => alive.has(v)).slice(0, cap) : [];
+  const used = new Set(current);
+  if (current.length < cap) {
+    const ranked = [];
+    for (let i = 0; i < enemies.length; i++) {
+      const e = enemies[i];
+      const key = twoNestEnemyKey(e, i + 1);
+      if (used.has(key)) continue;
+      ranked.push({ key, d: Math.hypot(Number(e.x || ax) - ax, Number(e.y || ay) - ay) });
+    }
+    ranked.sort((a, b) => a.d - b.d);
+    for (const item of ranked) {
+      if (current.length >= cap) break;
+      current.push(item.key);
+      used.add(item.key);
+    }
+  }
+  state.builder_ids = current;
+  return new Set(current);
+}
+function twoCurrentBuildCell(state) {
+  try {
+    const build = Array.isArray(state.build_cells) ? state.build_cells : [];
+    const idx = Number(state.build_index || 0) | 0;
+    if (idx >= 0 && idx < build.length) return [Number(build[idx][0]), Number(build[idx][1])];
+  } catch {}
+  return null;
+}
+
+function twoNestWorkCandidates(state, x, y) {
+  const out = [];
+  const seen = new Set();
+  const a = (state && state.anchor) || {};
+  const cx = Number.isFinite(Number(a.cell_x)) ? Number(a.cell_x) : Math.floor(Number(a.x || 0));
+  const cy = Number.isFinite(Number(a.cell_y)) ? Number(a.cell_y) : Math.floor(Number(a.y || 0));
+  function add(wx, wy) { const k = `${wx},${wy}`; if (!seen.has(k)) { seen.add(k); out.push([wx, wy]); } }
+  x = Number(x); y = Number(y);
+  if (y < cy) add(x, y + 1);
+  if (y > cy) add(x, y - 1);
+  if (x < cx) add(x + 1, y);
+  if (x > cx) add(x - 1, y);
+  add(x + 1, y); add(x - 1, y); add(x, y + 1); add(x, y - 1);
+  return out;
+}
+function twoNestDebug(state, msg) {
+  try {
+    if (!state) return;
+    msg = String(msg || '').slice(0, 180);
+    state.debug_last = msg;
+    if (!Array.isArray(state.debug_log)) state.debug_log = [];
+    const stamp = new Date().toTimeString().slice(0, 8);
+    const line = `${stamp}  ${msg}`;
+    if (!state.debug_log.length || String(state.debug_log[state.debug_log.length - 1]).split('  ').slice(1).join('  ') !== msg) state.debug_log.push(line);
+    if (state.debug_log.length > 14) state.debug_log.splice(0, state.debug_log.length - 14);
+  } catch {}
+}
+function twoNestPointWalkable(room, state, px, py) {
+  try {
+    px = Number(px); py = Number(py);
+    const map = room && room.mission && Array.isArray(room.mission.map) ? room.mission.map : [];
+    if (twoMapCell(map, Math.floor(px), Math.floor(py)) === "1") return false;
+    // Nest workers ignore the black-tree trunk body while operating in the hive.
+    // Wall/grid clearance still applies.
+    if (!twoCircleOpen(room, px, py, TWO_ENEMY_RADIUS)) return false;
+    return true;
+  } catch { return false; }
+}
+function twoNestWorkPoints(room, state, x, y) {
+  const out = [];
+  const seen = new Set();
+  try {
+    const map = room && room.mission && Array.isArray(room.mission.map) ? room.mission.map : [];
+    const candidates = twoNestWorkCandidates(state, x, y).slice();
+    for (const d of [[1,0],[-1,0],[0,1],[0,-1]]) {
+      const wx = Number(x) + d[0], wy = Number(y) + d[1];
+      if (twoMapCell(map, wx, wy) !== "1") candidates.push([wx, wy]);
+    }
+    for (const p of candidates) {
+      const px = Number(p[0]) + 0.5, py = Number(p[1]) + 0.5;
+      const pushed = twoPushPointOffNestTree(state, px, py, 0.66);
+      for (const q of [[px, py], [pushed.x, pushed.y]]) {
+        const qx = Number(q[0]), qy = Number(q[1]);
+        const key = `${Math.round(qx * 1000)},${Math.round(qy * 1000)}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (twoNestPointWalkable(room, state, qx, qy)) out.push([qx, qy]);
+      }
+    }
+  } catch {}
+  return out;
+}
+function twoNestWorkPoint(room, state, x, y, prefs = null) {
+  try {
+    const points = twoNestWorkPoints(room, state, x, y);
+    if (!points.length) return null;
+    if (Array.isArray(prefs) && prefs.length) {
+      points.sort((a, b) => {
+        const da = Math.min(...prefs.map(e => Math.hypot(Number(e.x || a[0]) - a[0], Number(e.y || a[1]) - a[1])));
+        const db = Math.min(...prefs.map(e => Math.hypot(Number(e.x || b[0]) - b[0], Number(e.y || b[1]) - b[1])));
+        return da - db;
+      });
+    }
+    return [Number(points[0][0]), Number(points[0][1])];
+  } catch {}
+  return null;
+}
+function twoCurrentWorkPoint(room, state) {
+  const cell = twoCurrentBuildCell(state);
+  if (!cell) return null;
+  const builders = twoNestBuilderIds(room, state);
+  const prefs = twoNestAliveEnemies(room).filter((e, i) => builders.has(twoNestEnemyKey(e, i + 1)));
+  const work = twoNestWorkPoint(room, state, cell[0], cell[1], prefs);
+  if (work) { state.current_wall = [Number(cell[0]), Number(cell[1])]; state.current_work = [Number(work[0]), Number(work[1])]; }
+  return work;
+}
+function twoSelectReachableBuildCell(room, state) {
+  try {
+    twoRefreshBuildIndex(room, state);
+    const cell = twoCurrentBuildCell(state);
+    if (!cell) return null;
+    const build = Array.isArray(state.build_cells) ? state.build_cells : [];
+    const idx = Number(state.build_index || 0) | 0;
+    const builders = twoNestBuilderIds(room, state);
+    const prefs = twoNestAliveEnemies(room).filter((e, i) => builders.has(twoNestEnemyKey(e, i + 1)));
+    if (twoNestWorkPoint(room, state, cell[0], cell[1], prefs)) { twoCurrentWorkPoint(room, state); return cell; }
+    for (const it of twoRemainingBuildCells(room, state, 14)) {
+      const j = Number(it[0]), x = Number(it[1]), y = Number(it[2]);
+      if (j === idx) continue;
+      if (twoNestWorkPoint(room, state, x, y, prefs)) {
+        const tmp = build[idx]; build[idx] = build[j]; build[j] = tmp;
+        state.build_cells = build;
+        twoRefreshBuildIndex(room, state);
+        twoNestDebug(state, `rotated build target to reachable wall ${build[idx][0]},${build[idx][1]}`);
+        twoCurrentWorkPoint(room, state);
+        return twoCurrentBuildCell(state);
+      }
+    }
+    return cell;
+  } catch { return twoCurrentBuildCell(state); }
+}
+
+function twoRemainingBuildCells(room, state, limit = null) {
+  const out = [];
+  try {
+    const map = room && room.mission && Array.isArray(room.mission.map) ? room.mission.map : [];
+    const ent = twoNestEntranceCell(state);
+    const built = new Set();
+    for (const it of (state.built || [])) built.add(`${Number(it[0])},${Number(it[1])}`);
+    const build = Array.isArray(state.build_cells) ? state.build_cells : [];
+    for (let idx = 0; idx < build.length; idx++) {
+      const x = Number(build[idx][0]), y = Number(build[idx][1]);
+      if (ent && Number(ent[0]) === x && Number(ent[1]) === y) continue;
+      if (twoMapCell(map, x, y) === "1") continue;
+      if (!twoNestPerimeterCell(state, x, y)) continue;
+      out.push([idx, x, y]);
+      if (limit !== null && out.length >= Number(limit)) break;
+    }
+  } catch {}
+  return out;
+}
+function twoRefreshBuildIndex(room, state) {
+  try {
+    const rem = twoRemainingBuildCells(room, state, 1);
+    if (rem.length) {
+      state.build_index = Number(rem[0][0]);
+      state.current_wall = [Number(rem[0][1]), Number(rem[0][2])];
+      return state.build_index;
+    }
+    state.build_index = Array.isArray(state.build_cells) ? state.build_cells.length : 0;
+    state.current_wall = null;
+    state.current_work = null;
+    return state.build_index;
+  } catch { return Number(state.build_index || 0) | 0; }
+}
+function twoBuilderJobs(room, state) {
+  const jobs = {};
+  try {
+    const builders = twoNestBuilderIds(room, state);
+    if (!builders.size) { state.builder_jobs = {}; return jobs; }
+    const enemies = twoNestAliveEnemies(room);
+    const alive = [];
+    const ax = Number((state.anchor && (state.anchor.x ?? state.anchor.cell_x)) || 2.5);
+    const ay = Number((state.anchor && (state.anchor.y ?? state.anchor.cell_y)) || 2.5);
+    for (let i = 0; i < enemies.length; i++) {
+      const key = twoNestEnemyKey(enemies[i], i + 1);
+      if (builders.has(key)) alive.push([key, enemies[i]]);
+    }
+    alive.sort((a, b) => (Math.hypot(Number(a[1].x || ax) - ax, Number(a[1].y || ay) - ay) - Math.hypot(Number(b[1].x || ax) - ax, Number(b[1].y || ay) - ay)) || (Number(a[0]) - Number(b[0])));
+    const remaining = twoRemainingBuildCells(room, state, Math.max(8, alive.length * 6));
+    if (!remaining.length) { state.builder_jobs = {}; return jobs; }
+    const firstIdx = Number(remaining[0][0]);
+    const claimed = new Set();
+    for (const pair of alive) {
+      const key = Number(pair[0]);
+      const e = pair[1];
+      const ex = Number(e.x || ax), ey = Number(e.y || ay);
+      let best = null, bestScore = 999999;
+      for (const it of remaining) {
+        const idx = Number(it[0]), x = Number(it[1]), y = Number(it[2]);
+        const cellKey = `${x},${y}`;
+        if (claimed.has(cellKey)) continue;
+        const work = twoNestWorkPoint(room, state, x, y, [e]);
+        if (!work) continue;
+        const score = Math.hypot(ex - Number(work[0]), ey - Number(work[1])) + Math.max(0, idx - firstIdx) * 0.085;
+        if (score < bestScore) { bestScore = score; best = { idx, x, y, wx: Number(work[0]), wy: Number(work[1]) }; }
+      }
+      if (!best) continue;
+      claimed.add(`${best.x},${best.y}`);
+      jobs[String(key)] = { idx: best.idx, wall: [best.x, best.y], work: [best.wx, best.wy] };
+    }
+    state.builder_jobs = jobs;
+    const vals = Object.values(jobs);
+    if (vals.length) {
+      vals.sort((a, b) => Number(a.idx || 999999) - Number(b.idx || 999999));
+      state.current_wall = [Number(vals[0].wall[0]), Number(vals[0].wall[1])];
+      state.current_work = [Number(vals[0].work[0]), Number(vals[0].work[1])];
+    }
+  } catch { try { state.builder_jobs = jobs; } catch {} }
+  return jobs;
+}
+function twoBuilderJobFor(state, key) {
+  try {
+    const jobs = state && state.builder_jobs && typeof state.builder_jobs === "object" ? state.builder_jobs : {};
+    return jobs[String(Number(key))] || null;
+  } catch { return null; }
+}
+function twoBuilderReadyForJob(room, state, key, job) {
+  try {
+    if (!job || typeof job !== "object") return false;
+    const x = Number(job.wall[0]), y = Number(job.wall[1]);
+    const wx = Number(job.work[0]), wy = Number(job.work[1]);
+    const wallX = x + 0.5, wallY = y + 0.5;
+    const enemies = twoNestAliveEnemies(room);
+    for (let i = 0; i < enemies.length; i++) {
+      const e = enemies[i];
+      if (twoNestEnemyKey(e, i + 1) !== Number(key)) continue;
+      const ex = Number(e.x || wallX), ey = Number(e.y || wallY);
+      const dWork = Math.hypot(ex - wx, ey - wy);
+      const dWall = Math.hypot(ex - wallX, ey - wallY);
+      if (dWall <= TWO_NEST_BUILD_RANGE + 0.72 && (dWork <= Math.max(0.88, TWO_NEST_BUILD_RANGE * 0.76) || dWall <= TWO_NEST_BUILD_RANGE + 0.42)) {
+        state.current_wall = [x, y];
+        state.current_work = [wx, wy];
+        twoNestDebug(state, `builder ${Number(key)} working wall ${x},${y}`);
+        return true;
+      }
+      return false;
+    }
+  } catch {}
+  return false;
+}
+
+function twoPrepareNestChamber(room, state, cells) {
+  try {
+    const map = room && room.mission && Array.isArray(room.mission.map) ? room.mission.map : [];
+    for (const it of (state.chamber_open || [])) {
+      const x = Number(it[0]), y = Number(it[1]);
+      if (twoSetMapCell(map, x, y, "0")) cells.push([x, y, "0"]);
+    }
+  } catch {}
+}
+
+function twoNestBuilderNearCell(room, state, x, y) {
+  const builders = twoNestBuilderIds(room, state);
+  if (!builders.size) { twoNestDebug(state, "no live builders assigned"); return false; }
+  const workPoints = twoNestWorkPoints(room, state, x, y);
+  if (!workPoints.length) { twoNestDebug(state, `wall ${x},${y} has no usable work point`); return false; }
+  const wx = Number(x) + 0.5, wy = Number(y) + 0.5;
+  const enemies = twoNestAliveEnemies(room);
+  let bestD = 999999;
+  for (let i = 0; i < enemies.length; i++) {
+    const e = enemies[i];
+    if (!builders.has(twoNestEnemyKey(e, i + 1))) continue;
+    const ex = Number(e.x || wx), ey = Number(e.y || wy);
+    for (const p of workPoints) {
+      const tx = Number(p[0]), ty = Number(p[1]);
+      const d = Math.hypot(ex - tx, ey - ty);
+      bestD = Math.min(bestD, d);
+      if (d <= Math.max(0.72, TWO_NEST_BUILD_RANGE * 0.70) && Math.hypot(ex - wx, ey - wy) <= TWO_NEST_BUILD_RANGE + 0.55) {
+        state.current_work = [tx, ty];
+        twoNestDebug(state, `builder ${twoNestEnemyKey(e, i + 1)} working wall ${x},${y}`);
+        return true;
+      }
+    }
+  }
+  if (bestD < 999998) twoNestDebug(state, `waiting: nearest builder ${bestD.toFixed(2)} from work point for wall ${x},${y}`);
+  return false;
+}
+
+function twoAssignNestTargets(room, state) {
+  try {
+    const enemies = room && room.mission && Array.isArray(room.mission.enemies) ? room.mission.enemies : [];
+    const gather = state && Array.isArray(state.gather) ? state.gather : [];
+    if (!gather.length) return;
+    const phase = String(state.phase || "waiting");
+    const ax = Number((state.anchor && state.anchor.x) || 2.5), ay = Number((state.anchor && state.anchor.y) || 2.5);
+    const builders = phase === "building" ? twoNestBuilderIds(room, state) : new Set();
+    const buildCell = phase === "building" ? twoSelectReachableBuildCell(room, state) : twoCurrentBuildCell(state);
+    if (phase === "building") twoBuilderJobs(room, state);
+    for (let i = 0; i < enemies.length; i++) {
+      const e = enemies[i];
+      if (!e || Number(e.hp || 1) <= 0) continue;
+      if (phase === "building" || phase === "built") {
+        const key = twoNestEnemyKey(e, i + 1);
+        const gatherSlot = Math.abs(key) % Math.max(1, gather.length);
+        const isBuilder = !!(phase === "building" && builders.has(key));
+        let tx, ty, mode = phase;
+        if (phase === "building" && isBuilder) {
+          if (Math.hypot(Number(e.x || ax) - ax, Number(e.y || ay) - ay) > TWO_NEST_RALLY_RADIUS) { tx = ax; ty = ay; }
+          else {
+            let job = twoBuilderJobFor(state, key);
+            if (!job) { twoBuilderJobs(room, state); job = twoBuilderJobFor(state, key); }
+            if (job && job.work) { tx = Number(job.work[0]); ty = Number(job.work[1]); e.hive_build_wall = job.wall; }
+            else if (buildCell) { const work = twoCurrentWorkPoint(room, state); if (work) { tx = Number(work[0]); ty = Number(work[1]); } else { const g = gather[gatherSlot]; tx = Number(g[0]); ty = Number(g[1]); } }
+            else { const g = gather[gatherSlot]; tx = Number(g[0]); ty = Number(g[1]); }
+          }
+        } else {
+          const g = gather[gatherSlot]; tx = Number(g[0]); ty = Number(g[1]);
+        }
+        try {
+          const targetIsTreeRally = Math.hypot(Number(tx) - ax, Number(ty) - ay) < 0.72;
+          const bypass = targetIsTreeRally ? null : twoNestTreeBypassPoint(room, state, Number(e.x || tx), Number(e.y || ty), Number(tx), Number(ty));
+          if (bypass) { tx = Number(bypass.x); ty = Number(bypass.y); e.nest_route = "tree-bypass"; }
+          else delete e.nest_route;
+        } catch {}
+        e.nest_tx = tx; e.nest_ty = ty; e.nest_anchor_x = ax; e.nest_anchor_y = ay; e.nest_mode = mode; e.nest_builder = isBuilder;
+        e.hive_job = isBuilder ? "builder" : (phase === "built" ? "garrison" : "guard-builder");
+        e.hive_target = [Math.round(Number(tx) * 1000) / 1000, Math.round(Number(ty) * 1000) / 1000];
+        e.debug_thought = `${e.hive_job} -> ${Number(tx).toFixed(2)},${Number(ty).toFixed(2)}`;
+        if (state.entrance) { e.nest_door_x = Number(state.entrance.x); e.nest_door_y = Number(state.entrance.y); }
+      } else {
+        delete e.nest_tx; delete e.nest_ty; delete e.nest_anchor_x; delete e.nest_anchor_y; delete e.nest_mode; delete e.nest_builder;
+        delete e.hive_job; delete e.hive_target; delete e.debug_thought;
+        delete e.nest_door_x; delete e.nest_door_y;
+      }
+    }
+  } catch {}
+}
+
+function twoEnemyInNestDoorway(e) {
+  try {
+    const mode = String((e && e.nest_mode) || "");
+    if (mode !== "building" && mode !== "built") return false;
+    const dx = Number(e.nest_door_x), dy = Number(e.nest_door_y);
+    if (!Number.isFinite(dx) || !Number.isFinite(dy)) return false;
+    return Math.hypot(Number(e.x || 0) - (dx + 0.5), Number(e.y || 0) - (dy + 0.5)) <= 1.28;
+  } catch { return false; }
+}
+function twoSameNestDoorway(a, b) {
+  try {
+    return twoEnemyInNestDoorway(a) && twoEnemyInNestDoorway(b)
+      && Number(a.nest_door_x) === Number(b.nest_door_x)
+      && Number(a.nest_door_y) === Number(b.nest_door_y);
+  } catch { return false; }
+}
+
+function twoSameActiveNestSpace(a, b) {
+  try {
+    const ma = String((a && a.nest_mode) || "");
+    const mb = String((b && b.nest_mode) || "");
+    if ((ma !== "building" && ma !== "built") || (mb !== "building" && mb !== "built")) return false;
+    const ax = Math.round(Number((a && a.nest_anchor_x) || 0) * 100) / 100;
+    const ay = Math.round(Number((a && a.nest_anchor_y) || 0) * 100) / 100;
+    const bx = Math.round(Number((b && b.nest_anchor_x) || 0) * 100) / 100;
+    const by = Math.round(Number((b && b.nest_anchor_y) || 0) * 100) / 100;
+    if (ax !== bx || ay !== by) return false;
+    const ex = Number((a && a.x) || 0), ey = Number((a && a.y) || 0);
+    const ox = Number((b && b.x) || 0), oy = Number((b && b.y) || 0);
+    return Math.hypot(ex - ax, ey - ay) <= 4.65 && Math.hypot(ox - bx, oy - by) <= 4.65;
+  } catch { return false; }
+}
+
+function twoEnemyIdentity(e, idx) {
+  const eid = Number(e && e.id);
+  return Number.isFinite(eid) ? eid : Number(idx || 0) + 1;
+}
+function twoEnsureEnemyMind(e, idx) {
+  try {
+    const eid = twoEnemyIdentity(e, idx);
+    const ex = Number(e.x || 0), ey = Number(e.y || 0);
+    if (!Number.isFinite(e.spawn_x)) { e.spawn_x = ex; e.spawn_y = ey; }
+    if (!Number.isFinite(e.home_x)) { e.home_x = ex; e.home_y = ey; }
+    if (!Number.isFinite(e.ai_slot)) e.ai_slot = Math.abs((eid * 1103515245 + 12345) | 0) % 8;
+    if (!Number.isFinite(e.ai_patience)) e.ai_patience = 0.86 + (Math.abs(eid) % 7) * 0.045;
+    if (!Number.isFinite(e.aiDecideT)) e.aiDecideT = 0.05 + (Math.abs(eid) % 5) * 0.035;
+    if (!e.aiGoal) { e.aiGoal = "hold"; e.aiGoalX = ex; e.aiGoalY = ey; }
+  } catch {}
+  return e;
+}
+function twoSnapIdleEnemy(e, ex, ey) {
+  try {
+    e.x = Math.round(Number(Number.isFinite(ex) ? ex : e.x || 0) * 1000) / 1000;
+    e.y = Math.round(Number(Number.isFinite(ey) ? ey : e.y || 0) * 1000) / 1000;
+    e.moving = false;
+    e.avoidT = 0;
+    e.avoidBias = 0;
+    e.stuckT = 0;
+  } catch {}
+}
+function twoAlertEnemyUnderFire(e, sx, sy, duration = 7.0) {
+  if (!e || typeof e !== "object") return e;
+  try {
+    const x = Number(Number.isFinite(Number(sx)) ? sx : (e.lastX ?? e.x ?? 0));
+    const y = Number(Number.isFinite(Number(sy)) ? sy : (e.lastY ?? e.y ?? 0));
+    if (Number.isFinite(x) && Number.isFinite(y)) {
+      e.lastX = x; e.lastY = y;
+      e.last_seen_x = x; e.last_seen_y = y;
+    }
+    e.shotReactT = Math.max(Number(e.shotReactT || 0), Number(duration || 7.0));
+    e.smellT = Math.max(Number(e.smellT || 0), 4.5);
+    e.alertT = Math.max(Number(e.alertT || 0), 2.5);
+    e.engagedT = Math.max(Number(e.engagedT || 0), Number(duration || 7.0));
+    e.aiDecideT = 0;
+    e.aiPathCells = [];
+    e.stuckT = 0;
+    e.avoidT = 0;
+    e.brain = "shot-react-pursue";
+    e.tactic = "under-fire";
+    e.debug_thought = "SHOT REACT: pursue/reposition";
+  } catch (_) {}
+  return e;
+}
+
+function twoCommitEnemyGoal(e, tx, ty, brain, tactic, force) {
+  tx = Number(tx); ty = Number(ty);
+  if (!Number.isFinite(tx) || !Number.isFinite(ty)) return null;
+  const oldX = Number.isFinite(Number(e.aiGoalX)) ? Number(e.aiGoalX) : tx;
+  const oldY = Number.isFinite(Number(e.aiGoalY)) ? Number(e.aiGoalY) : ty;
+  const same = Math.hypot(oldX - tx, oldY - ty) < 0.20 && String(e.aiGoal || "") === String(tactic || brain || "");
+  if (!force && same && Number(e.aiDecideT || 0) > 0) {
+    e.brain = brain; e.tactic = tactic;
+    return { x: oldX, y: oldY };
+  }
+  e.aiGoal = String(tactic || brain || "move");
+  e.aiGoalX = tx; e.aiGoalY = ty;
+  const eid = Math.abs(twoEnemyIdentity(e, 0));
+  const jitter = ((eid % 11) - 5) * 0.012;
+  e.aiDecideT = clamp(Number(e.ai_patience || 1.0) * (0.22 + Math.random() * 0.33) + jitter, 0.16, 0.72);
+  e.brain = brain; e.tactic = tactic;
+  return { x: tx, y: ty };
+}
+function twoAllyAlertSignal(e, enemies) {
+  try {
+    const ex = Number(e.x || 0), ey = Number(e.y || 0);
+    let best = null, bestD = 999999;
+    for (const o of (enemies || [])) {
+      if (!o || o === e || Number(o.hp || 0) <= 0) continue;
+      if (!Number.isFinite(Number(o.lastX)) && !Number.isFinite(Number(o.last_seen_x))) continue;
+      const alert = Number(o.alertT || o.alert_t || 0), engaged = Number(o.engagedT || o.engaged_t || 0);
+      const b = String(o.brain || "");
+      if (alert <= 0.20 && engaged <= 0 && !(b.startsWith("paladin-pitbull") || b.startsWith("paladin-intercept") || b.startsWith("ranged-command") || b.startsWith("lich-"))) continue;
+      const d = Math.hypot(Number(o.x || ex) - ex, Number(o.y || ey) - ey);
+      if (d <= 7.25 && d < bestD) {
+        best = { x: Number(o.lastX ?? o.last_seen_x ?? o.x ?? ex), y: Number(o.lastY ?? o.last_seen_y ?? o.y ?? ey), d, alert, engaged };
+        bestD = d;
+      }
+    }
+    return best;
+  } catch { return null; }
+}
+function twoPaladinTacticalTarget(room, e, ex, ey, px, py, dist, visible, meleeAttackRange) {
+  try {
+    if (dist <= Math.max(4.75, meleeAttackRange + 2.15) || (visible && dist <= 6.3)) return { x: px, y: py, brain: "paladin-pitbull-charge", tactic: "maul" };
+    const slot = (Number(e.ai_slot || 0) | 0) % 8;
+    const base = Math.atan2(ey - py, ex - px);
+    const offsets = [0, 0.58, -0.58, 1.04, -1.04, 1.55, -1.55, Math.PI];
+    const radius = 1.08 + (slot % 3) * 0.22;
+    const order = [slot, (slot + 1) % 8, (slot + 7) % 8, (slot + 2) % 8, (slot + 6) % 8];
+    for (const idx of order) {
+      const ang = base + offsets[idx];
+      const tx = px + Math.cos(ang) * radius, ty = py + Math.sin(ang) * radius;
+      if (twoEnemyBodyClear(room, e, tx, ty, room.mission ? room.mission.enemies : [], room.vehicle || { x: px, y: py })) return { x: tx, y: ty, brain: idx === slot ? "paladin-intercept" : "paladin-cutoff", tactic: "cutoff" };
+    }
+  } catch {}
+  return { x: px, y: py, brain: "paladin-intercept", tactic: "intercept" };
+}
+function twoArriveRadius(e, nestOrder, aware) {
+  const base = Math.max(0.24, Number(e.body_radius || TWO_ENEMY_RADIUS) * 0.72);
+  if (nestOrder) return Math.max(base, String(e.nest_mode || "") === "built" ? 0.54 : 0.42);
+  if (!aware) return Math.max(base, 0.34);
+  return base;
+}
+
+
+function twoGridCellFromPoint(x, y) {
+  return [Math.floor(Number(x) || 0), Math.floor(Number(y) || 0)];
+}
+function twoNavCellOpen(room, e, cx, cy, vehicle) {
+  try {
+    const x = Number(cx) + 0.5, y = Number(cy) + 0.5;
+    return twoEnemyBodyClear(room, e, x, y, [], vehicle || room.vehicle || null);
+  } catch { return false; }
+}
+function twoNearestOpenNavCell(room, e, tx, ty, vehicle, maxR) {
+  const [gx, gy] = twoGridCellFromPoint(tx, ty);
+  if (twoNavCellOpen(room, e, gx, gy, vehicle)) return [gx, gy];
+  let best = null, bestD = 999999;
+  for (let r = 1; r <= (maxR || 4); r++) {
+    for (let yy = gy - r; yy <= gy + r; yy++) {
+      for (let xx = gx - r; xx <= gx + r; xx++) {
+        if (Math.abs(xx - gx) !== r && Math.abs(yy - gy) !== r) continue;
+        if (!twoNavCellOpen(room, e, xx, yy, vehicle)) continue;
+        const d = Math.hypot(xx + 0.5 - Number(tx), yy + 0.5 - Number(ty));
+        if (d < bestD) { bestD = d; best = [xx, yy]; }
+      }
+    }
+    if (best) return best;
+  }
+  return null;
+}
+function twoStraightRouteClear(room, e, ex, ey, tx, ty, vehicle) {
+  try {
+    const dist = Math.hypot(Number(tx) - Number(ex), Number(ty) - Number(ey));
+    if (dist <= 0.35) return true;
+    const steps = Math.max(2, Math.min(18, Math.ceil(dist / 0.42)));
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      const x = Number(ex) + (Number(tx) - Number(ex)) * t;
+      const y = Number(ey) + (Number(ty) - Number(ey)) * t;
+      if (!twoEnemyBodyClear(room, e, x, y, [], vehicle || room.vehicle || null)) return false;
+    }
+    return true;
+  } catch { return false; }
+}
+function twoReconstructPath(came, cur) {
+  const out = [cur];
+  while (came.has(cur.join(','))) {
+    cur = came.get(cur.join(','));
+    out.push(cur);
+  }
+  out.reverse();
+  return out;
+}
+function twoPlanGridPath(room, e, ex, ey, tx, ty, vehicle, maxNodes) {
+  try {
+    const start = twoGridCellFromPoint(ex, ey);
+    const goal = twoNearestOpenNavCell(room, e, tx, ty, vehicle, 4);
+    if (!goal) return [];
+    if (start[0] === goal[0] && start[1] === goal[1]) return [start];
+    const pad = 9;
+    const minX = Math.min(start[0], goal[0]) - pad, maxX = Math.max(start[0], goal[0]) + pad;
+    const minY = Math.min(start[1], goal[1]) - pad, maxY = Math.max(start[1], goal[1]) + pad;
+    const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
+    const open = [{ f: 0, g: 0, c: start }];
+    const came = new Map();
+    const gscore = new Map([[start.join(','), 0]]);
+    const seen = new Set();
+    while (open.length && seen.size < (maxNodes || 420)) {
+      open.sort((a, b) => a.f - b.f);
+      const curItem = open.shift();
+      const cur = curItem.c;
+      const key = cur.join(',');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (cur[0] === goal[0] && cur[1] === goal[1]) return twoReconstructPath(came, cur);
+      for (const d of dirs) {
+        const nx = cur[0] + d[0], ny = cur[1] + d[1];
+        if (nx < minX || nx > maxX || ny < minY || ny > maxY) continue;
+        if ((nx !== goal[0] || ny !== goal[1]) && !twoNavCellOpen(room, e, nx, ny, vehicle)) continue;
+        if (d[0] && d[1] && (!twoNavCellOpen(room, e, cur[0] + d[0], cur[1], vehicle) || !twoNavCellOpen(room, e, cur[0], cur[1] + d[1], vehicle))) continue;
+        const nk = `${nx},${ny}`;
+        const step = d[0] && d[1] ? 1.414 : 1.0;
+        const tentative = Number(gscore.get(key) || 0) + step;
+        if (tentative >= Number(gscore.get(nk) ?? 999999)) continue;
+        came.set(nk, cur);
+        gscore.set(nk, tentative);
+        const h = Math.hypot(goal[0] - nx, goal[1] - ny);
+        open.push({ f: tentative + h, g: tentative, c: [nx, ny] });
+      }
+    }
+  } catch {}
+  return [];
+}
+function twoPathCacheValid(e, goal) {
+  try {
+    return Array.isArray(e.aiPathCells) && e.aiPathCells.length >= 1 && Array.isArray(e.aiPathGoal) && Number(e.aiPathGoal[0]) === Number(goal[0]) && Number(e.aiPathGoal[1]) === Number(goal[1]) && Number(e.aiPathT || 0) > 0;
+  } catch { return false; }
+}
+function twoHiveWaypointForGoal(room, e, ex, ey, tx, ty, vehicle, forcePath) {
+  try {
+    tx = Number(tx); ty = Number(ty);
+    if (!Number.isFinite(tx) || !Number.isFinite(ty)) return { x: tx, y: ty };
+    const goal = twoNearestOpenNavCell(room, e, tx, ty, vehicle, 4);
+    if (!goal) return { x: tx, y: ty };
+    const start = twoGridCellFromPoint(ex, ey);
+    const direct = twoStraightRouteClear(room, e, ex, ey, tx, ty, vehicle);
+    const needPath = !!(forcePath || Number(e.stuckT || 0) > 0.10 || ((start[0] !== goal[0] || start[1] !== goal[1]) && !direct));
+    if (!needPath && Math.hypot(tx - ex, ty - ey) < 3.2) return { x: tx, y: ty };
+    if (!twoPathCacheValid(e, goal)) {
+      if (Number(e.aiPathReplanT || 0) > 0) return { x: tx, y: ty };
+      const path = twoPlanGridPath(room, e, ex, ey, tx, ty, vehicle, forcePath ? 300 : 220);
+      e.aiPathReplanT = 0.13 + (Math.abs(Number(e.id || 0) | 0) % 5) * 0.025;
+      if (path && path.length) { e.aiPathCells = path; e.aiPathGoal = goal; e.aiPathT = forcePath ? 0.74 : 0.42; e.aiPathFail = 0; }
+      else { e.aiPathCells = []; e.aiPathT = 0.16; e.aiPathFail = Number(e.aiPathFail || 0) + 1; return { x: tx, y: ty }; }
+    } else e.aiPathT = Math.max(0, Number(e.aiPathT || 0) - 0.016);
+    const cells = Array.isArray(e.aiPathCells) ? e.aiPathCells : [];
+    while (cells.length > 1) {
+      const wx = Number(cells[1][0]) + 0.5, wy = Number(cells[1][1]) + 0.5;
+      if (Math.hypot(wx - ex, wy - ey) <= Math.max(0.26, Number(e.body_radius || TWO_ENEMY_RADIUS) * 0.92)) cells.shift();
+      else break;
+    }
+    e.aiPathCells = cells;
+    if (cells.length > 1) {
+      const wx = Number(cells[1][0]) + 0.5, wy = Number(cells[1][1]) + 0.5;
+      e.aiWaypointX = wx; e.aiWaypointY = wy;
+      return { x: wx, y: wy };
+    }
+    return { x: tx, y: ty };
+  } catch { return { x: tx, y: ty }; }
+}
+
+function twoNestRepathGoal(room, e, ex, ey, tx, ty) {
+  try {
+    const oldD = Math.hypot(tx - ex, ty - ey);
+    const base = Math.atan2(ty - ey, tx - ex);
+    const offsets = [0, 0.45, -0.45, 0.90, -0.90, 1.35, -1.35, 1.85, -1.85, 2.45, -2.45, Math.PI];
+    const dists = [0.72, 1.05, 1.42, 1.90, 2.55];
+    let best = null, bestScore = -999999;
+    for (const dist of dists) {
+      for (const off of offsets) {
+        const a = base + off;
+        const cx = ex + Math.cos(a) * dist, cy = ey + Math.sin(a) * dist;
+        if (!twoEnemyBodyClear(room, e, cx, cy, room.mission ? room.mission.enemies : [], room.vehicle || null)) continue;
+        const nd = Math.hypot(tx - cx, ty - cy);
+        const score = (oldD - nd) * 7.5 - Math.abs(off) * 0.28 + (nd < oldD + 0.25 ? 0.8 : -1.2);
+        if (score > bestScore) { bestScore = score; best = { x: cx, y: cy }; }
+      }
+    }
+    if (best) return best;
+    for (const r of [0.65, 1.0, 1.45, 2.0]) {
+      for (let i = 0; i < 12; i++) {
+        const a = Math.PI * 2 * i / 12 + (i % 2 ? 0.17 : 0);
+        const cx = tx + Math.cos(a) * r, cy = ty + Math.sin(a) * r;
+        if (twoEnemyBodyClear(room, e, cx, cy, room.mission ? room.mission.enemies : [], room.vehicle || null)) return { x: cx, y: cy };
+      }
+    }
+  } catch {}
+  return null;
+}
+
+function twoNestEnemyOccupiesCell(e, x, y) {
+  try {
+    const ex = Number(e.x || 0), ey = Number(e.y || 0);
+    const radius = Math.max(0.28, Number(e.body_radius || TWO_ENEMY_RADIUS));
+    if (Math.floor(ex) === Number(x) && Math.floor(ey) === Number(y)) return true;
+    const cx = Math.max(Number(x), Math.min(ex, Number(x) + 1));
+    const cy = Math.max(Number(y), Math.min(ey, Number(y) + 1));
+    return Math.hypot(ex - cx, ey - cy) < radius + 0.08;
+  } catch { return false; }
+}
+function twoNestEnemiesInCell(room, x, y) {
+  try {
+    const enemies = room && room.mission && Array.isArray(room.mission.enemies) ? room.mission.enemies : [];
+    return enemies.filter(e => e && Number(e.hp || 1) > 0 && twoNestEnemyOccupiesCell(e, x, y));
+  } catch { return []; }
+}
+function twoNestVehicleInCell(room, x, y) {
+  try {
+    const v = (room && room.vehicle) || {};
+    const vx = Number(v.x || 0), vy = Number(v.y || 0);
+    const radius = Math.max(0.30, Number(v.body_radius || TWO_TANK_RADIUS));
+    if (Math.floor(vx) === Number(x) && Math.floor(vy) === Number(y)) return true;
+    const cx = Math.max(Number(x), Math.min(vx, Number(x) + 1));
+    const cy = Math.max(Number(y), Math.min(vy, Number(y) + 1));
+    return Math.hypot(vx - cx, vy - cy) < radius + 0.10;
+  } catch { return false; }
+}
+function twoNestEvacPoints(room, state, x, y) {
+  const mission = room && room.mission;
+  const map = mission && Array.isArray(mission.map) ? mission.map : [];
+  const h = map.length, w = h ? String(map[0] || "").length : 0;
+  const pts = [];
+  try { for (const g of (state.gather || [])) pts.push([Number(g[0]), Number(g[1])]); } catch {}
+  try { for (const k of (state.keep_open || [])) pts.push([Number(k[0]) + 0.5, Number(k[1]) + 0.5]); } catch {}
+  for (let r = 1; r <= 5; r++) {
+    for (let yy = Number(y) - r; yy <= Number(y) + r; yy++) {
+      for (let xx = Number(x) - r; xx <= Number(x) + r; xx++) {
+        if (xx <= 0 || yy <= 0 || xx >= w - 1 || yy >= h - 1) continue;
+        if (Math.abs(xx - Number(x)) !== r && Math.abs(yy - Number(y)) !== r) continue;
+        if (twoMapCell(map, xx, yy) !== "1") pts.push([xx + 0.5, yy + 0.5]);
+      }
+    }
+  }
+  pts.sort((a, b) => Math.hypot(a[0] - (Number(x) + 0.5), a[1] - (Number(y) + 0.5)) - Math.hypot(b[0] - (Number(x) + 0.5), b[1] - (Number(y) + 0.5)));
+  const seen = new Set(), out = [];
+  for (const p of pts) {
+    const key = p[0].toFixed(3) + "," + p[1].toFixed(3);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (twoMapCell(map, Math.floor(p[0]), Math.floor(p[1])) !== "1") out.push(p);
+  }
+  return out;
+}
+function twoNestEvacuateEnemy(room, state, e, x, y) {
+  for (const p of twoNestEvacPoints(room, state, x, y)) {
+    e.x = Math.round(Number(p[0]) * 1000) / 1000;
+    e.y = Math.round(Number(p[1]) * 1000) / 1000;
+    e.moving = false; e.stuckT = 0; e.avoidT = 0; e.avoidBias = 0;
+    return true;
+  }
+  return false;
+}
+function twoNestEvacuateFutureWallCell(room, state, x, y) {
+  for (const e of twoNestEnemiesInCell(room, x, y)) twoNestEvacuateEnemy(room, state, e, x, y);
+}
+function twoNestUnstickEnemiesFromWalls(room, state) {
+  try {
+    const enemies = room && room.mission && Array.isArray(room.mission.enemies) ? room.mission.enemies : [];
+    for (const e of enemies) {
+      if (!e || Number(e.hp || 1) <= 0) continue;
+      const cx = Math.floor(Number(e.x || 0)), cy = Math.floor(Number(e.y || 0));
+      if (twoMapCell(room.mission.map, cx, cy) === "1") twoNestEvacuateEnemy(room, state, e, cx, cy);
+    }
+  } catch {}
+}
+function twoNestBuildWallNow(room, state, map, x, y, cells, reason) {
+  try {
+    x = Number(x) | 0; y = Number(y) | 0;
+    const ent = twoNestEntranceCell(state);
+    if (ent && x === ent[0] && y === ent[1]) return false;
+    if (!twoNestPerimeterCell(state, x, y)) return false;
+    if (twoMapCell(map, x, y) === "1") {
+      if (!Array.isArray(state.built)) state.built = [];
+      if (!state.built.some(it => Number(it[0]) === x && Number(it[1]) === y)) state.built.push([x, y]);
+      twoRefreshBuildIndex(room, state);
+      return false;
+    }
+    if (twoNestVehicleInCell(room, x, y)) {
+      twoNestDebug(state, `deferred occupied wall ${x},${y}: tank in cell`);
+      return false;
+    }
+    twoNestEvacuateFutureWallCell(room, state, x, y);
+    if (!Array.isArray(state.built)) state.built = [];
+    if (!state.built.some(it => Number(it[0]) === x && Number(it[1]) === y)) state.built.push([x, y]);
+    if (twoSetMapCell(map, x, y, "1")) {
+      if (Array.isArray(cells)) cells.push([x, y, "1"]);
+      twoNestDebug(state, `${reason || "failsafe"} built wall ${x},${y} (${state.built.length}/${Array.isArray(state.build_cells) ? state.build_cells.length : 0})`);
+      twoNestUnstickEnemiesFromWalls(room, state);
+      twoRefreshBuildIndex(room, state);
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+function twoNestSealCompletedShell(room, state, map, cells, force = false) {
+  let changed = false;
+  try {
+    if (!state || !map || !map.length) return false;
+    twoNormalizeSingleEntrance(state);
+    const ent = twoNestEntranceCell(state);
+    const raw = [];
+    for (const src of [state.build_cells || [], state.built || []]) {
+      for (const it of (src || [])) {
+        const x = Number(it[0]) | 0, y = Number(it[1]) | 0;
+        if (ent && x === ent[0] && y === ent[1]) continue;
+        if (!twoNestPerimeterCell(state, x, y)) continue;
+        raw.push([x, y]);
+      }
+    }
+    const seen = new Set();
+    for (const it of raw) {
+      const x = Number(it[0]) | 0, y = Number(it[1]) | 0;
+      const k = `${x},${y}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      if (twoMapCell(map, x, y) !== "1") {
+        if (!force && twoNestVehicleInCell(room, x, y)) continue;
+        changed = twoNestBuildWallNow(room, state, map, x, y, cells, force ? "final-seal" : "seal") || changed;
+      }
+    }
+    for (const it of (state.keep_open || [])) {
+      const x = Number(it[0]) | 0, y = Number(it[1]) | 0;
+      if (twoSetMapCell(map, x, y, "0")) { if (Array.isArray(cells)) cells.push([x, y, "0"]); changed = true; }
+    }
+    state.ceiling = true;
+    twoNestUnstickEnemiesFromWalls(room, state);
+  } catch {}
+  return changed;
+}
+
+
+function twoNestPerimeterCell(state, x, y) {
+  try {
+    const a = (state && state.anchor) || {};
+    const cx = Number.isFinite(Number(a.cell_x)) ? Number(a.cell_x) : Math.floor(Number(a.x || 0));
+    const cy = Number.isFinite(Number(a.cell_y)) ? Number(a.cell_y) : Math.floor(Number(a.y || 0));
+    const r = Math.max(1, Number((state && state.radius) || 3) | 0);
+    x = Number(x) | 0; y = Number(y) | 0;
+    return x >= cx - r && x <= cx + r && y >= cy - r && y <= cy + r && (x === cx - r || x === cx + r || y === cy - r || y === cy + r);
+  } catch { return false; }
+}
+function twoNestEntranceCell(state) {
+  try {
+    const ent = (state && state.entrance) || {};
+    return [Number(ent.x || 0) | 0, Number(ent.y || 0) | 0];
+  } catch { return null; }
+}
+function twoNormalizeSingleEntrance(state) {
+  try {
+    const ent = twoNestEntranceCell(state);
+    if (!ent) return;
+    const keep = [], seen = new Set();
+    for (const it of (state.keep_open || [])) {
+      const x = Number(it[0]) | 0, y = Number(it[1]) | 0;
+      if (twoNestPerimeterCell(state, x, y) && (x !== ent[0] || y !== ent[1])) continue;
+      const key = `${x},${y}`;
+      if (!seen.has(key)) { seen.add(key); keep.push([x, y]); }
+    }
+    const ekey = `${ent[0]},${ent[1]}`;
+    if (!seen.has(ekey)) keep.push([ent[0], ent[1]]);
+    state.keep_open = keep;
+  } catch {}
+}
+function twoSyncNestBuildProgress(room, state) {
+  try {
+    const map = room && room.mission && Array.isArray(room.mission.map) ? room.mission.map : [];
+    if (!state || !map.length) return false;
+    twoNormalizeSingleEntrance(state);
+    const ent = twoNestEntranceCell(state);
+    const raw = [], seen = new Set();
+    for (const src of [state.build_cells || [], state.built || []]) {
+      for (const it of (src || [])) {
+        const x = Number(it[0]) | 0, y = Number(it[1]) | 0;
+        if (ent && x === ent[0] && y === ent[1]) continue;
+        if (!twoNestPerimeterCell(state, x, y)) continue;
+        const key = `${x},${y}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        raw.push([x, y]);
+      }
+    }
+    if (!raw.length) return false;
+    const built = [], remaining = [];
+    for (const it of raw) {
+      const x = Number(it[0]) | 0, y = Number(it[1]) | 0;
+      if (twoMapCell(map, x, y) === "1") built.push([x, y]);
+      else remaining.push([x, y]);
+    }
+    state.built = built;
+    state.build_cells = built.concat(remaining);
+    state.build_index = built.length;
+    if (remaining.length) {
+      state.phase = "building";
+      state.waiting_for_builder = remaining[0];
+      state.current_wall = remaining[0];
+      state.build_wait_t = 0;
+    } else {
+      state.phase = "built";
+      state.waiting_for_builder = null;
+      state.current_wall = null;
+    }
+    state.builder_ids = [];
+    state.builder_jobs = {};
+    return true;
+  } catch { return false; }
+}
+function twoResumeNestingForNewWave(room) {
+  try {
+    const state = twoEnsureNesting(room);
+    const mission = room && room.mission;
+    const map = mission && Array.isArray(mission.map) ? mission.map : [];
+    if (!state || !state.enabled || !map.length) return state;
+    if (String(state.phase || "waiting") === "building" || String(state.phase || "waiting") === "built") {
+      for (const it of state.keep_open || []) twoSetMapCell(map, Number(it[0]), Number(it[1]), "0");
+      twoPrepareNestChamber(room, state, []);
+    }
+    const resumed = twoSyncNestBuildProgress(room, state);
+    if (resumed && String(state.phase || "waiting") === "building") {
+      state.build_timer = Math.min(Number(state.build_timer || 0), Math.max(0.15, Number(state.interval || TWO_NEST_BUILD_INTERVAL_SEC)));
+      twoSelectReachableBuildCell(room, state);
+      twoNestBuilderIds(room, state);
+      twoAssignNestTargets(room, state);
+      const left = Math.max(0, (Array.isArray(state.build_cells) ? state.build_cells.length : 0) - (Number(state.build_index || 0) | 0));
+      twoNestDebug(state, `wave resume: ${(state.built || []).length} built, ${left} walls left; entrance locked`);
+    } else if (resumed) {
+      twoAssignNestTargets(room, state);
+      twoNestDebug(state, "wave resume: nest already built; garrison order renewed");
+    }
+    mission.nesting = state;
+    room.nesting = state;
+    return state;
+  } catch { return room && room.nesting; }
+}
+
+function twoUpdateNesting(room, dtSec) {
+  const state = twoEnsureNesting(room);
+  const mission = room && room.mission;
+  const map = mission && Array.isArray(mission.map) ? mission.map : [];
+  if (!state || !map.length) return null;
+  const cells = [];
+  let phaseChanged = false;
+  if (String(state.phase || "waiting") === "building" || String(state.phase || "waiting") === "built") twoNormalizeSingleEntrance(state);
+  state.timer = Number(state.timer || 0) + Math.max(0, Number(dtSec || 0));
+  if (String(state.phase || "waiting") === "waiting" && state.timer >= Number(state.delay || TWO_NEST_DELAY_SEC)) {
+    state.phase = "building";
+    state.ceiling = false;
+    state.build_timer = 0;
+    state.waiting_for_builder = null;
+    state.build_wait_t = 0;
+    twoNestDebug(state, "phase -> building; hive workers activated");
+    phaseChanged = true;
+  }
+  if (String(state.phase || "waiting") === "building" || String(state.phase || "waiting") === "built") {
+    for (const it of state.keep_open || []) {
+      if (twoSetMapCell(map, Number(it[0]), Number(it[1]), "0")) cells.push([Number(it[0]), Number(it[1]), "0"]);
+    }
+    twoPrepareNestChamber(room, state, cells);
+    twoNestUnstickEnemiesFromWalls(room, state);
+  }
+  twoAssignNestTargets(room, state);
+  if (String(state.phase || "waiting") === "building") {
+    twoSelectReachableBuildCell(room, state);
+    twoBuilderJobs(room, state);
+    state.build_timer = Number(state.build_timer || 0) + Math.max(0, Number(dtSec || 0));
+    const interval = Math.max(0.15, Number(state.interval || TWO_NEST_BUILD_INTERVAL_SEC));
+    while (state.build_timer >= interval) {
+      twoRefreshBuildIndex(room, state);
+      const remaining = twoRemainingBuildCells(room, state);
+      if (!remaining.length) {
+        twoNestSealCompletedShell(room, state, map, cells, true);
+        state.phase = "built";
+        state.ceiling = true;
+        state.waiting_for_builder = null;
+        state.builder_jobs = {};
+        state.current_wall = null;
+        state.current_work = null;
+        twoNestDebug(state, "phase -> built; garrison slots active");
+        phaseChanged = true;
+        break;
+      }
+      const jobs = twoBuilderJobs(room, state);
+      const vals = Object.entries(jobs || {});
+      if (!vals.length) {
+        state.waiting_for_builder = [Number(remaining[0][1]), Number(remaining[0][2])];
+        state.build_wait_t = Number(state.build_wait_t || 0) + Math.max(0, Number(dtSec || 0));
+        state.build_timer = Math.min(Number(state.build_timer || 0), interval);
+        if (Number(state.build_wait_t || 0) > 1.35) {
+          if (twoNestBuildWallNow(room, state, map, Number(remaining[0][1]), Number(remaining[0][2]), cells, "failsafe-no-builder")) {
+            state.build_wait_t = 0;
+            state.build_timer = Math.max(0, Number(state.build_timer || 0) - interval);
+            twoBuilderJobs(room, state);
+            twoAssignNestTargets(room, state);
+            continue;
+          }
+        }
+        twoNestDebug(state, "waiting: no reachable builder jobs");
+        break;
+      }
+      const ready = [];
+      for (const [key, job] of vals) {
+        const x = Number(job.wall[0]), y = Number(job.wall[1]);
+        if (twoMapCell(map, x, y) === "1") ready.push([Number(job.idx || 999999), Number(key), job, true]);
+        else if (twoBuilderReadyForJob(room, state, Number(key), job)) ready.push([Number(job.idx || 999999), Number(key), job, false]);
+      }
+      if (!ready.length) {
+        state.waiting_for_builder = [Number(remaining[0][1]), Number(remaining[0][2])];
+        state.build_wait_t = Number(state.build_wait_t || 0) + Math.max(0, Number(dtSec || 0));
+        state.build_timer = Math.min(Number(state.build_timer || 0), interval);
+        if (Number(state.build_wait_t || 0) > 1.10) {
+          state.builder_jobs = {};
+          twoSelectReachableBuildCell(room, state);
+          twoBuilderJobs(room, state);
+          twoAssignNestTargets(room, state);
+          twoNestDebug(state, "reassigned builders to reachable hive work points");
+        }
+        if (Number(state.build_wait_t || 0) > 1.65) {
+          if (twoNestBuildWallNow(room, state, map, Number(remaining[0][1]), Number(remaining[0][2]), cells, "failsafe-stalled-builder")) {
+            state.build_wait_t = 0;
+            state.build_timer = Math.max(0, Number(state.build_timer || 0) - interval);
+            twoBuilderJobs(room, state);
+            twoAssignNestTargets(room, state);
+            continue;
+          }
+        }
+        break;
+      }
+      ready.sort((a, b) => (Number(a[0]) - Number(b[0])) || (Number(a[1]) - Number(b[1])));
+      const builderKey = Number(ready[0][1]);
+      const job = ready[0][2];
+      const x = Number(job.wall[0]), y = Number(job.wall[1]);
+      state.build_timer -= interval;
+      state.waiting_for_builder = null;
+      state.build_wait_t = 0;
+      if (twoMapCell(map, x, y) === "1") {
+        if (!Array.isArray(state.built)) state.built = [];
+        if (!state.built.some(it => Number(it[0]) === x && Number(it[1]) === y)) state.built.push([x, y]);
+        twoRefreshBuildIndex(room, state);
+        continue;
+      }
+      twoNestEvacuateFutureWallCell(room, state, x, y);
+      if (twoNestVehicleInCell(room, x, y) || twoNestEnemiesInCell(room, x, y).length) {
+        twoNestDebug(state, `deferred occupied wall ${x},${y}`);
+        continue;
+      }
+      if (!Array.isArray(state.built)) state.built = [];
+      if (!state.built.some(it => Number(it[0]) === x && Number(it[1]) === y)) state.built.push([x, y]);
+      if (twoSetMapCell(map, x, y, "1")) { cells.push([x, y, "1"]); twoNestDebug(state, `builder ${builderKey} built wall ${x},${y} (${state.built.length}/${Array.isArray(state.build_cells) ? state.build_cells.length : 0})`); }
+      twoRefreshBuildIndex(room, state);
+      twoBuilderJobs(room, state);
+    }
+    twoAssignNestTargets(room, state);
+  }
+  if (String(state.phase || "waiting") === "built") {
+    if (twoNestSealCompletedShell(room, state, map, cells, false)) phaseChanged = true;
+    twoAssignNestTargets(room, state);
+  }
+  mission.nesting = state;
+  room.nesting = state;
+  if (!cells.length && !phaseChanged) return null;
+  return { cells, map, nesting: state };
+}
+
 function twoPointSegmentDistance(ax, ay, bx, by, px, py) {
   const vx = bx - ax, vy = by - ay;
   const denom = vx * vx + vy * vy;
@@ -2473,6 +3938,19 @@ function twoGridNearWall(map, x, y) {
   for (const [ox, oy] of dirs) if (!twoGridWalkable(map, gx + ox, gy + oy)) return true;
   return false;
 }
+function twoInsideActiveNestSpawnBlock(nesting, x, y) {
+  try {
+    if (!nesting || typeof nesting !== "object") return false;
+    const phase = String(nesting.phase || "");
+    if (phase !== "building" && phase !== "built") return false;
+    const a = (nesting.anchor && typeof nesting.anchor === "object") ? nesting.anchor : {};
+    const cx = Number.isFinite(Number(a.cell_x)) ? Number(a.cell_x) : Math.floor(Number(a.x || 0));
+    const cy = Number.isFinite(Number(a.cell_y)) ? Number(a.cell_y) : Math.floor(Number(a.y || 0));
+    const r = Math.max(1, Number(nesting.radius || 3) | 0);
+    return Math.abs((Number(x) | 0) - cx) <= r + 2 && Math.abs((Number(y) | 0) - cy) <= r + 2;
+  } catch { return false; }
+}
+
 function twoWaveSpawnCandidates(room) {
   const m = room && room.mission;
   const map = m && Array.isArray(m.map) ? m.map : [];
@@ -2483,6 +3961,7 @@ function twoWaveSpawnCandidates(room) {
   for (let y = 1; y < h - 1; y++) {
     for (let x = 1; x < w - 1; x++) {
       if (!twoGridWalkable(map, x, y)) continue;
+      if (twoInsideActiveNestSpawnBlock(m && m.nesting, x, y)) continue;
       const cx = x + 0.5, cy = y + 0.5;
       const d = Math.hypot(cx - px, cy - py);
       if (d < 8.25 || (x <= 7 && y <= 7)) continue; // never around the player picture/start area
@@ -2503,9 +3982,11 @@ const TOXIC_GREEN_HEX = "#75e398";
 function twoMarkEliteTrait(tr, eliteType) {
   tr = Object.assign({}, tr || {});
   tr.stats = Object.assign({}, tr.stats || {});
-  eliteType = (String(eliteType) === "lich") ? "lich" : "paladin";
+  const rawEliteType = String(eliteType || "").toLowerCase();
+  const isKingu = rawEliteType === "kingu";
+  eliteType = (rawEliteType === "lich" || rawEliteType === "kingu") ? "lich" : "paladin";
   tr.elite = true;
-  tr.elite_type = eliteType;
+  tr.elite_type = isKingu ? "kingu" : eliteType;
   tr.crit_immune = true;
   tr.aggro_immune = true;
   tr.rally_radius = 3.0;
@@ -2570,7 +4051,7 @@ function twoUpdateAcidStacks(v, dtSec) {
     rem -= tick;
     if (rem > 0) live.push({ total, remaining: rem, source: "acid" });
   }
-  if (dmg > 0) v.hp = clamp(Number(v.hp || 100) - dmg, 0, 100);
+  if (dmg > 0) v.hp = clamp(Number(v.hp || 100) - dmg, 0, Number(v.max_hp || 100));
   v.acid_stacks = live;
   return dmg;
 }
@@ -2584,8 +4065,8 @@ function twoSpawnWaveElite(room, level) {
   const pool = cands.slice(0, Math.max(12, Math.min(cands.length, 36)));
   const p = pool[Math.floor(Math.random() * pool.length)];
   let serial = Math.max(500, Number(mission.next_enemy_serial || 500) | 0) + 1;
-  const casterAlive = Array.isArray(mission.enemies) && mission.enemies.some(e => e && String(e.archetype || "") === "caster" && Number(e.hp || 0) > 0);
-  const eliteType = casterAlive ? "paladin" : (Math.random() < 0.35 ? "lich" : "paladin");
+  // Enemy 2 elite is reserved for Kingu. Regular half-wave elites are paladins only.
+  const eliteType = "paladin";
   let enemyId = eliteType === "lich" ? ((serial % 2 === 0) ? serial : serial + 1) : ((serial % 2 === 1) ? serial : serial + 1);
   const e = twoPrepareEnemy({ id: enemyId, x: Math.round(p.x * 1000) / 1000, y: Math.round(p.y * 1000) / 1000, elite: true, elite_type: eliteType, militia_delay: 0, enemy_level: level, enemy_wave: waveNo }, Math.random);
   mission.next_enemy_serial = enemyId + 1;
@@ -2658,6 +4139,7 @@ function twoSpawnNextWave(room, level) {
   mission.next_enemy_serial = serial + 1;
   mission.enemies = enemies;
   mission.wave_start_count = enemies.length;
+  try { twoResumeNestingForNewWave(room); } catch {}
   delete mission[`elite_wave_${waveNo}_rolled`];
   delete mission[`elite_wave_${waveNo}_spawned`];
   return enemies;
@@ -2715,14 +4197,14 @@ function twoCombatLog(room, text) {
   } catch (_) {}
 }
 function twoShotRollText(roll, enemy) {
-  const label = (enemy && enemy.elite ? "GEM " : "") + (String((enemy && enemy.archetype) || "") === "caster" ? "LICH" : "PAL");
+  const label = (enemy && (enemy.kingu || String(enemy.elite_type || "").toLowerCase() === "kingu")) ? "KINGU" : ((enemy && enemy.elite ? "GEM " : "") + (String((enemy && enemy.archetype) || "") === "caster" ? "LICH" : "PAL"));
   const total = Number(roll.d20 || 0) + Number(roll.attack_bonus || 0);
   if (roll.hit) return `SHOT${roll.crit ? " CRIT" : ""}: d20 ${roll.d20}+${roll.attack_bonus}=${total} vs AC ${roll.ac} ${label} -> HIT ${roll.damage}`;
   return `SHOT: d20 ${roll.d20}+${roll.attack_bonus}=${total} vs AC ${roll.ac} ${label} -> ${Number(roll.d20 || 0) === 1 ? "JAM" : "MISS"}`;
 }
 function twoResolveEnemyDamage(e, v) {
   const mode = String(e.attack_mode || "melee");
-  const label = (e && e.elite ? "GEM " : "") + (String(e.archetype || "") === "caster" ? "LICH" : "PAL");
+  const label = (e && (e.kingu || String(e.elite_type || "").toLowerCase() === "kingu")) ? "KINGU" : ((e && e.elite ? "GEM " : "") + (String(e.archetype || "") === "caster" ? "LICH" : "PAL"));
   if (mode === "wis_save") {
     const dc = Number(e.save_dc || 13);
     const bonus = Number(v.wis_save || 0);
@@ -2816,6 +4298,7 @@ function twoPrepareEnemy(e, rnd) {
     e.body_radius = TWO_ENEMY_RADIUS * 1.333;
     if (String(e.archetype) === "caster") e.acid_dot = true;
   }
+  if (e.kingu || String(e.elite_type || "").toLowerCase() === "kingu") twoApplyKinguBalance(e, e.kingu_stats || e.stats);
   e.attack_cooldown = Number(tr.cooldown);
   e.flank_bias = Number(tr.flank);
   e.flank_dir = Number(e.flank_dir || ((eid % 2) ? -1 : 1));
@@ -2838,6 +4321,9 @@ function twoPrepareEnemy(e, rnd) {
   e.lungeT = Number(e.lungeT || e.lunge_t || 0);
   e.castingT = Number(e.castingT || e.casting_t || 0);
   e.stuckT = Number(e.stuckT || 0);
+  if (e.aiPathReplanT === undefined || e.aiPathReplanT === null) {
+    e.aiPathReplanT = 0.035 + (Math.abs(eid) % 7) * 0.025 + ((rnd ? rnd() : Math.random()) * 0.035);
+  }
   return e;
 }
 const TWO_ENEMY_RADIUS = 0.32;
@@ -2889,6 +4375,7 @@ function twoEnemyBodyClear(room, e, nx, ny, enemies, vehicle) {
 
   for (const o of (enemies || [])) {
     if (!o || o === e || Number(o.hp || 1) <= 0) continue;
+    if (twoSameNestDoorway(e, o) || twoSameActiveNestSpace(e, o)) continue;
     const ox = Number(o.x || ex), oy = Number(o.y || ey);
     const orad = Number(o.body_radius || TWO_ENEMY_RADIUS);
     const minD = radius + orad + 0.08;
@@ -2916,6 +4403,7 @@ function twoBodyPressureScore(e, nx, ny, enemies, vehicle) {
   if (pd < pmin + 0.85) score -= (pmin + 0.85 - pd) * 4.5;
   for (const o of enemies || []) {
     if (!o || o === e || Number(o.hp || 1) <= 0) continue;
+    if (twoSameNestDoorway(e, o) || twoSameActiveNestSpace(e, o)) continue;
     const d = Math.hypot(nx - Number(o.x || nx), ny - Number(o.y || ny));
     const minD = radius + Number(o.body_radius || TWO_ENEMY_RADIUS) + 0.14;
     if (d < minD + 0.90) score -= (minD + 0.90 - d) * 5.25;
@@ -3075,6 +4563,13 @@ function twoSpawnMission(room, campaignReq = null, level = 1) {
       flank_dir: ((i % 2) ? 1 : -1)
     }, rnd));
   }
+  const isKinguStage = !!(campaign && (Number(campaign.stage || -1) === 5 || campaign.final));
+  if (isKinguStage) {
+    const ks = twoKinguStatsFromParty(room);
+    const kp = twoFindOpen(map, rnd, target.x, target.y);
+    const rawKingu = { id: 9002, x: Math.round(kp.x * 1000) / 1000, y: Math.round(kp.y * 1000) / 1000, elite: true, elite_type: "kingu", kingu: true, kingu_stats: ks, militia_delay: 0, enemy_level: level || 20, enemy_wave: 1 };
+    enemies.push(twoApplyKinguBalance(twoPrepareEnemy(rawKingu, rnd), ks));
+  }
   const flashliteWeather = (rnd() < 0.5) ? "NIGHT" : "EVENING";
   room.mission = {
     id: (campaign ? ("CAMPAIGN-" + campaign.stage + "-" + String(seed >>> 0)) : ("NEST-" + String(seed >>> 0))), seed, code,
@@ -3092,7 +4587,10 @@ function twoSpawnMission(room, campaignReq = null, level = 1) {
     enemies,
     complete: false
   };
-  room.vehicle = { x: 2.5, y: 2.5, a: 0, hp: 100 };
+  twoSharedInfectedTree(room.mission);
+  room.nesting = null;
+  twoEnsureNesting(room);
+  room.vehicle = { x: 2.5, y: 2.5, a: 0, hp: 100, max_hp: 100 };
   room.buffPickups = [];
   room.activeBuffs = [];
   room.started = false;
@@ -3122,10 +4620,7 @@ function twoHandle(ws, payloadStr) {
     const meta = room.clients.get(ws) || { ws, id, name: desired, sprite: 1, x: 250, y: 190, dir: "down", moving: false };
     meta.ws = ws; meta.id = id; meta.name = desired; meta.sprite = clamp(Number(m.sprite || meta.sprite || 1), 1, 4);
     if (m.dnd5e && typeof m.dnd5e === "object") {
-      meta.dnd5e = {
-        level: clamp(Number(m.dnd5e.level || 1), 1, 20),
-        ac: clamp(Math.round(Number(m.dnd5e.ac || m.dnd5e.tank_ac || 16)), 10, 25)
-      };
+      twoStoreDndPayload(meta, m.dnd5e, 1);
     }
     room.clients.set(ws, meta);
     ws._twoId = id;
@@ -3156,10 +4651,7 @@ function twoHandle(ws, payloadStr) {
     meta.sprite = clamp(Number(m.sprite || meta.sprite || 1), 1, 4);
     if (m.name != null) meta.name = String(m.name || meta.name || meta.id).replace(/\s+/g, " ").trim().slice(0, 20) || meta.id;
     if (m.dnd5e && typeof m.dnd5e === "object") {
-      meta.dnd5e = {
-        level: clamp(Number(m.dnd5e.level || (meta.dnd5e && meta.dnd5e.level) || 1), 1, 20),
-        ac: clamp(Math.round(Number(m.dnd5e.ac || m.dnd5e.tank_ac || (meta.dnd5e && meta.dnd5e.ac) || 16)), 10, 25)
-      };
+      twoStoreDndPayload(meta, m.dnd5e, (meta.dnd5e && meta.dnd5e.level) || 1);
     }
     twoSyncLobby(room);
     return;
@@ -3184,19 +4676,22 @@ function twoHandle(ws, payloadStr) {
     return;
   }
   if (t === "mission_request") {
+    if (m.dnd5e && typeof m.dnd5e === "object") twoStoreDndPayload(meta, m.dnd5e, m.level || 1);
     const partyLevelForSpawn = twoSharedMissionLevel(room, Number(m.level || 1));
     const mission = (room.mission && twoMissionMatchesCampaign(room.mission, m.campaign)) ? room.mission : twoSpawnMission(room, m.campaign, partyLevelForSpawn);
-    twoBroadcast(room, { t: "mission", mission, ts: Date.now() });
+    room.mission = mission;
+    twoEnsureKinguForMission(room);
+    twoBroadcast(room, { t: "mission", mission: room.mission, ts: Date.now() });
     return;
   }
   if (t === "launch") {
     const partyLevelForSpawn = twoSharedMissionLevel(room, Number(m.level || 1));
     const mission = (room.mission && twoMissionMatchesCampaign(room.mission, m.campaign)) ? room.mission : twoSpawnMission(room, m.campaign, partyLevelForSpawn);
+    room.mission = mission;
+    twoEnsureKinguForMission(room);
     if (m.dnd5e && typeof m.dnd5e === "object") {
-      meta.dnd5e = {
-        level: clamp(Number(m.dnd5e.level || m.level || 1), 1, 20),
-        ac: clamp(Math.round(Number(m.dnd5e.ac || m.dnd5e.tank_ac || 16)), 10, 25)
-      };
+      twoStoreDndPayload(meta, m.dnd5e, m.level || 1);
+      twoEnsureKinguForMission(room);
     }
     twoAutoAssignRolesForLaunch(room, meta.id);
     const partyLevel = twoSharedMissionLevel(room, Number(m.level || 1));
@@ -3204,11 +4699,23 @@ function twoHandle(ws, payloadStr) {
     if (Array.isArray(mission.enemies)) mission.wave_start_count = mission.enemies.length;
     room.buffPickups = [];
     room.activeBuffs = [];
+    const selectedGarage = twoSharedGarage(room);
+    room.mainGarage = selectedGarage;
+    room.mainGarageOwnerId = selectedGarage ? String(selectedGarage.owner_id || "") : null;
+    const maxHull = twoSharedTankMaxHull(room, 100);
     const sharedAC = twoSharedTankACBuffed(room, 16);
     room.started = true;
-    room.vehicle = { x: 2.5, y: 2.5, a: 0, hp: 100, ac: sharedAC, tank_ac: sharedAC, shared_tank_ac: true };
+    room.nesting = null;
+    room.vehicle = { x: 2.5, y: 2.5, a: 0, hp: maxHull, max_hp: maxHull, ac: sharedAC, tank_ac: sharedAC, shared_tank_ac: true, shared_garage: selectedGarage, body_radius: TWO_TANK_RADIUS };
+    twoEnsureNesting(room);
+    if (selectedGarage) {
+      twoBroadcast(room, { t: "chat", from: "GARAGE", name: "GARAGE", text: `Using ${selectedGarage.owner_name}'s tank tree (${selectedGarage.node_count || 0} nodes) as the main mission tree.`, ts: Date.now() });
+    }
     for (const [ows, ometa] of room.clients.entries()) {
-      twoSend(ows, { t: "start", mission, vehicle: room.vehicle, roles: room.roles, role: twoRoleForId(room, ometa.id), id: ometa.id, ts: Date.now() });
+      twoSend(ows, { t: "start", mission, vehicle: room.vehicle, garage: selectedGarage, roles: room.roles, role: twoRoleForId(room, ometa.id), id: ometa.id, ts: Date.now() });
+    }
+    if (room.nesting && room.nesting.enabled) {
+      twoBroadcast(room, { t: "nest_update", cells: [], map: room.mission.map, nesting: room.nesting, ts: Date.now() });
     }
     twoSendRoleSync(room);
     twoSyncLobby(room);
@@ -3226,14 +4733,17 @@ function twoHandle(ws, payloadStr) {
     else if (twoVehicleCanStand(room, oldX, wantY, oldX, oldY)) finalY = wantY;
     twoPruneBuffs(room);
     const sharedAC = twoSharedTankACBuffed(room, room.vehicle.ac || 16);
+    const maxHull = Number(room.vehicle.max_hp || twoSharedTankMaxHull(room, 100) || 100);
     room.vehicle = {
       x: finalX,
       y: finalY,
       a: clamp(Number(v.a != null ? v.a : room.vehicle.a), -999999, 999999),
-      hp: clamp(Number(v.hp != null ? v.hp : room.vehicle.hp), 0, 100),
+      hp: clamp(Number(v.hp != null ? v.hp : room.vehicle.hp), 0, maxHull),
+      max_hp: maxHull,
       ac: sharedAC,
       tank_ac: sharedAC,
       shared_tank_ac: true,
+      shared_garage: room.mainGarage || room.vehicle.shared_garage || null,
       body_radius: TWO_TANK_RADIUS
     };
     twoCheckBuffPickup(room);
@@ -3275,10 +4785,12 @@ function twoHandle(ws, payloadStr) {
       const shotRoll = twoResolveShotDamage(shotDnd, e);
       twoCombatLog(room, twoShotRollText(shotRoll, e));
       if (!shotRoll.hit) {
-        twoBroadcast(room, { t: "enemy_update", enemies: [{ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, miss: true }], ts: Date.now() });
+        twoAlertEnemyUnderFire(e, sx, sy);
+        twoBroadcast(room, { t: "enemy_update", enemies: [{ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, miss: true, brain: e.brain, tactic: e.tactic, shot_react_t: e.shotReactT, debug_thought: e.debug_thought }], ts: Date.now() });
         return;
       }
       e.hp = (e.hp | 0) - Math.max(1, shotRoll.damage | 0);
+      twoAlertEnemyUnderFire(e, sx, sy);
       if (e.hp <= 0) {
         const dead = room.mission.enemies.splice(bestIdx, 1)[0];
         twoBroadcast(room, { t: "enemy_remove", id: dead.id, by: meta.id, ts: Date.now() });
@@ -3295,6 +4807,7 @@ function twoHandle(ws, payloadStr) {
             const wv = room.mission.waves || {};
             twoBroadcast(room, { t: "chat", from: "COMMAND", name: "COMMAND", text: `Wave ${Number(wv.current || 1)}/${Number(wv.total || 1)} entering from elsewhere on the map.`, ts: Date.now() });
             twoBroadcast(room, { t: "enemies", enemies: room.mission.enemies, waves: room.mission.waves, ts: Date.now() });
+            if (room.nesting && room.nesting.enabled) twoBroadcast(room, { t: "nest_update", cells: [], map: room.mission.map, nesting: room.nesting, ts: Date.now() });
             twoBroadcast(room, { t: "buff_state", pickups: room.buffPickups || [], active: room.activeBuffs || [], ts: Date.now() });
           } else {
             room.started = false;
@@ -3303,10 +4816,11 @@ function twoHandle(ws, payloadStr) {
             room.mission = null;
             room.buffPickups = [];
             room.activeBuffs = [];
+            room.nesting = null;
           }
         }
       } else {
-        twoBroadcast(room, { t: "enemy_update", enemies: [{ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, lunge_t: e.lungeT, casting_t: e.castingT, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot }], ts: Date.now() });
+        twoBroadcast(room, { t: "enemy_update", enemies: [{ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, lunge_t: e.lungeT, casting_t: e.castingT, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot, brain: e.brain, tactic: e.tactic, ai_goal: e.aiGoal, ai_waypoint_x: e.aiWaypointX, ai_waypoint_y: e.aiWaypointY, nest_mode: e.nest_mode, nest_builder: e.nest_builder, nest_tx: e.nest_tx, nest_ty: e.nest_ty, hive_job: e.hive_job, hive_target: e.hive_target, debug_thought: e.debug_thought }], ts: Date.now() });
       }
     }
     return;
@@ -3318,11 +4832,13 @@ function twoHandle(ws, payloadStr) {
 }
 function twoTickRoom(room, dt) {
   if (!room || !room.started || !room.mission || !Array.isArray(room.mission.enemies)) return;
-  const v = room.vehicle || { x: 2.5, y: 2.5, hp: 100 };
+  const v = room.vehicle || { x: 2.5, y: 2.5, hp: 100, max_hp: twoSharedTankMaxHull(room, 100) };
+  v.max_hp = Number(v.max_hp || twoSharedTankMaxHull(room, 100) || 100);
+  v.shared_garage = room.mainGarage || v.shared_garage || null;
   const dtSec = Math.max(0.001, Math.min(0.09, Number(dt || 80) / 1000));
   twoPruneBuffs(room);
   const regen = twoActiveBuffCount(room, 2);
-  if (regen > 0) v.hp = clamp(Number(v.hp || 100) + 0.1 * regen * dtSec, 0, 100);
+  if (regen > 0) v.hp = clamp(Number(v.hp || v.max_hp || 100) + (Number(v.max_hp || 100) * 0.0015) * regen * dtSec, 0, Number(v.max_hp || 100));
   const acidDamage = twoUpdateAcidStacks(v, dtSec);
   twoApplyRally(room);
   v.ac = twoSharedTankACBuffed(room, v.ac || 16);
@@ -3330,9 +4846,17 @@ function twoTickRoom(room, dt) {
   v.shared_tank_ac = true;
   const moved = [];
   let damaged = acidDamage > 0;
+  const nestUpdate = twoUpdateNesting(room, dtSec);
+  if (nestUpdate) twoBroadcast(room, { t: "nest_update", cells: nestUpdate.cells, map: nestUpdate.map, nesting: nestUpdate.nesting, ts: Date.now() });
 
   for (let idx = 0; idx < room.mission.enemies.length; idx++) {
     const e = twoPrepareEnemy(room.mission.enemies[idx]);
+    twoEnsureEnemyMind(e, idx);
+    e.aiDecideT = Math.max(0, Number(e.aiDecideT || 0) - dtSec);
+    e.nestRepathT = Math.max(0, Number(e.nestRepathT || 0) - dtSec);
+    e.aiPathReplanT = Math.max(0, Number(e.aiPathReplanT || 0) - dtSec);
+    e.shotReactT = Math.max(0, Number(e.shotReactT || 0) - dtSec);
+    const shotReact = Number(e.shotReactT || 0) > 0;
     const ex = Number(e.x || 0), ey = Number(e.y || 0);
     const px = Number(v.x || 2.5), py = Number(v.y || 2.5);
     const dx = px - ex, dy = py - ey;
@@ -3347,8 +4871,13 @@ function twoTickRoom(room, dt) {
     const aggro = Number(v.aggro_range || 8.5);
     const closeVisible = !!(visible && dist <= (isCaster ? Math.max(2.10, Number(e.attack_range || 0.74) * 0.38) : Math.max(2.85, meleeAttackRange + 1.15)));
     const alreadyHurt = Number(e.hp || 1) < Number(e.max_hp || e.hp || 1);
+    const nestMode = String(e.nest_mode || "");
+    const nestHasTarget = (nestMode === "building" || nestMode === "built") && Number.isFinite(Number(e.nest_tx)) && Number.isFinite(Number(e.nest_ty));
+    const nestInterruptRange = nestMode === "building" ? Math.max(1.55, meleeAttackRange + 0.55) : Math.max(4.2, meleeAttackRange + 2.2);
+    const nestInterrupt = !!(nestHasTarget && ((visible && dist <= nestInterruptRange) || shotReact));
+    const nestHardOrder = !!(nestHasTarget && !nestInterrupt);
 
-    if (visible && (dist <= aggro || closeVisible || alreadyHurt)) {
+    if (shotReact || ((!nestHardOrder) && visible && (dist <= aggro || closeVisible || alreadyHurt))) {
       // CHA / aggro only lowers the first trigger radius.  Close, wounded, or
       // already-engaged vampires keep hunting and never freeze in front of the tank.
       e.lastX = px;
@@ -3358,6 +4887,14 @@ function twoTickRoom(room, dt) {
     } else {
       e.smellT = Math.max(0, Number(e.smellT || 0) - dtSec);
       e.engagedT = Math.max(0, Number(e.engagedT || 0) - dtSec);
+      e.alertT = Math.max(0, Number(e.alertT || 0) - dtSec * 0.24);
+      const signal = twoAllyAlertSignal(e, room.mission.enemies);
+      if (signal) {
+        e.lastX = signal.x;
+        e.lastY = signal.y;
+        e.smellT = Math.max(Number(e.smellT || 0), Math.max(0.65, 2.10 - signal.d * 0.16));
+        e.alertT = Math.max(Number(e.alertT || 0), Math.max(0.12, Math.min(1.15, 0.72 - signal.d * 0.055)));
+      }
     }
     e.attackT = Math.max(0, Number(e.attackT || 0) - dtSec);
     e.lungeT = Math.max(0, Number(e.lungeT || 0) - dtSec);
@@ -3386,7 +4923,7 @@ function twoTickRoom(room, dt) {
     const effectiveAttackRange = isCaster ? Number(e.attack_range || 0.74) : meleeAttackRange;
     const castBlocker = (isCaster && visible && dist <= effectiveAttackRange) ? twoCastLineBlocker(e, room.mission.enemies, px, py) : null;
     if (castBlocker) { e.castBlockedT = Math.max(Number(e.castBlockedT || 0), 0.55); e.brain = "lich-reposition-cast-lane"; }
-    if (visible && dist <= effectiveAttackRange && hasCharge && (!isCaster || !castBlocker)) {
+    if ((!nestHardOrder) && visible && dist <= effectiveAttackRange && hasCharge && (!isCaster || !castBlocker)) {
       if (e.attackT <= 0) {
         let atkResult = twoResolveEnemyDamage(e, v);
         twoCombatLog(room, atkResult.text);
@@ -3397,7 +4934,7 @@ function twoTickRoom(room, dt) {
           damaged = true;
         }
         if (dmg > 0) {
-          v.hp = clamp(Number(v.hp || 100) - dmg, 0, 100);
+          v.hp = clamp(Number(v.hp || v.max_hp || 100) - dmg, 0, Number(v.max_hp || 100));
           damaged = true;
         }
         e.attackT = Number(e.attack_cooldown || 0.45) * (0.82 + Math.random() * 0.34);
@@ -3411,13 +4948,24 @@ function twoTickRoom(room, dt) {
           e.lungeT = 0.16;
         }
       }
-      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: false, lunge_t: e.lungeT, casting_t: e.castingT, cast: didCast, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot });
+      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: false, lunge_t: e.lungeT, casting_t: e.castingT, cast: didCast, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot, brain: e.brain, tactic: e.tactic, ai_goal: e.aiGoal, ai_waypoint_x: e.aiWaypointX, ai_waypoint_y: e.aiWaypointY, nest_mode: e.nest_mode, nest_builder: e.nest_builder, nest_tx: e.nest_tx, nest_ty: e.nest_ty, hive_job: e.hive_job, hive_target: e.hive_target, debug_thought: e.debug_thought });
       if (!isCaster || dist >= Math.max(1.0, Number(e.prefer_range || 0) * 0.65)) continue;
     }
 
     let tx, ty;
     const aggroMove = Number(v.aggro_range || 8.5);
-    if (visible && (dist <= aggroMove || closeVisible || Number(e.engagedT || 0) > 0)) {
+    const nestOrder = nestHardOrder;
+    if (nestOrder) {
+      tx = Number(e.nest_tx); ty = Number(e.nest_ty);
+      e.brain = String(e.nest_mode || "") === "building" ? "nest-builder" : "nest-garrison-hold";
+      if (Number(e.nestRepathT || 0) > 0 && Number.isFinite(Number(e.nestRepathX)) && Number.isFinite(Number(e.nestRepathY))) {
+        const rx = Number(e.nestRepathX), ry = Number(e.nestRepathY);
+        if (Math.hypot(rx - ex, ry - ey) > Math.max(0.34, Number(e.body_radius || TWO_ENEMY_RADIUS) * 0.95)) {
+          tx = rx; ty = ry; e.brain = "nest-reroute"; e.tactic = "hive-repath";
+        } else { e.nestRepathT = 0; }
+      }
+    }
+    else if (shotReact || (visible && (dist <= aggroMove || closeVisible || Number(e.engagedT || 0) > 0))) {
       if (dist < contactStop) {
         const awayX = (ex - px) / dist, awayY = (ey - py) / dist;
         tx = ex + awayX * 1.20; ty = ey + awayY * 1.20;
@@ -3442,7 +4990,8 @@ function twoTickRoom(room, dt) {
           ty = ey + (dx / dist) * side * 0.95;
         }
       } else {
-        tx = px; ty = py;
+        const plan = twoPaladinTacticalTarget(room, e, ex, ey, px, py, dist, visible, meleeAttackRange);
+        tx = plan.x; ty = plan.y; e.brain = plan.brain; e.tactic = plan.tactic;
       }
     }
     else if (Number(e.smellT || 0) > 0 && Number.isFinite(e.lastX) && Number.isFinite(e.lastY)) { tx = e.lastX; ty = e.lastY; e.brain = "investigate"; }
@@ -3450,31 +4999,45 @@ function twoTickRoom(room, dt) {
       // No idle orbit/jiggle.  If the vampire has no line-of-sight, scent trail,
       // attack, or regroup objective, it holds position like a predator.
       e.brain = isCaster ? "lich-command-hold" : "paladin-sentry-hold";
-      e.avoidT = 0;
-      e.avoidBias = 0;
-      e.stuckT = 0;
-      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: false, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot });
+      twoSnapIdleEnemy(e, ex, ey);
+      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: false, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot, brain: e.brain, tactic: e.tactic, ai_goal: e.aiGoal, ai_waypoint_x: e.aiWaypointX, ai_waypoint_y: e.aiWaypointY, nest_mode: e.nest_mode, nest_builder: e.nest_builder, nest_tx: e.nest_tx, nest_ty: e.nest_ty, hive_job: e.hive_job, hive_target: e.hive_target, debug_thought: e.debug_thought });
       continue;
     }
 
+    const awareMove = !!(shotReact || (visible && (dist <= aggroMove || closeVisible || Number(e.engagedT || 0) > 0)) || Number(e.smellT || 0) > 1.9 || Number(e.alertT || 0) > 0.55);
+    const forceGoal = !!((nestOrder && String(e.nest_mode || "") === "building") || (awareMove && visible && dist <= Math.max(5.0, meleeAttackRange + 1.15)) || (e.elite && visible));
+    const committed = twoCommitEnemyGoal(e, tx, ty, e.brain || "move", e.tactic || "move", forceGoal);
+    if (!committed) {
+      twoSnapIdleEnemy(e, ex, ey);
+      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: false, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot, brain: e.brain, tactic: e.tactic, ai_goal: e.aiGoal, ai_waypoint_x: e.aiWaypointX, ai_waypoint_y: e.aiWaypointY, nest_mode: e.nest_mode, nest_builder: e.nest_builder, nest_tx: e.nest_tx, nest_ty: e.nest_ty, hive_job: e.hive_job, hive_target: e.hive_target, debug_thought: e.debug_thought });
+      continue;
+    }
+    tx = committed.x; ty = committed.y;
     const targetDist = Math.hypot(tx - ex, ty - ey);
-    if (targetDist <= Math.max(0.075, Number(e.body_radius || TWO_ENEMY_RADIUS) * 0.22)) {
-      e.stuckT = 0;
-      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: false, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot });
+    if (targetDist <= twoArriveRadius(e, nestOrder, awareMove)) {
+      twoSnapIdleEnemy(e, ex, ey);
+      e.aiPathCells = [];
+      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: false, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot, brain: e.brain, tactic: e.tactic, ai_goal: e.aiGoal, ai_waypoint_x: e.aiWaypointX, ai_waypoint_y: e.aiWaypointY, nest_mode: e.nest_mode, nest_builder: e.nest_builder, nest_tx: e.nest_tx, nest_ty: e.nest_ty, hive_job: e.hive_job, hive_target: e.hive_target, debug_thought: e.debug_thought });
       continue;
     }
 
-    let vx = tx - ex, vy = ty - ey;
-    let mag = targetDist || 1;
+    const pathForce = !!((nestOrder && String(e.nest_mode || "") === "building") || (!visible && awareMove) || Number(e.stuckT || 0) > 0.08);
+    const wp = twoHiveWaypointForGoal(room, e, ex, ey, tx, ty, v, pathForce);
+    const moveTx = Number(wp.x), moveTy = Number(wp.y);
+    let vx = moveTx - ex, vy = moveTy - ey;
+    let mag = Math.hypot(vx, vy) || 1;
     vx /= mag; vy /= mag;
 
     let sepX = 0, sepY = 0;
-    for (let j = 0; j < room.mission.enemies.length; j++) {
-      if (j === idx) continue;
-      const o = room.mission.enemies[j];
-      const ox = ex - Number(o.x || ex), oy = ey - Number(o.y || ey);
-      const od = Math.hypot(ox, oy);
-      if (od > 0.001 && od < TWO_ENEMY_ENEMY_STANDOFF) { sepX += ox / od * (TWO_ENEMY_ENEMY_STANDOFF - od); sepY += oy / od * (TWO_ENEMY_ENEMY_STANDOFF - od); }
+    if (targetDist > Math.max(0.42, Number(e.body_radius || TWO_ENEMY_RADIUS) * 1.15)) {
+      for (let j = 0; j < room.mission.enemies.length; j++) {
+        if (j === idx) continue;
+        const o = room.mission.enemies[j];
+        if (!o || Number(o.hp || 1) <= 0 || twoSameNestDoorway(e, o) || twoSameActiveNestSpace(e, o)) continue;
+        const ox = ex - Number(o.x || ex), oy = ey - Number(o.y || ey);
+        const od = Math.hypot(ox, oy);
+        if (od > 0.001 && od < TWO_ENEMY_ENEMY_STANDOFF) { sepX += ox / od * (TWO_ENEMY_ENEMY_STANDOFF - od); sepY += oy / od * (TWO_ENEMY_ENEMY_STANDOFF - od); }
+      }
     }
 
     const fd = Number(e.flank_dir || 1) < 0 ? -1 : 1;
@@ -3482,7 +5045,8 @@ function twoTickRoom(room, dt) {
     let flank = Number(e.flank_bias || 0.5) * (visible ? 1.0 : 1.45) * (wounded && !isCaster ? 1.08 : 1.0);
     // First-person view fix: visible melee enemies should advance straight at the tank,
     // not diagonally strafe while the minimap path reads as direct.
-    if (!isCaster && visible && (dist <= Number(v.aggro_range || 8.5) || closeVisible || Number(e.engagedT || 0) > 0)) flank = 0;
+    if (nestOrder) flank = 0;
+    else if (!isCaster && visible && (dist <= Number(v.aggro_range || 8.5) || closeVisible || Number(e.engagedT || 0) > 0)) flank = 0;
     if (isCaster) flank *= 0.90;
     const lx = -vy * fd * flank, ly = vx * fd * flank;
     let mx = vx + lx + sepX * 1.7, my = vy + ly + sepY * 1.7;
@@ -3497,30 +5061,56 @@ function twoTickRoom(room, dt) {
     if (Number(e.avoidT || 0) > 0) e.avoidT = Math.max(0, Number(e.avoidT || 0) - dtSec);
     else e.avoidBias = 0;
     const step = speed * dtSec;
-    let ok = twoSteeredMove(room, e, ex, ey, mx, my, step, tx, ty, room.mission.enemies, v);
+    let ok = twoSteeredMove(room, e, ex, ey, mx, my, step, moveTx, moveTy, room.mission.enemies, v);
+    if (ok && Math.hypot(Number(e.x || ex) - ex, Number(e.y || ey) - ey) < 0.024) { e.x = Math.round(ex * 1000) / 1000; e.y = Math.round(ey * 1000) / 1000; ok = false; }
     if (!ok) {
       if (!isCaster && visible && dist > meleeAttackRange + 0.18) {
         const dxp = (px - ex) / (dist || 1), dyp = (py - ey) / (dist || 1);
         if (twoMoveEnemy(room, e, ex + dxp * step, ey + dyp * step, [], v)) {
           e.stuckT = 0;
-          moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: true, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot });
+          moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: true, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot, brain: e.brain, tactic: e.tactic, ai_goal: e.aiGoal, ai_waypoint_x: e.aiWaypointX, ai_waypoint_y: e.aiWaypointY, nest_mode: e.nest_mode, nest_builder: e.nest_builder, nest_tx: e.nest_tx, nest_ty: e.nest_ty, hive_job: e.hive_job, hive_target: e.hive_target, debug_thought: e.debug_thought });
           continue;
         }
       }
       e.stuckT = Number(e.stuckT || 0) + dtSec;
+      if (!awareMove && !nestOrder) twoSnapIdleEnemy(e, ex, ey);
       if (!isCaster && visible && dist <= meleeAttackRange + 0.18 && e.attackT <= 0) {
         const atkResult = twoResolveEnemyDamage(e, v);
         twoCombatLog(room, atkResult.text);
         const dmg = Number(atkResult.damage || 0);
-        if (dmg > 0) { v.hp = clamp(Number(v.hp || 100) - dmg, 0, 100); damaged = true; }
+        if (dmg > 0) { v.hp = clamp(Number(v.hp || v.max_hp || 100) - dmg, 0, Number(v.max_hp || 100)); damaged = true; }
         e.attackT = Number(e.attack_cooldown || 0.45) * (0.82 + Math.random() * 0.34);
         e.lungeT = 0.16;
       }
-      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: false, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot });
-      if (e.stuckT > 0.18) { e.flank_dir = -fd; e.stuckT = 0; }
+      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: false, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot, brain: e.brain, tactic: e.tactic, ai_goal: e.aiGoal, ai_waypoint_x: e.aiWaypointX, ai_waypoint_y: e.aiWaypointY, nest_mode: e.nest_mode, nest_builder: e.nest_builder, nest_tx: e.nest_tx, nest_ty: e.nest_ty, hive_job: e.hive_job, hive_target: e.hive_target, debug_thought: e.debug_thought });
+      if (!nestOrder && e.stuckT > 0.18) {
+        const alt = twoNestRepathGoal(room, e, ex, ey, tx, ty);
+        if (alt) {
+          e.aiGoal = "combat-reroute"; e.aiGoalX = alt.x; e.aiGoalY = alt.y;
+          e.aiDecideT = Math.max(Number(e.aiDecideT || 0), 0.42);
+          e.aiPathCells = [];
+          e.brain = "hive-combat-reroute"; e.tactic = "repath";
+          e.avoidBias = Number(e.avoidBias || 0) > 0 ? -1 : 1; e.avoidT = 0.45;
+        } else {
+          e.flank_dir = -fd;
+        }
+        e.stuckT = 0;
+      }
+      else if (nestOrder && e.stuckT > 0.30) {
+        const alt = twoNestRepathGoal(room, e, ex, ey, tx, ty);
+        if (alt) {
+          e.nestRepathX = alt.x; e.nestRepathY = alt.y; e.nestRepathT = 0.95;
+          e.aiGoal = "nest-reroute"; e.aiGoalX = alt.x; e.aiGoalY = alt.y;
+          e.aiDecideT = Math.max(Number(e.aiDecideT || 0), 0.38);
+          e.avoidBias = Number(e.avoidBias || 0) > 0 ? -1 : 1; e.avoidT = 0.55;
+        } else {
+          e.flank_dir = -fd; e.avoidBias = Number(e.avoidBias || 0) > 0 ? -1 : 1; e.avoidT = 0.65;
+        }
+        e.stuckT = 0;
+      }
     } else {
       e.stuckT = 0;
-      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: true, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot });
+      moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: true, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot, brain: e.brain, tactic: e.tactic, ai_goal: e.aiGoal, ai_waypoint_x: e.aiWaypointX, ai_waypoint_y: e.aiWaypointY, nest_mode: e.nest_mode, nest_builder: e.nest_builder, nest_tx: e.nest_tx, nest_ty: e.nest_ty, hive_job: e.hive_job, hive_target: e.hive_target, debug_thought: e.debug_thought });
     }
   }
   if (moved.length) twoBroadcast(room, { t: "enemy_update", enemies: moved, ts: Date.now() });
@@ -3535,7 +5125,10 @@ function twoTickRoom(room, dt) {
     room.mission = null;
     room.buffPickups = [];
     room.activeBuffs = [];
-    room.vehicle = { x: 2.5, y: 2.5, a: 0, hp: 100, ac: v.ac || 16, tank_ac: v.tank_ac || v.ac || 16, shared_tank_ac: true, body_radius: TWO_TANK_RADIUS };
+    room.nesting = null;
+    room.vehicle = { x: 2.5, y: 2.5, a: 0, hp: 100, max_hp: 100, ac: v.ac || 16, tank_ac: v.tank_ac || v.ac || 16, shared_tank_ac: true, body_radius: TWO_TANK_RADIUS };
+    room.mainGarage = null;
+    room.mainGarageOwnerId = null;
     twoSyncLobby(room);
   }
 }
