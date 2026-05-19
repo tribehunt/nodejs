@@ -5489,6 +5489,21 @@ function umbralHandle(ws, payloadStr, prefixed = false) {
     return;
   }
 
+  if (typ === "rail_chat" || typ === "visitor_chat" || typ === "chat") {
+    const text = String(m.text || m.msg || m.message || "").replace(/\r?\n/g, " ").slice(0, 240);
+    if (!text) return;
+    if (!m.from_id) m.from_id = String(ws._umbralId || m.id || "").slice(0, 64);
+    if (!m.from_name) {
+      const c = umbralFindClient(m.from_id, m.room || ws._umbralRoomName || UMBRAL_DEFAULT_ROOM);
+      m.from_name = c ? umbralSafeName(c.name, "Gaunt-Wraith") : umbralSafeName(m.name, "Gaunt-Wraith");
+    }
+    m.type = "rail_chat";
+    m.text = text;
+    m.ts = Date.now();
+    if (m.target || m.host) umbralRelayToTarget(ws, m);
+    return;
+  }
+
   if (typ === "visit" || typ === "visit_position") {
     const visitor = (m.visitor && typeof m.visitor === "object") ? m.visitor : m;
     const id = umbralSafeId(visitor.id || ws._umbralId || "");
@@ -5590,7 +5605,7 @@ function routeSocketMessage(ws, data) {
     if (game === "prison" || game === "ethane" || game === "p") { prisonHandle(ws, raw); return; }
 
     const t = String(m.t || m.type || "").toLowerCase();
-    if (t === "presence" || t === "peer" || t === "visit" || t === "visit_position" || t === "leave" || t === "request_peers" || t === "sync") {
+    if (t === "presence" || t === "peer" || t === "visit" || t === "visit_position" || t === "rail_chat" || t === "visitor_chat" || t === "leave" || t === "request_peers" || t === "sync") {
       umbralHandle(ws, raw, false);
       return;
     }
