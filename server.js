@@ -1,5 +1,5 @@
 // server.js - supports Eldritch Cyber Front,
-// Ethane Sea, Azha, STUG, GROWTH & [2]
+// Ethane Sea, Azha, STUG, GROWTH, [2] & House Nocturne Umbral Rail
 // One process, one port, isolated rooms by game.
 // by Dedset Media 02/24/2026
 const http = require("http");
@@ -2741,6 +2741,87 @@ function twoFrontGatherSortKey(side, cx, cy, entrance, pt) {
   return Math.hypot(x - ex, y - ey) * 1000 + Math.abs(x - (Number(cx) + 0.5)) + Math.abs(y - (Number(cy) + 0.5));
 }
 
+function twoIsEnemy2(e) {
+  try {
+    if (String((e && e.archetype) || "").toLowerCase() === "caster") return true;
+    if (Number((e && e.spell_slots_max) || 0) > 0) return true;
+    const mode = String((e && e.attack_mode) || "").toLowerCase();
+    if (["wis_save", "spell", "caster", "ranged"].includes(mode)) return true;
+    return (Number((e && e.id) || 1) % 2) === 0;
+  } catch { return false; }
+}
+function twoNestEntranceBundle(state) {
+  try {
+    const ent = (state && state.entrance) || {};
+    const dx = Number(ent.x || 0) | 0, dy = Number(ent.y || 0) | 0;
+    const u = twoNestEntranceUnit(state);
+    let ux = Math.round(Number(u.x || 0)), uy = Math.round(Number(u.y || 0));
+    if (!ux && !uy) { ux = 0; uy = -1; }
+    const px = -uy, py = ux;
+    return { door: [dx, dy], outside: [dx + ux, dy + uy], inside: [dx - ux, dy - uy], u: [ux, uy], p: [px, py] };
+  } catch { return { door: [0, 0], outside: [0, -1], inside: [0, 1], u: [0, -1], p: [1, 0] }; }
+}
+function twoNestDoorGuardSlots(room, state) {
+  const slots = [];
+  try {
+    const map = room && room.mission && room.mission.map;
+    const h = map ? map.length : 0, w = h ? String(map[0] || "").length : 0;
+    const b = twoNestEntranceBundle(state);
+    const ox = Number(b.outside[0]), oy = Number(b.outside[1]);
+    const dx = Number(b.door[0]), dy = Number(b.door[1]);
+    const ux = Number(b.u[0]), uy = Number(b.u[1]);
+    const px = Number(b.p[0]), py = Number(b.p[1]);
+    const sideSets = [
+      [[ox + px, oy + py], [ox + px + ux, oy + py + uy], [dx + px, dy + py], [ox + px * 2, oy + py * 2]],
+      [[ox - px, oy - py], [ox - px + ux, oy - py + uy], [dx - px, dy - py], [ox - px * 2, oy - py * 2]],
+    ];
+    const seen = new Set();
+    for (let si = 0; si < sideSets.length; si++) {
+      let chosen = null;
+      for (const c of sideSets[si]) {
+        const cx = Number(c[0]) | 0, cy = Number(c[1]) | 0;
+        const k = `${cx},${cy}`;
+        if (cx <= 0 || cy <= 0 || cx >= w - 1 || cy >= h - 1 || seen.has(k)) continue;
+        if (twoNestPerimeterCell(state, cx, cy)) continue;
+        if (twoNestVehicleInCell(room, cx, cy)) continue;
+        chosen = [cx, cy]; break;
+      }
+      if (chosen) {
+        seen.add(`${chosen[0]},${chosen[1]}`);
+        slots.push({ cell: chosen, x: chosen[0] + 0.5, y: chosen[1] + 0.5, side: si === 0 ? "left" : "right" });
+      }
+    }
+  } catch {}
+  return slots.slice(0, 2);
+}
+function twoEnsureNestGuardSlotsOpen(room, state, cells) {
+  const slots = twoNestDoorGuardSlots(room, state);
+  try {
+    state.guard_slots = slots.map(s => [Number(s.cell[0]) | 0, Number(s.cell[1]) | 0]);
+    const map = room && room.mission && room.mission.map;
+    for (const s of slots) {
+      const x = Number(s.cell[0]) | 0, y = Number(s.cell[1]) | 0;
+      if (twoSetMapCell(map, x, y, "0") && Array.isArray(cells)) cells.push([x, y, "0"]);
+    }
+  } catch {}
+  return slots;
+}
+function twoGarrisonPointsAwayFromDoor(state, gather) {
+  try {
+    const b = twoNestEntranceBundle(state);
+    const dx = Number(b.door[0]) + 0.5, dy = Number(b.door[1]) + 0.5;
+    const ox = Number(b.outside[0]) + 0.5, oy = Number(b.outside[1]) + 0.5;
+    const pts = [];
+    for (const g of (gather || [])) {
+      const gx = Number(g[0]), gy = Number(g[1]);
+      if (Math.hypot(gx - dx, gy - dy) <= 1.42) continue;
+      if (Math.hypot(gx - ox, gy - oy) <= 1.72) continue;
+      pts.push([gx, gy]);
+    }
+    return pts.length ? pts : (gather || []);
+  } catch { return gather || []; }
+}
+
 function twoPlanNesting(room) {
   try {
     const mission = room && room.mission;
@@ -3129,41 +3210,64 @@ function twoAssignNestTargets(room, state) {
     const builders = phase === "building" ? twoNestBuilderIds(room, state) : new Set();
     const buildCell = phase === "building" ? twoSelectReachableBuildCell(room, state) : twoCurrentBuildCell(state);
     if (phase === "building") twoBuilderJobs(room, state);
+    const guardSlots = phase === "built" ? twoEnsureNestGuardSlotsOpen(room, state, null) : [];
+    const guardKeys = [];
+    if (phase === "built" && guardSlots.length) {
+      for (let i = 0; i < enemies.length; i++) {
+        const e = enemies[i];
+        if (!e || Number(e.hp || 1) <= 0 || twoIsEnemy2(e)) continue;
+        guardKeys.push(twoNestEnemyKey(e, i + 1));
+        if (guardKeys.length >= Math.min(2, guardSlots.length)) break;
+      }
+    }
+    const guardMap = new Map();
+    for (let i = 0; i < Math.min(guardKeys.length, guardSlots.length); i++) guardMap.set(Number(guardKeys[i]), guardSlots[i]);
+    const garrison = twoGarrisonPointsAwayFromDoor(state, gather);
+    let liveSlot = 0, garrisonSlot = 0;
     for (let i = 0; i < enemies.length; i++) {
       const e = enemies[i];
       if (!e || Number(e.hp || 1) <= 0) continue;
       if (phase === "building" || phase === "built") {
         const key = twoNestEnemyKey(e, i + 1);
-        const gatherSlot = Math.abs(key) % Math.max(1, gather.length);
         const isBuilder = !!(phase === "building" && builders.has(key));
-        let tx, ty, mode = phase;
+        const isDoorGuard = !!(phase === "built" && guardMap.has(Number(key)));
+        let tx, ty, mode = phase, hiveJob = phase === "built" ? "garrison" : "guard-builder";
         if (phase === "building" && isBuilder) {
           if (Math.hypot(Number(e.x || ax) - ax, Number(e.y || ay) - ay) > TWO_NEST_RALLY_RADIUS) { tx = ax; ty = ay; }
           else {
             let job = twoBuilderJobFor(state, key);
             if (!job) { twoBuilderJobs(room, state); job = twoBuilderJobFor(state, key); }
             if (job && job.work) { tx = Number(job.work[0]); ty = Number(job.work[1]); e.hive_build_wall = job.wall; }
-            else if (buildCell) { const work = twoCurrentWorkPoint(room, state); if (work) { tx = Number(work[0]); ty = Number(work[1]); } else { const g = gather[gatherSlot]; tx = Number(g[0]); ty = Number(g[1]); } }
-            else { const g = gather[gatherSlot]; tx = Number(g[0]); ty = Number(g[1]); }
+            else if (buildCell) { const work = twoCurrentWorkPoint(room, state); if (work) { tx = Number(work[0]); ty = Number(work[1]); } else { const g = gather[liveSlot % Math.max(1, gather.length)]; tx = Number(g[0]); ty = Number(g[1]); } }
+            else { const g = gather[liveSlot % Math.max(1, gather.length)]; tx = Number(g[0]); ty = Number(g[1]); }
           }
+          hiveJob = "builder";
+        } else if (phase === "built" && isDoorGuard) {
+          const slot = guardMap.get(Number(key));
+          tx = Number(slot.x); ty = Number(slot.y); hiveJob = "door-guard"; e.nest_guard = true; e.nest_guard_slot = slot.side;
+          const sx = Number(slot.cell[0]) | 0, sy = Number(slot.cell[1]) | 0;
+          if (twoMapCell(room.mission.map, sx, sy) === "1") twoSetMapCell(room.mission.map, sx, sy, "0");
+          if (twoMapCell(room.mission.map, Math.floor(Number(e.x || tx)), Math.floor(Number(e.y || ty))) === "1") { e.x = tx; e.y = ty; e.moving = false; e.stuckT = 0; e.aiPathCells = []; }
+        } else if (phase === "built") {
+          const g = garrison[garrisonSlot % Math.max(1, garrison.length)]; tx = Number(g[0]); ty = Number(g[1]); garrisonSlot++; delete e.nest_guard; delete e.nest_guard_slot;
         } else {
-          const g = gather[gatherSlot]; tx = Number(g[0]); ty = Number(g[1]);
+          const g = gather[liveSlot % Math.max(1, gather.length)]; tx = Number(g[0]); ty = Number(g[1]); liveSlot++;
         }
         try {
           const targetIsTreeRally = Math.hypot(Number(tx) - ax, Number(ty) - ay) < 0.72;
-          const bypass = targetIsTreeRally ? null : twoNestTreeBypassPoint(room, state, Number(e.x || tx), Number(e.y || ty), Number(tx), Number(ty));
+          const bypass = (targetIsTreeRally || isDoorGuard) ? null : twoNestTreeBypassPoint(room, state, Number(e.x || tx), Number(e.y || ty), Number(tx), Number(ty));
           if (bypass) { tx = Number(bypass.x); ty = Number(bypass.y); e.nest_route = "tree-bypass"; }
           else delete e.nest_route;
         } catch {}
         e.nest_tx = tx; e.nest_ty = ty; e.nest_anchor_x = ax; e.nest_anchor_y = ay; e.nest_mode = mode; e.nest_builder = isBuilder;
-        e.hive_job = isBuilder ? "builder" : (phase === "built" ? "garrison" : "guard-builder");
+        e.hive_job = hiveJob;
         e.hive_target = [Math.round(Number(tx) * 1000) / 1000, Math.round(Number(ty) * 1000) / 1000];
         e.debug_thought = `${e.hive_job} -> ${Number(tx).toFixed(2)},${Number(ty).toFixed(2)}`;
         if (state.entrance) { e.nest_door_x = Number(state.entrance.x); e.nest_door_y = Number(state.entrance.y); }
       } else {
         delete e.nest_tx; delete e.nest_ty; delete e.nest_anchor_x; delete e.nest_anchor_y; delete e.nest_mode; delete e.nest_builder;
         delete e.hive_job; delete e.hive_target; delete e.debug_thought;
-        delete e.nest_door_x; delete e.nest_door_y;
+        delete e.nest_door_x; delete e.nest_door_y; delete e.nest_guard; delete e.nest_guard_slot;
       }
     }
   } catch {}
@@ -3172,7 +3276,7 @@ function twoAssignNestTargets(room, state) {
 function twoEnemyInNestDoorway(e) {
   try {
     const mode = String((e && e.nest_mode) || "");
-    if (mode !== "building" && mode !== "built") return false;
+    if (mode !== "building") return false;
     const dx = Number(e.nest_door_x), dy = Number(e.nest_door_y);
     if (!Number.isFinite(dx) || !Number.isFinite(dy)) return false;
     return Math.hypot(Number(e.x || 0) - (dx + 0.5), Number(e.y || 0) - (dy + 0.5)) <= 1.28;
@@ -3416,7 +3520,7 @@ function twoHiveWaypointForGoal(room, e, ex, ey, tx, ty, vehicle, forcePath) {
     if (!goal) return { x: tx, y: ty };
     const start = twoGridCellFromPoint(ex, ey);
     const direct = twoStraightRouteClear(room, e, ex, ey, tx, ty, vehicle);
-    const needPath = !!(forcePath || Number(e.stuckT || 0) > 0.10 || ((start[0] !== goal[0] || start[1] !== goal[1]) && !direct));
+    const needPath = !!(forcePath || Number(e.stuckT || 0) > 0.12 || ((start[0] !== goal[0] || start[1] !== goal[1]) && !direct));
     if (!needPath && Math.hypot(tx - ex, ty - ey) < 3.2) return { x: tx, y: ty };
     if (!twoPathCacheValid(e, goal)) {
       if (Number(e.aiPathReplanT || 0) > 0) return { x: tx, y: ty };
@@ -3738,6 +3842,7 @@ function twoUpdateNesting(room, dtSec) {
       if (twoSetMapCell(map, Number(it[0]), Number(it[1]), "0")) cells.push([Number(it[0]), Number(it[1]), "0"]);
     }
     twoPrepareNestChamber(room, state, cells);
+    if (String(state.phase || "waiting") === "built") twoEnsureNestGuardSlotsOpen(room, state, cells);
     twoNestUnstickEnemiesFromWalls(room, state);
   }
   twoAssignNestTargets(room, state);
@@ -3753,6 +3858,7 @@ function twoUpdateNesting(room, dtSec) {
         twoNestSealCompletedShell(room, state, map, cells, true);
         state.phase = "built";
         state.ceiling = true;
+        twoEnsureNestGuardSlotsOpen(room, state, cells);
         state.waiting_for_builder = null;
         state.builder_jobs = {};
         state.current_wall = null;
@@ -4332,13 +4438,14 @@ const TWO_ENEMY_TANK_STANDOFF = TWO_ENEMY_RADIUS + TWO_TANK_RADIUS + 0.10;
 const TWO_ENEMY_ENEMY_STANDOFF = TWO_ENEMY_RADIUS * 2.0 + 0.10;
 
 function twoCircleOpen(room, x, y, radius) {
-  const r = Math.max(0, Number(radius || 0));
+  const r = Math.max(0, Number(radius || 0)) * 1.08;
   if (twoIsWall(room, x, y)) return false;
   if (r <= 0.01) return true;
+  const d = r * 0.707;
   const samples = [
     [ r, 0], [-r, 0], [0,  r], [0, -r],
-    [ r * 0.70,  r * 0.70], [-r * 0.70,  r * 0.70],
-    [ r * 0.70, -r * 0.70], [-r * 0.70, -r * 0.70],
+    [ d, d], [-d, d], [d, -d], [-d, -d],
+    [ r * 0.38, 0], [-r * 0.38, 0], [0, r * 0.38], [0, -r * 0.38],
   ];
   for (const [ox, oy] of samples) if (twoIsWall(room, x + ox, y + oy)) return false;
   return true;
@@ -4428,6 +4535,65 @@ function twoWallClearanceScore(room, nx, ny, radius) {
   if (blocked >= 2) score -= 1.20 + blocked * 0.28;
   return score;
 }
+function twoWallContactVector(room, nx, ny, radius) {
+  try {
+    const r = Math.max(0.20, Number(radius || TWO_ENEMY_RADIUS) * 1.18);
+    const samples = [[r,0],[-r,0],[0,r],[0,-r],[r*0.72,r*0.72],[-r*0.72,r*0.72],[r*0.72,-r*0.72],[-r*0.72,-r*0.72]];
+    let ax = 0, ay = 0, hits = 0;
+    for (const [ox, oy] of samples) {
+      if (twoIsWall(room, Number(nx) + ox, Number(ny) + oy)) { ax -= ox; ay -= oy; hits++; }
+    }
+    if (!hits) return { x: 0, y: 0, hits: 0 };
+    const mag = Math.hypot(ax, ay) || 1;
+    return { x: ax / mag, y: ay / mag, hits };
+  } catch { return { x: 0, y: 0, hits: 0 }; }
+}
+
+function twoEmergencyUnstickStep(room, e, ex, ey, tx, ty, step, enemies, vehicle) {
+  try {
+    const radius = Number(e.body_radius || TWO_ENEMY_RADIUS);
+    step = Math.max(0.10, Math.min(Math.max(0.16, Number(step || 0) * 1.35), 0.34));
+    const away = twoWallContactVector(room, ex, ey, radius);
+    const toAng = Math.atan2(Number(ty) - Number(ey), Number(tx) - Number(ex));
+    const angles = [];
+    if (away.hits > 0) {
+      const a = Math.atan2(away.y, away.x);
+      angles.push(a, a + 0.70, a - 0.70);
+    }
+    angles.push(toAng);
+    for (let i = 0; i < 8; i++) angles.push(i * Math.PI * 2 / 8);
+    const oldD = Math.hypot(Number(tx) - Number(ex), Number(ty) - Number(ey));
+    const oldClear = twoWallClearanceScore(room, ex, ey, radius);
+    let best = null, bestScore = -999999;
+    const seen = new Set();
+    for (const ang of angles) {
+      for (const scale of [1.0, 0.72, 0.48]) {
+        const ux = Math.cos(ang), uy = Math.sin(ang);
+        const nx = Number(ex) + ux * step * scale, ny = Number(ey) + uy * step * scale;
+        const key = `${Math.round(nx*1000)},${Math.round(ny*1000)}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (!twoEnemyBodyClear(room, e, nx, ny, enemies, vehicle)) continue;
+        const newD = Math.hypot(Number(tx) - nx, Number(ty) - ny);
+        const clear = twoWallClearanceScore(room, nx, ny, radius);
+        const awayScore = away.hits > 0 ? (ux * away.x + uy * away.y) : 0;
+        let score = (clear - oldClear) * 5.0 + (oldD - newD) * 3.25 + awayScore * 2.2 + scale * 0.15;
+        if (away.hits > 0 && clear > oldClear + 0.20) score += 2.0;
+        if (score > bestScore) { bestScore = score; best = { nx, ny, ux, uy }; }
+      }
+    }
+    if (!best) return false;
+    e.x = Math.round(best.nx * 1000) / 1000;
+    e.y = Math.round(best.ny * 1000) / 1000;
+    e.avoidBias = (best.ux * (-(Number(ty) - Number(ey))) + best.uy * (Number(tx) - Number(ex))) > 0 ? 1 : -1;
+    e.avoidT = 0.62;
+    e.aiPathCells = [];
+    e.aiPathT = 0;
+    e.aiPathReplanT = 0;
+    return true;
+  } catch { return false; }
+}
+
 function twoSteeredMove(room, e, ex, ey, mx, my, step, tx, ty, enemies, vehicle) {
   if (!Number.isFinite(step) || step <= 0.0001) return false;
   const base = Math.atan2(my, mx);
@@ -4436,10 +4602,10 @@ function twoSteeredMove(room, e, ex, ey, mx, my, step, tx, ty, enemies, vehicle)
   const oldD = Math.hypot(tx - ex, ty - ey);
   const sideOrder = Number(e.avoidBias || 0) > 0 ? [1, -1] : (Number(e.avoidBias || 0) < 0 ? [-1, 1] : [flank, -flank]);
   const offsets = [0];
-  for (const mag of [0.34, 0.68, 1.02, 1.38, 1.72, 2.12, 2.55]) for (const side of sideOrder) offsets.push(side * mag);
+  for (const mag of [0.38, 0.82, 1.28, 1.80]) for (const side of sideOrder) offsets.push(side * mag);
   offsets.push(Math.PI);
   let best = null, bestScore = -999999;
-  for (const scale of [1.0, 0.72, 0.48]) {
+  for (const scale of [1.0, 0.70, 0.46]) {
     const ds = step * scale;
     for (const off of offsets) {
       const ang = base + off, ux = Math.cos(ang), uy = Math.sin(ang);
@@ -4449,15 +4615,15 @@ function twoSteeredMove(room, e, ex, ey, mx, my, step, tx, ty, enemies, vehicle)
       if (!wallClear && scale > 0.50) continue;
       const progress = (oldD - Math.hypot(tx - nx, ty - ny)) * 8.0;
       const pressure = twoBodyPressureScore(e, nx, ny, enemies, vehicle);
-      const clearance = twoWallClearanceScore(room, nx, ny, radius);
-      const score = progress + pressure + clearance + (wallClear ? 0.45 : -0.85) - Math.abs(off) * 0.42 - (Math.abs(off) > 2.4 ? 1.2 : 0) + scale * 0.16;
+      const clearance = twoWallClearanceScore(room, nx, ny, radius) * 0.55;
+      const score = progress + pressure + clearance + (wallClear ? 0.42 : -0.55) - Math.abs(off) * 0.36 - (Math.abs(off) > 2.4 ? 0.80 : 0) + scale * 0.12;
       if (score > bestScore) { bestScore = score; best = { nx, ny, off }; }
     }
   }
   if (!best) return false;
   e.x = Math.round(best.nx * 1000) / 1000;
   e.y = Math.round(best.ny * 1000) / 1000;
-  if (Math.abs(best.off) > 0.30) { e.avoidBias = best.off > 0 ? 1 : -1; e.avoidT = 0.40; }
+  if (Math.abs(best.off) > 0.30) { e.avoidBias = best.off > 0 ? 1 : -1; e.avoidT = 0.36; }
   else { e.avoidT = Math.max(0, Number(e.avoidT || 0) - 0.08); if (e.avoidT <= 0) e.avoidBias = 0; }
   return true;
 }
@@ -5021,7 +5187,7 @@ function twoTickRoom(room, dt) {
       continue;
     }
 
-    const pathForce = !!((nestOrder && String(e.nest_mode || "") === "building") || (!visible && awareMove) || Number(e.stuckT || 0) > 0.08);
+    const pathForce = !!((nestOrder && (String(e.nest_mode || "") === "building" || String(e.nest_mode || "") === "built")) || (!visible && awareMove) || Number(e.stuckT || 0) > 0.12);
     const wp = twoHiveWaypointForGoal(room, e, ex, ey, tx, ty, v, pathForce);
     const moveTx = Number(wp.x), moveTy = Number(wp.y);
     let vx = moveTx - ex, vy = moveTy - ey;
@@ -5064,7 +5230,7 @@ function twoTickRoom(room, dt) {
     let ok = twoSteeredMove(room, e, ex, ey, mx, my, step, moveTx, moveTy, room.mission.enemies, v);
     if (ok && Math.hypot(Number(e.x || ex) - ex, Number(e.y || ey) - ey) < 0.024) { e.x = Math.round(ex * 1000) / 1000; e.y = Math.round(ey * 1000) / 1000; ok = false; }
     if (!ok) {
-      if (!isCaster && visible && dist > meleeAttackRange + 0.18) {
+      if (!isCaster && visible && dist > meleeAttackRange + 0.18 && Number(e.stuckT || 0) <= 0.10) {
         const dxp = (px - ex) / (dist || 1), dyp = (py - ey) / (dist || 1);
         if (twoMoveEnemy(room, e, ex + dxp * step, ey + dyp * step, [], v)) {
           e.stuckT = 0;
@@ -5073,6 +5239,13 @@ function twoTickRoom(room, dt) {
         }
       }
       e.stuckT = Number(e.stuckT || 0) + dtSec;
+      if (e.stuckT > 0.14 && twoEmergencyUnstickStep(room, e, ex, ey, tx, ty, step, room.mission.enemies, v)) {
+        e.stuckT = 0;
+        e.brain = "wall-unstick";
+        e.tactic = "clear-wall";
+        moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: true, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot, brain: e.brain, tactic: e.tactic, ai_goal: e.aiGoal, ai_waypoint_x: e.aiWaypointX, ai_waypoint_y: e.aiWaypointY, nest_mode: e.nest_mode, nest_builder: e.nest_builder, nest_tx: e.nest_tx, nest_ty: e.nest_ty, hive_job: e.hive_job, hive_target: e.hive_target, debug_thought: e.debug_thought });
+        continue;
+      }
       if (!awareMove && !nestOrder) twoSnapIdleEnemy(e, ex, ey);
       if (!isCaster && visible && dist <= meleeAttackRange + 0.18 && e.attackT <= 0) {
         const atkResult = twoResolveEnemyDamage(e, v);
@@ -5135,10 +5308,255 @@ function twoTickRoom(room, dt) {
 
 
 
+
+// ---------------------------------------------------------------------------------------------------------
+// HOUSE NOCTURNE / VESPERA Umbral Rail protocol
+// Raw JSON, plus optional ur: prefix for future clients.
+// Python client connects to: wss://nodejs-production-740bc.up.railway.app
+// Clients send:  {"type":"presence","id":"UR-XXXX","name":"King","floor":0,"x":10.5,"y":10.5,"angle":0,"maps":{...}}
+//                {"type":"visit","target":"UR-OTHER","visitor":{...}}
+//                {"type":"visit_position","target":"UR-OTHER","visitor":{...}}
+//                {"type":"leave","target":"UR-OTHER","id":"UR-XXXX"}
+// Server sends:  {"type":"presence",...} / {"type":"peer_left",...} / relayed visit packets
+// ---------------------------------------------------------------------------------------------------------
+const umbralRooms = new Map(); // roomName -> { name, clients:Map<id,client> }
+const UMBRAL_DEFAULT_ROOM = "house_nocturne";
+const UMBRAL_PEER_TTL_MS = 45000;
+const UMBRAL_MAX_MAP_FLOORS = 8;
+const UMBRAL_MAX_MAP_ROWS = 128;
+const UMBRAL_MAX_MAP_COLS = 160;
+
+function umbralSafeId(s) {
+  try {
+    const out = String(s || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+    return out || ("UR-" + rid());
+  } catch { return "UR-" + rid(); }
+}
+function umbralSafeName(s, fb = "Gaunt-Geist") {
+  try {
+    const out = String(s || "").replace(/\s+/g, " ").trim().slice(0, 28);
+    return out || fb;
+  } catch { return fb; }
+}
+function umbralRoomName(s) {
+  return safeRoomId(s || UMBRAL_DEFAULT_ROOM, UMBRAL_DEFAULT_ROOM);
+}
+function umbralGetRoom(roomName) {
+  const rn = umbralRoomName(roomName);
+  if (!umbralRooms.has(rn)) umbralRooms.set(rn, { name: rn, clients: new Map() });
+  const room = umbralRooms.get(rn);
+  if (!room.clients) room.clients = new Map();
+  return room;
+}
+function umbralCleanMaps(raw) {
+  const out = {};
+  try {
+    if (!raw || typeof raw !== "object") return out;
+    let floors = 0;
+    for (const [fk, grid] of Object.entries(raw)) {
+      if (floors++ >= UMBRAL_MAX_MAP_FLOORS) break;
+      const key = String(fk || "0").replace(/[^0-9-]/g, "").slice(0, 8) || "0";
+      const rows = [];
+      if (Array.isArray(grid)) {
+        for (const row of grid.slice(0, UMBRAL_MAX_MAP_ROWS)) {
+          rows.push(String(row || "").slice(0, UMBRAL_MAX_MAP_COLS));
+        }
+      }
+      out[key] = rows;
+    }
+  } catch {}
+  return out;
+}
+function umbralPublicPeer(client, viewerWs = null) {
+  return {
+    type: "presence",
+    room: String(client.room || UMBRAL_DEFAULT_ROOM),
+    id: String(client.id || ""),
+    name: umbralSafeName(client.name, "Gaunt-Geist"),
+    floor: Math.floor(clamp(Number(client.floor || 0), -16, 16)),
+    x: clamp(Number(client.x || 10.5), -1000000, 1000000),
+    y: clamp(Number(client.y || 10.5), -1000000, 1000000),
+    angle: clamp(Number(client.angle || 0), -1000000, 1000000),
+    maps: client.maps && typeof client.maps === "object" ? client.maps : {},
+    visiting: !!client.visiting,
+    visit_target: String(client.visit_target || ""),
+    you: !!(viewerWs && client.ws === viewerWs),
+    t: Date.now() / 1000
+  };
+}
+function umbralSend(ws, obj) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  try {
+    const data = JSON.stringify(obj);
+    if (ws._umbralPrefixed) ws.send("ur:" + data);
+    else ws.send(data);
+    return true;
+  } catch { return false; }
+}
+function umbralBroadcast(room, obj, exceptWs = null) {
+  if (!room || !room.clients) return;
+  for (const c of room.clients.values()) {
+    if (!c || !c.ws || c.ws === exceptWs) continue;
+    umbralSend(c.ws, obj);
+  }
+}
+function umbralSendPeerList(ws, room, selfId) {
+  if (!room || !room.clients) return;
+  for (const c of room.clients.values()) {
+    if (!c || String(c.id || "") === String(selfId || "")) continue;
+    umbralSend(ws, umbralPublicPeer(c, ws));
+  }
+}
+function umbralDetach(ws, announce = true) {
+  if (!ws || !ws._umbralId) return;
+  const id = String(ws._umbralId || "");
+  const roomName = umbralRoomName(ws._umbralRoomName || UMBRAL_DEFAULT_ROOM);
+  const room = umbralRooms.get(roomName);
+  if (room && room.clients) {
+    const c = room.clients.get(id);
+    if (c && c.ws === ws) room.clients.delete(id);
+    if (announce && id) umbralBroadcast(room, { type: "peer_left", id, room: room.name, ts: Date.now() }, ws);
+    if (room.clients.size === 0) umbralRooms.delete(roomName);
+  }
+  ws._umbralId = "";
+  ws._umbralRoomName = "";
+}
+function umbralRememberPresence(ws, m) {
+  const room = umbralGetRoom(m.room || m.castle_room || UMBRAL_DEFAULT_ROOM);
+  const oldRoom = ws._umbralRoomName ? umbralRoomName(ws._umbralRoomName) : "";
+  if (oldRoom && oldRoom !== room.name) umbralDetach(ws, true);
+  const id = umbralSafeId(m.id || ws._umbralId || "");
+  ws._umbralId = id;
+  ws._umbralRoomName = room.name;
+  const existing = room.clients.get(id) || { id, room: room.name, ws };
+  existing.ws = ws;
+  existing.id = id;
+  existing.room = room.name;
+  existing.name = umbralSafeName(m.name || existing.name, "Gaunt-Geist");
+  existing.floor = Math.floor(clamp(Number(m.floor != null ? m.floor : existing.floor || 0), -16, 16));
+  existing.x = clamp(Number(m.x != null ? m.x : existing.x || 10.5), -1000000, 1000000);
+  existing.y = clamp(Number(m.y != null ? m.y : existing.y || 10.5), -1000000, 1000000);
+  existing.angle = clamp(Number(m.angle != null ? m.angle : existing.angle || 0), -1000000, 1000000);
+  existing.maps = m.maps && typeof m.maps === "object" ? umbralCleanMaps(m.maps) : (existing.maps || {});
+  existing.visiting = !!m.visiting;
+  existing.visit_target = String(m.visit_target || "").slice(0, 64);
+  existing.lastSeen = Date.now();
+  room.clients.set(id, existing);
+  return { room, client: existing };
+}
+function umbralFindClient(targetId, roomName = "") {
+  const tid = String(targetId || "").slice(0, 64);
+  if (!tid) return null;
+  if (roomName) {
+    const room = umbralRooms.get(umbralRoomName(roomName));
+    const c = room && room.clients ? room.clients.get(tid) : null;
+    if (c) return c;
+  }
+  for (const room of umbralRooms.values()) {
+    const c = room && room.clients ? room.clients.get(tid) : null;
+    if (c) return c;
+  }
+  return null;
+}
+function umbralRelayToTarget(ws, m) {
+  const roomName = m.room || ws._umbralRoomName || UMBRAL_DEFAULT_ROOM;
+  const targetId = String(m.target || m.host || "").slice(0, 64);
+  const target = umbralFindClient(targetId, roomName);
+  if (!target || !target.ws || target.ws.readyState !== WebSocket.OPEN) {
+    umbralSend(ws, { type: "error", code: "umbral_target_missing", message: "The Umbral Rail target is no longer online.", target: targetId, ts: Date.now() });
+    return false;
+  }
+  return umbralSend(target.ws, m);
+}
+function umbralHandle(ws, payloadStr, prefixed = false) {
+  if (prefixed) ws._umbralPrefixed = true;
+  let m = null;
+  try { m = JSON.parse(String(payloadStr || "")); } catch { m = null; }
+  if (!m || typeof m !== "object") return;
+  const typ = String(m.type || m.t || "").toLowerCase();
+
+  if (typ === "presence" || typ === "peer" || typ === "hello" || typ === "join") {
+    const got = umbralRememberPresence(ws, m);
+    if (!got || !got.client) return;
+    umbralSendPeerList(ws, got.room, got.client.id);
+    umbralBroadcast(got.room, umbralPublicPeer(got.client), ws);
+    return;
+  }
+
+  if (typ === "list" || typ === "request_peers" || typ === "sync") {
+    const room = umbralGetRoom(m.room || ws._umbralRoomName || UMBRAL_DEFAULT_ROOM);
+    umbralSendPeerList(ws, room, ws._umbralId || "");
+    return;
+  }
+
+  if (typ === "visit" || typ === "visit_position") {
+    const visitor = (m.visitor && typeof m.visitor === "object") ? m.visitor : m;
+    const id = umbralSafeId(visitor.id || ws._umbralId || "");
+    if (id) {
+      const got = umbralRememberPresence(ws, {
+        type: "presence",
+        room: m.room || ws._umbralRoomName || UMBRAL_DEFAULT_ROOM,
+        id,
+        name: visitor.name || m.name,
+        floor: visitor.floor,
+        x: visitor.x,
+        y: visitor.y,
+        angle: visitor.angle,
+        maps: visitor.maps,
+        visiting: true,
+        visit_target: m.target || m.host || ""
+      });
+      if (got && got.client) umbralBroadcast(got.room, umbralPublicPeer(got.client), ws);
+    }
+    umbralRelayToTarget(ws, m);
+    return;
+  }
+
+  if (typ === "leave") {
+    const id = String(m.id || ws._umbralId || "").slice(0, 64);
+    if (ws._umbralId && id === ws._umbralId) {
+      const room = umbralGetRoom(m.room || ws._umbralRoomName || UMBRAL_DEFAULT_ROOM);
+      const c = room.clients.get(id);
+      if (c) {
+        c.visiting = false;
+        c.visit_target = "";
+        c.lastSeen = Date.now();
+        umbralBroadcast(room, umbralPublicPeer(c), ws);
+      }
+    }
+    if (m.target || m.host) umbralRelayToTarget(ws, m);
+    return;
+  }
+
+  if (typ === "ping") {
+    umbralSend(ws, { type: "pong", peers: umbralGetRoom(ws._umbralRoomName || UMBRAL_DEFAULT_ROOM).clients.size, ts: Date.now() });
+    return;
+  }
+}
+function umbralCleanRooms() {
+  const now = Date.now();
+  for (const [roomName, room] of [...umbralRooms.entries()]) {
+    if (!room || !room.clients) { umbralRooms.delete(roomName); continue; }
+    for (const [id, c] of [...room.clients.entries()]) {
+      const open = !!(c && c.ws && c.ws.readyState === WebSocket.OPEN);
+      if (!open || now - Number(c.lastSeen || 0) > UMBRAL_PEER_TTL_MS) {
+        room.clients.delete(id);
+        umbralBroadcast(room, { type: "peer_left", id, room: room.name, ts: Date.now() });
+      }
+    }
+    if (room.clients.size === 0) umbralRooms.delete(roomName);
+  }
+}
+try {
+  const _umbralSweep = setInterval(umbralCleanRooms, 15000);
+  if (_umbralSweep && typeof _umbralSweep.unref === "function") _umbralSweep.unref();
+} catch {}
+
 // ------------------------------------------------------
 // Shared WebSocket connection router
 // ------------------------------------------------------
 function detachAllProtocols(ws) {
+  try { umbralDetach(ws, true); } catch {}
   try { twoDetach(ws); } catch {}
   try { growthDetach(ws); } catch {}
   try { stugDetach(ws, true); } catch {}
@@ -5154,6 +5572,7 @@ function routeSocketMessage(ws, data) {
   }
   if (!raw) return;
 
+  if (raw.startsWith("ur:")) { umbralHandle(ws, raw.slice(3), true); return; }
   if (raw.startsWith("2:")) { twoHandle(ws, raw.slice(2)); return; }
   if (raw.startsWith("gf:")) { growthHandle(ws, raw.slice(3)); return; }
   if (raw.startsWith("s:")) { stugHandle(ws, raw.slice(2)); return; }
@@ -5164,12 +5583,17 @@ function routeSocketMessage(ws, data) {
   try { m = JSON.parse(raw); } catch { m = null; }
   if (m && typeof m === "object") {
     const game = String(m.game || m.proto || m.protocol || m.g || "").toLowerCase();
+    if (game === "umbral" || game === "umbral_rail" || game === "house_nocturne" || game === "vespera" || game === "ur") { umbralHandle(ws, raw, false); return; }
     if (game === "two" || game === "2" || game === "hunters") { twoHandle(ws, raw); return; }
     if (game === "growth" || game === "gf") { growthHandle(ws, raw); return; }
     if (game === "stug" || game === "s") { stugHandle(ws, raw); return; }
     if (game === "prison" || game === "ethane" || game === "p") { prisonHandle(ws, raw); return; }
 
     const t = String(m.t || m.type || "").toLowerCase();
+    if (t === "presence" || t === "peer" || t === "visit" || t === "visit_position" || t === "leave" || t === "request_peers" || t === "sync") {
+      umbralHandle(ws, raw, false);
+      return;
+    }
     if (t === "join" || t === "lobby_state" || t === "role" || t === "mission_request" || t === "launch" || t === "drive" || t === "shot" || t === "ping") {
       twoHandle(ws, raw);
       return;
