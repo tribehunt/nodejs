@@ -1,5 +1,5 @@
 // server.js - supports Eldritch Cyber Front,
-// Ethane Sea, Azha, STUG, GROWTH, [2] & House Nocturne Umbral Rail
+// Ethane Sea, STUG, GROWTH, ARMORBOUND & House Nocturne
 // One process, one port, isolated rooms by game.
 // by Dedset Media 02/24/2026
 const http = require("http");
@@ -8,6 +8,7 @@ const zlib = require("zlib");
 const WebSocket = require("ws");
 const PORT = process.env.PORT || 8080;
 const server = http.createServer((req, res) => {
+  if (handleMegaClaimHTTP(req, res)) return;
   res.writeHead(200, { "content-type": "text/plain" });
   res.end("OK\n");
 });
@@ -27,6 +28,179 @@ const _hb = setInterval(() => {
   } catch {}
 }, HEARTBEAT_MS);
 try { if (_hb && typeof _hb.unref === "function") _hb.unref(); } catch {}
+
+// ------------------------------------------------------------
+// House Nocturne MEGA chat distributed reply claim endpoint
+// ------------------------------------------------------------
+// Vespera's autonomous MEGA responder runs inside each game copy, but this
+// Railway endpoint gives all copies one shared lock so only one Vespera answers
+// each incoming MEGA chat message.
+const MEGA_CLAIM_TTL_MS = Math.max(30000, Number(process.env.MEGA_CLAIM_TTL_MS || 180000));
+const megaClaims = new Map();
+
+function megaClaimCleanId(v, max = 220) {
+  return String(v || "")
+    .replace(/[\r\n\t]/g, " ")
+    .replace(/[^\x20-\x7e]/g, "")
+    .trim()
+    .slice(0, max);
+}
+
+function megaClaimRoom(v) {
+  const s = String(v || "house_nocturne")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, "")
+    .slice(0, 48);
+  return s || "house_nocturne";
+}
+
+function megaClaimKey(room, messageId, fingerprint) {
+  const rid = megaClaimRoom(room);
+  const mid = megaClaimCleanId(messageId || fingerprint || "", 220);
+  if (!mid) return "";
+  return rid + ":" + mid;
+}
+
+function megaClaimSweep() {
+  const now = Date.now();
+  for (const [k, v] of megaClaims.entries()) {
+    if (!v || Number(v.expiresAt || 0) <= now) megaClaims.delete(k);
+  }
+}
+
+try {
+  const _megaClaimSweep = setInterval(megaClaimSweep, 30000);
+  if (_megaClaimSweep && typeof _megaClaimSweep.unref === "function") _megaClaimSweep.unref();
+} catch {}
+
+function megaClaimReply(res, code, obj) {
+  try {
+    res.writeHead(code, {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+      "access-control-allow-origin": "*",
+      "access-control-allow-methods": "POST,OPTIONS",
+      "access-control-allow-headers": "content-type,authorization"
+    });
+    if (code === 204) res.end();
+    else res.end(JSON.stringify(obj));
+  } catch {}
+}
+
+function handleMegaClaimHTTP(req, res) {
+  try {
+    const url = new URL(req.url || "/", "http://localhost");
+    const path = String(url.pathname || "").replace(/\/+$/, "") || "/";
+    if (path !== "/mega-claim" && path !== "/api/mega-claim") return false;
+
+    if (req.method === "OPTIONS") {
+      megaClaimReply(res, 204, { ok: true });
+      return true;
+    }
+    if (req.method !== "POST") {
+      megaClaimReply(res, 405, { ok: false, error: "method-not-allowed" });
+      return true;
+    }
+
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk.toString("utf8");
+      if (body.length > 65536) {
+        try { req.destroy(); } catch {}
+      }
+    });
+    req.on("end", () => {
+      let m = null;
+      try { m = JSON.parse(body || "{}"); } catch { m = null; }
+      if (!m || typeof m !== "object") {
+        megaClaimReply(res, 400, { ok: false, error: "bad-json" });
+        return;
+      }
+
+      megaClaimSweep();
+      const op = String(m.op || "claim").toLowerCase();
+      const room = megaClaimRoom(m.room || "house_nocturne");
+      const ownerId = megaClaimCleanId(m.owner_id || m.owner || "", 96);
+      const messageId = megaClaimCleanId(m.message_id || m.messageId || m.id || "", 220);
+      const fingerprint = megaClaimCleanId(m.fingerprint || "", 96);
+      const key = megaClaimKey(room, messageId, fingerprint);
+      const ttlSeconds = Math.max(30, Math.min(900, Number(m.ttl_seconds || m.ttl || MEGA_CLAIM_TTL_MS / 1000) || 180));
+      const now = Date.now();
+
+      if (!key || !ownerId) {
+        megaClaimReply(res, 400, { ok: false, error: "missing-message-or-owner" });
+        return;
+      }
+
+      const existing = megaClaims.get(key);
+      if (op === "status") {
+        megaClaimReply(res, 200, {
+          ok: true,
+          claimed: !!existing,
+          owner_id: existing ? existing.owner_id : "",
+          owner_name: existing ? (existing.owner_name || "") : "",
+          completed: existing ? !!existing.completed : false,
+          expires_at: existing ? existing.expiresAt : 0,
+          ts: now
+        });
+        return;
+      }
+
+      if (op === "release") {
+        if (existing && existing.owner_id === ownerId) megaClaims.delete(key);
+        megaClaimReply(res, 200, { ok: true, released: true, owner_id: ownerId, ts: now });
+        return;
+      }
+
+      if (op === "complete") {
+        megaClaims.set(key, {
+          owner_id: ownerId,
+          owner_name: megaClaimCleanId(m.owner_name || "Vespera", 80),
+          room,
+          message_id: messageId,
+          fingerprint,
+          completed: true,
+          claimedAt: existing ? existing.claimedAt : now,
+          completedAt: now,
+          expiresAt: now + Math.max(MEGA_CLAIM_TTL_MS, ttlSeconds * 1000)
+        });
+        megaClaimReply(res, 200, { ok: true, completed: true, claimed: true, owner_id: ownerId, ts: now });
+        return;
+      }
+
+      // Default op: claim. Existing owner wins until TTL expires. A completed
+      // claim also blocks duplicate replies for the TTL window.
+      if (existing && Number(existing.expiresAt || 0) > now && existing.owner_id && existing.owner_id !== ownerId) {
+        megaClaimReply(res, 200, {
+          ok: true,
+          claimed: false,
+          owner_id: existing.owner_id,
+          owner_name: existing.owner_name || "",
+          completed: !!existing.completed,
+          expires_at: existing.expiresAt,
+          ts: now
+        });
+        return;
+      }
+
+      megaClaims.set(key, {
+        owner_id: ownerId,
+        owner_name: megaClaimCleanId(m.owner_name || "Vespera", 80),
+        room,
+        message_id: messageId,
+        fingerprint,
+        completed: false,
+        claimedAt: existing ? existing.claimedAt : now,
+        expiresAt: now + ttlSeconds * 1000
+      });
+      megaClaimReply(res, 200, { ok: true, claimed: true, owner_id: ownerId, expires_at: now + ttlSeconds * 1000, ts: now });
+    });
+  } catch (e) {
+    try { megaClaimReply(res, 500, { ok: false, error: String(e && e.message ? e.message : e).slice(0, 240) }); } catch {}
+  }
+  return true;
+}
+
 // --------------
 // Shared helpers
 // --------------
@@ -329,8 +503,7 @@ function enforceReservedName(ws, desired, currentName, fallbackId, proto) {
   return { name: fb, blocked: true, reservedKey };
 }
 // --------------------------------------
-// Room registry: key = `${game}:${room}`
-// game is "ECF" or "AZHA"
+// ECF legacy room registry
 // --------------------------------------
 const rooms = new Map();
 // ------------------------------------------------------------------------------------------------------------
@@ -1021,41 +1194,24 @@ function roomKey(game, room) {
   return `${game}:${room}`;
 }
 function getRoom(game, roomName) {
-  const key = roomKey(game, roomName);
+  if (String(game || "").toUpperCase() !== "ECF") return null;
+  const key = roomKey("ECF", roomName);
   if (!rooms.has(key)) {
-    if (game === "ECF") {
-      rooms.set(key, {
-        game: "ECF",
-        name: roomName,
-        clients: new Map(),     // id -> ws
-        ready: new Map(),       // id -> bool
-        seed: null,
-        difficulty: 1,
-        missionActive: false
-      });
-    } else {
-      rooms.set(key, {
-        game: "AZHA",
-        name: roomName,
-        clients: new Map(),     // ws -> meta
-        started: false,
-        seed: 0,
-        mapW: 80,
-        mapH: 45,
-        mapGrid: null,
-        mission: { step: 0, phase: "rally", target: { x: 2.5, y: 2.5 }, entities: [], nextId: 1 }
-      });
-    }
+    rooms.set(key, {
+      game: "ECF",
+      name: roomName,
+      clients: new Map(),     // id -> ws
+      ready: new Map(),       // id -> bool
+      seed: null,
+      difficulty: 1,
+      missionActive: false
+    });
   }
   return rooms.get(key);
 }
 function deleteRoomIfEmpty(room) {
   if (!room) return;
-  if (room.game === "ECF") {
-    if (room.clients.size === 0) rooms.delete(roomKey("ECF", room.name));
-  } else {
-    if (room.clients.size === 0) rooms.delete(roomKey("AZHA", room.name));
-  }
+  if (room.game === "ECF" && room.clients.size === 0) rooms.delete(roomKey("ECF", room.name));
 }
 // ------------
 // ECF protocol
@@ -1074,254 +1230,6 @@ function ecfRoomState(room) {
   for (const [id, val] of room.ready) r[id] = !!val;
   const players = [...room.clients.keys()].sort();
   return { t: "room_state", seed: room.seed, difficulty: room.difficulty, ready: r, missionActive: room.missionActive, players };
-}
-// -------------
-// AZHA protocol
-// -------------
-function azhaBroadcast(room, msgObj) {
-  const data = JSON.stringify(msgObj);
-  for (const ws of room.clients.keys()) {
-    if (ws.readyState === WebSocket.OPEN) {
-      try { ws.send(data); } catch {}
-    }
-  }
-}
-function azhaLobbyState(room) {
-  const users = [];
-  for (const meta of room.clients.values()) {
-    users.push({ id: meta.id, name: meta.name, ready: meta.ready });
-  }
-  return users;
-}
-function azhaSyncLobby(room, roomId) {
-  azhaBroadcast(room, { type: "lobby", room: roomId, users: azhaLobbyState(room), started: room.started });
-}
-function rndInt(min, max) {
-  min = Math.floor(min);
-  max = Math.floor(max);
-  return min + Math.floor(Math.random() * (max - min + 1));
-}
-function mulberry32(seed) {
-  let t = (seed >>> 0);
-  return function () {
-    t += 0x6D2B79F5;
-    let r = Math.imul(t ^ (t >>> 15), 1 | t);
-    r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
-    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
-  };
-}
-function genDuneMap(w, h, seed) {
-  w = Math.max(24, Math.floor(w));
-  h = Math.max(18, Math.floor(h));
-  const rnd = mulberry32((seed >>> 0) || 1);
-  const g = new Array(h);
-  for (let y = 0; y < h; y++) {
-    let row = "";
-    for (let x = 0; x < w; x++) {
-      const border = (x === 0 || y === 0 || x === w - 1 || y === h - 1);
-      row += border ? "1" : "0";
-    }
-    g[y] = row;
-  }
-  const duneCount = Math.max(6, Math.floor((w * h) / 700));
-  const bumps = Math.max(8, Math.floor((w * h) / 500));
-  function stampEllipse(cx, cy, rx, ry) {
-    const x0 = Math.max(1, Math.floor(cx - rx));
-    const x1 = Math.min(w - 2, Math.ceil(cx + rx));
-    const y0 = Math.max(1, Math.floor(cy - ry));
-    const y1 = Math.min(h - 2, Math.ceil(cy + ry));
-    for (let yy = y0; yy <= y1; yy++) {
-      let row = g[yy].split("");
-      for (let xx = x0; xx <= x1; xx++) {
-        const nx = (xx - cx) / rx, ny = (yy - cy) / ry;
-        if (nx * nx + ny * ny <= 1) row[xx] = "1";
-      }
-      g[yy] = row.join("");
-    }
-  }
-  for (let i = 0; i < duneCount; i++) {
-    const cx = 2 + Math.floor(rnd() * (w - 4));
-    const cy = 2 + Math.floor(rnd() * (h - 4));
-    const rx = 3 + Math.floor(rnd() * 8);
-    const ry = 2 + Math.floor(rnd() * 6);
-    stampEllipse(cx + 0.5, cy + 0.5, rx, ry);
-  }
-  for (let i = 0; i < bumps; i++) {
-    const cx = 2 + Math.floor(rnd() * (w - 4));
-    const cy = 2 + Math.floor(rnd() * (h - 4));
-    const rx = 1 + Math.floor(rnd() * 3);
-    const ry = 1 + Math.floor(rnd() * 3);
-    stampEllipse(cx + 0.5, cy + 0.5, rx, ry);
-  }
-  function carve(cx, cy, r) {
-    for (let yy = Math.max(1, cy - r); yy <= Math.min(h - 2, cy + r); yy++) {
-      let row = g[yy].split("");
-      for (let xx = Math.max(1, cx - r); xx <= Math.min(w - 2, cx + r); xx++) {
-        row[xx] = "0";
-      }
-      g[yy] = row.join("");
-    }
-  }
-  carve(4, 4, 4);
-  carve(w - 5, h - 5, 4);
-  return g;
-}
-function azhaIsWall(room, x, y) {
-  const xi = Math.floor(x), yi = Math.floor(y);
-  if (xi < 0 || yi < 0 || xi >= room.mapW || yi >= room.mapH) return true;
-  const row = room.mapGrid && room.mapGrid[yi];
-  return row ? row[xi] === "1" : true;
-}
-function azhaFindNearestEmpty(room, x, y) {
-  if (!azhaIsWall(room, x, y)) return { x, y };
-  const bx = Math.floor(x) + 0.5, by = Math.floor(y) + 0.5;
-  for (let r = 1; r < Math.max(room.mapW, room.mapH); r++) {
-    for (let dy = -r; dy <= r; dy++) {
-      for (let dx = -r; dx <= r; dx++) {
-        if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
-        const nx = bx + dx, ny = by + dy;
-        if (nx < 1 || ny < 1 || nx >= room.mapW - 1 || ny >= room.mapH - 1) continue;
-        if (!azhaIsWall(room, nx, ny)) return { x: nx, y: ny };
-      }
-    }
-  }
-  for (let yy = 1; yy < room.mapH - 1; yy++) {
-    for (let xx = 1; xx < room.mapW - 1; xx++) {
-      if (!azhaIsWall(room, xx + 0.5, yy + 0.5)) return { x: xx + 0.5, y: yy + 0.5 };
-    }
-  }
-  return { x: 2.5, y: 2.5 };
-}
-function azhaJimboSay(room, text) {
-  azhaBroadcast(room, { type: "chat", from: "JIMBO", name: "Jimbo", text: "@@JIMBO@@" + String(text || ""), ts: Date.now() });
-}
-function azhaPushMission(room) {
-  azhaBroadcast(room, {
-    type: "mission",
-    phase: room.mission.phase,
-    step: room.mission.step,
-    target: room.mission.target,
-    entities: room.mission.entities
-  });
-}
-function azhaPickRallyTarget(room) {
-  const w = room.mapW, h = room.mapH;
-  const raw = {
-    x: rndInt(2, Math.max(2, w - 3)) + 0.5,
-    y: rndInt(2, Math.max(2, h - 3)) + 0.5
-  };
-  return azhaFindNearestEmpty(room, raw.x, raw.y);
-}
-function azhaSpawnLocalEntities(room, type, center, count) {
-  const w = room.mapW, h = room.mapH;
-  const out = [];
-  const radius = 6.5;
-  for (let i = 0; i < count; i++) {
-    let x = center.x, y = center.y;
-    for (let t = 0; t < 12; t++) {
-      const a = Math.random() * Math.PI * 2;
-      const r = Math.random() * radius;
-      x = clamp(center.x + Math.cos(a) * r, 1.5, w - 2.5);
-      y = clamp(center.y + Math.sin(a) * r, 1.5, h - 2.5);
-      if (!azhaIsWall(room, x, y)) break;
-    }
-    const snapped = azhaFindNearestEmpty(room, x, y);
-    const ent = {
-      id: room.mission.nextId++,
-      type,
-      x: Math.round(snapped.x * 1000) / 1000,
-      y: Math.round(snapped.y * 1000) / 1000
-    };
-    if (type === "enemy") ent.hp = 2;
-    out.push(ent);
-  }
-  return out;
-}
-function azhaStartMission(room) {
-  room.mission.step = 0;
-  room.mission.phase = "rally";
-  room.mission.entities = [];
-  room.mission.nextId = 1;
-  const tgt = azhaPickRallyTarget(room);
-  room.mission.target = { x: Math.round(tgt.x * 1000) / 1000, y: Math.round(tgt.y * 1000) / 1000 };
-  azhaJimboSay(room, `AZHA / MIL-AI ONLINE. Tankers, rally at the marked nav blip. (X:${room.mission.target.x.toFixed(1)} Y:${room.mission.target.y.toFixed(1)})`);
-  azhaPushMission(room);
-}
-function azhaEnsureMission(room) {
-  if (!room.started) return;
-  if (!room.mission || !room.mission.target || !Number.isFinite(room.mission.target.x) || !Number.isFinite(room.mission.target.y)) {
-    room.mission = { step: 0, phase: "rally", target: { x: 2.5, y: 2.5 }, entities: [], nextId: 1 };
-  }
-  if (!room.mapGrid) {
-    room.mapGrid = genDuneMap(room.mapW || 80, room.mapH || 45, room.seed || 1);
-  }
-  if (room.mission.target.x === 0 && room.mission.target.y === 0) {
-    azhaStartMission(room);
-    return;
-  }
-  const sn = azhaFindNearestEmpty(room, room.mission.target.x, room.mission.target.y);
-  room.mission.target = { x: Math.round(sn.x * 1000) / 1000, y: Math.round(sn.y * 1000) / 1000 };
-  azhaPushMission(room);
-}
-function azhaWithin(a, b, r) {
-  const dx = a.x - b.x;
-  const dy = a.y - b.y;
-  return (dx * dx + dy * dy) <= (r * r);
-}
-function azhaMaybeAdvanceMission(room) {
-  if (!room.started) return;
-  const metas = [...room.clients.values()];
-  if (metas.length !== 2) return;
-  if (!metas.every(m => m && m.state && Number.isFinite(m.state.x) && Number.isFinite(m.state.y))) return;
-  const p0 = { x: metas[0].state.x, y: metas[0].state.y };
-  const p1 = { x: metas[1].state.x, y: metas[1].state.y };
-  const tgt = room.mission.target;
-  if (room.mission.phase === "rally") {
-    if (azhaWithin(p0, tgt, 1.25) && azhaWithin(p1, tgt, 1.25)) {
-      room.mission.step++;
-      const pick = Math.random() < 0.5 ? "destroy" : "retrieve";
-      room.mission.phase = pick;
-      room.mission.entities = [];
-      room.mission.nextId = Math.max(room.mission.nextId || 1, 1);
-      if (pick === "destroy") {
-        const count = rndInt(2, 7);
-        room.mission.entities = azhaSpawnLocalEntities(room, "enemy", tgt, count);
-        azhaJimboSay(room, `CONTACT. Hostile old-tech drones detected. Destroy all targets in the local grid. (${count} total)`);
-      } else {
-        const count = rndInt(1, 6);
-        room.mission.entities = azhaSpawnLocalEntities(room, "datnode", tgt, count);
-        azhaJimboSay(room, `DATA SIGNATURES FOUND. Retrieve all datnodes in the local grid. (${count} total)`);
-      }
-      azhaPushMission(room);
-    }
-    return;
-  }
-  if (room.mission.phase === "destroy" || room.mission.phase === "retrieve") {
-    if (room.mission.entities.length === 0) {
-      azhaJimboSay(room, room.mission.phase === "destroy" ? `AREA SECURED. Stand by for next nav task.` : `DATA RECOVERED. Stand by for next nav task.`);
-      room.mission.step++;
-      room.mission.phase = "rally";
-      room.mission.entities = [];
-      room.mission.nextId = 1;
-      const nt = azhaPickRallyTarget(room);
-      room.mission.target = { x: Math.round(nt.x * 1000) / 1000, y: Math.round(nt.y * 1000) / 1000 };
-      azhaJimboSay(room, `New nav blip uploaded. Rally at (X:${room.mission.target.x.toFixed(1)} Y:${room.mission.target.y.toFixed(1)}).`);
-      azhaPushMission(room);
-    }
-  }
-}
-function azhaMaybeStart(room, roomId) {
-  if (room.started) return;
-  const metas = [...room.clients.values()];
-  if (metas.length !== 2) return;
-  if (!metas.every(m => m.ready)) return;
-  room.started = true;
-  room.seed = nowSeed();
-  room.mapW = 80;
-  room.mapH = 45;
-  room.mapGrid = genDuneMap(room.mapW, room.mapH, room.seed);
-  azhaBroadcast(room, { type: "start", room: roomId, seed: room.seed, mapW: room.mapW, mapH: room.mapH });
-  azhaStartMission(room);
 }
 // ---------------------------------------------------------------------------------------------------------
 // GROWTH Frog-Hole / Croakline protocol (gf:...)
@@ -5644,76 +5552,6 @@ setInterval(() => {
   } catch {}
 }, TWO_TICK_MS);
 
-// ----------------------------------------
-// AZHA fixed-rate net sync & enemy AI tick
-// ----------------------------------------
-const TICK_MS = 50;   // 20 Hz
-const ENEMY_MS = 100; // 10 Hz
-let _accEnemy = 0;
-setInterval(() => {
-  for (const room of rooms.values()) {
-    if (!room || room.game !== "AZHA") continue;
-    if (!room.started) continue;
-    const metas = [...room.clients.entries()];
-    if (metas.length === 0) continue;
-    for (const [wsA, metaA] of metas) {
-      if (!metaA || !metaA.state || !metaA._dirty) continue;
-      metaA._dirty = false;
-      const msg = { type: "state", from: metaA.id, name: metaA.name || metaA.id, s: metaA.state };
-      const data = JSON.stringify(msg);
-      for (const [wsB] of metas) {
-        try { if (wsB && wsB.readyState === 1) wsB.send(data); } catch {}
-      }
-    }
-    _accEnemy += TICK_MS;
-    if (_accEnemy >= ENEMY_MS) {
-      _accEnemy = 0;
-      if (room.mission && room.mission.phase === "destroy" && Array.isArray(room.mission.entities) && room.mission.entities.length) {
-        const players = metas
-          .map(([, m]) => (m && m.state) ? { x: m.state.x, y: m.state.y } : null)
-          .filter(Boolean);
-        if (players.length) {
-          let moved = null;
-          for (const e of room.mission.entities) {
-            if (!e || e.type !== "enemy") continue;
-            const ex = e.x, ey = e.y;
-            let best = players[0], bestD2 = 1e9;
-            for (const p of players) {
-              const dx = p.x - ex, dy = p.y - ey;
-              const d2 = dx * dx + dy * dy;
-              if (d2 < bestD2) { bestD2 = d2; best = p; }
-            }
-            const hp = (e.hp | 0) || 2;
-            const flee = hp <= 1 && bestD2 < 9.0;
-            const speed = flee ? 0.020 : 0.028;
-            let vx = best.x - ex, vy = best.y - ey;
-            const mag = Math.hypot(vx, vy) || 1;
-            vx /= mag; vy /= mag;
-            if (flee) { vx = -vx; vy = -vy; }
-            let nx = ex + vx * speed;
-            let ny = ey + vy * speed;
-            if (azhaIsWall(room, nx, ny)) {
-              if (!azhaIsWall(room, nx, ey)) { ny = ey; }
-              else if (!azhaIsWall(room, ex, ny)) { nx = ex; }
-              else { nx = ex; ny = ey; }
-            }
-            nx = clamp(nx, 1.25, (room.mapW || 80) - 2.25);
-            ny = clamp(ny, 1.25, (room.mapH || 45) - 2.25);
-            const dxm = nx - ex, dym = ny - ey;
-            if ((dxm * dxm + dym * dym) > 1e-6) {
-              e.x = Math.round(nx * 1000) / 1000;
-              e.y = Math.round(ny * 1000) / 1000;
-              (moved || (moved = [])).push({ id: e.id | 0, x: e.x, y: e.y, hp: e.hp | 0 });
-            }
-          }
-          if (moved && moved.length) {
-            azhaBroadcast(room, { type: "m_update", op: "pos", list: moved });
-          }
-        }
-      }
-    }
-  }
-}, TICK_MS);
 // -------------------------
 // STUG shared theater pulse
 // -------------------------
