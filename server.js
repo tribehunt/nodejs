@@ -5,8 +5,12 @@
 const http = require("http");
 const https = require("https");
 const zlib = require("zlib");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
 const WebSocket = require("ws");
 const PORT = process.env.PORT || 8080;
+const HOST = String(process.env.HOST || process.env.BIND_HOST || process.env.MEGA_CLAIM_HOST || (process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID ? "0.0.0.0" : "127.0.0.1")).trim() || "127.0.0.1";
 const server = http.createServer((req, res) => {
   if (handleMegaClaimHTTP(req, res)) return;
   res.writeHead(200, { "content-type": "text/plain" });
@@ -35,8 +39,55 @@ try { if (_hb && typeof _hb.unref === "function") _hb.unref(); } catch {}
 // Vespera's autonomous MEGA responder runs inside each game copy, but this
 // Railway endpoint gives all copies one shared lock so only one Vespera answers
 // each incoming MEGA chat message.
-const MEGA_CLAIM_TTL_MS = Math.max(30000, Number(process.env.MEGA_CLAIM_TTL_MS || 180000));
+function megaEnvNumber(name, fallback, min, max) {
+  const n = Number(process.env[name]);
+  let v = Number.isFinite(n) ? n : Number(fallback);
+  if (Number.isFinite(min)) v = Math.max(Number(min), v);
+  if (Number.isFinite(max)) v = Math.min(Number(max), v);
+  return v;
+}
+const MEGA_CLAIM_TTL_MS = megaEnvNumber("MEGA_CLAIM_TTL_MS", 180000, 30000);
+function readMegaClaimSecretFile() {
+  const candidates = [
+    process.env.MEGA_CLAIM_SECRET_FILE,
+    path.join(process.cwd(), "crew", "her", ".gate", "mega_claim.secret"),
+    path.join(__dirname, "crew", "her", ".gate", "mega_claim.secret"),
+    path.join(process.cwd(), "crew", "her", "mega_claim.secret"),
+    path.join(__dirname, "crew", "her", "mega_claim.secret"),
+    path.join(process.cwd(), "mega_claim.secret"),
+    path.join(__dirname, "mega_claim.secret")
+  ].filter(Boolean);
+  const seen = new Set();
+  for (const candidate of candidates) {
+    try {
+      const p = path.resolve(String(candidate || ""));
+      const key = p.toLowerCase();
+      if (!p || seen.has(key)) continue;
+      seen.add(key);
+      if (fs.existsSync(p) && fs.statSync(p).isFile()) {
+        const secret = fs.readFileSync(p, "utf8").split(/\r?\n/)[0].trim();
+        if (secret) return secret;
+      }
+    } catch {}
+  }
+  return "";
+}
+const MEGA_CLAIM_SECRET = String(process.env.MEGA_CLAIM_SECRET || process.env.VESPERA_MEGA_CLAIM_SECRET || readMegaClaimSecretFile() || "").trim();
+const MEGA_CLAIM_REQUIRE_AUTH = !/^0|false|no|off$/i.test(String(process.env.MEGA_CLAIM_REQUIRE_AUTH || "1").trim());
+const MEGA_CLAIM_HMAC_WINDOW_MS = megaEnvNumber("MEGA_CLAIM_HMAC_WINDOW_MS", 300000, 30000);
+const MEGA_CLAIM_RATE_WINDOW_MS = megaEnvNumber("MEGA_CLAIM_RATE_WINDOW_MS", 60000, 10000);
+const MEGA_CLAIM_RATE_MAX = megaEnvNumber("MEGA_CLAIM_RATE_MAX", 120, 5);
+const MEGA_CLAIM_STORE = path.resolve(String(process.env.MEGA_CLAIM_STORE || path.join(process.cwd(), "data", "mega_claims.json")));
+const MEGA_CLAIM_ALLOWED_ORIGINS = new Set(
+  String(process.env.MEGA_CLAIM_ALLOWED_ORIGINS || "http://localhost,http://127.0.0.1,http://localhost:8080,http://127.0.0.1:8080")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean)
+);
 const megaClaims = new Map();
+const megaClaimRate = new Map();
+let megaClaimsDirty = false;
+let megaClaimSaveTimer = null;
 
 function megaClaimCleanId(v, max = 220) {
   return String(v || "")
@@ -61,11 +112,142 @@ function megaClaimKey(room, messageId, fingerprint) {
   return rid + ":" + mid;
 }
 
+function megaClaimClientIP(req) {
+  try { return pickIP(req) || "local"; } catch { return "local"; }
+}
+
+function megaClaimOriginAllowed(req) {
+  try {
+    const origin = String((req && req.headers && req.headers.origin) || "").trim();
+    if (!origin) return true;
+    if (MEGA_CLAIM_ALLOWED_ORIGINS.has(origin)) return true;
+    try {
+      const u = new URL(origin);
+      const host = String(u.hostname || "").toLowerCase();
+      if ((host === "localhost" || host === "127.0.0.1" || host === "::1") && MEGA_CLAIM_ALLOWED_ORIGINS.has(u.protocol + "//" + host)) return true;
+    } catch {}
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function megaClaimCorsHeaders(req) {
+  const headers = {
+    "content-type": "application/json",
+    "cache-control": "no-store",
+    "vary": "Origin",
+    "access-control-allow-methods": "POST,OPTIONS",
+    "access-control-allow-headers": "content-type,authorization,x-hn-timestamp,x-hn-signature"
+  };
+  try {
+    const origin = String((req && req.headers && req.headers.origin) || "").trim();
+    if (origin && megaClaimOriginAllowed(req)) headers["access-control-allow-origin"] = origin;
+  } catch {}
+  return headers;
+}
+
+function megaClaimRateAllow(req) {
+  const now = Date.now();
+  const ip = megaClaimClientIP(req);
+  let rec = megaClaimRate.get(ip);
+  if (!rec || Number(rec.reset || 0) <= now) rec = { count: 0, reset: now + MEGA_CLAIM_RATE_WINDOW_MS };
+  rec.count = Number(rec.count || 0) + 1;
+  megaClaimRate.set(ip, rec);
+  if (megaClaimRate.size > 2000) {
+    for (const [k, v] of megaClaimRate.entries()) {
+      if (!v || Number(v.reset || 0) <= now) megaClaimRate.delete(k);
+    }
+  }
+  return rec.count <= MEGA_CLAIM_RATE_MAX;
+}
+
+function megaClaimSafeEqual(a, b) {
+  try {
+    const ab = Buffer.from(String(a || ""), "hex");
+    const bb = Buffer.from(String(b || ""), "hex");
+    return ab.length > 0 && ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
+  } catch {
+    return false;
+  }
+}
+
+function megaClaimVerifyHmac(req, body) {
+  try {
+    if (!MEGA_CLAIM_SECRET) {
+      if (!MEGA_CLAIM_REQUIRE_AUTH) return { ok: true, auth: "disabled" };
+      return { ok: false, code: 503, error: "claim-secret-not-configured" };
+    }
+    const h = (req && req.headers) ? req.headers : {};
+    let ts = String(h["x-hn-timestamp"] || "").trim();
+    let sig = String(h["x-hn-signature"] || "").trim().toLowerCase();
+    const auth = String(h.authorization || "").trim();
+    const m = auth.match(/^HN-HMAC\s+([0-9]{8,14})[: ]([a-f0-9]{64})$/i);
+    if ((!ts || !sig) && m) { ts = m[1]; sig = m[2].toLowerCase(); }
+    if (!ts || !sig) return { ok: false, code: 401, error: "missing-hmac" };
+    const tsMs = Number(ts) * 1000;
+    if (!Number.isFinite(tsMs) || Math.abs(Date.now() - tsMs) > MEGA_CLAIM_HMAC_WINDOW_MS) return { ok: false, code: 401, error: "stale-hmac" };
+    const expected = crypto.createHmac("sha256", MEGA_CLAIM_SECRET).update(ts + "." + String(body || ""), "utf8").digest("hex");
+    if (!megaClaimSafeEqual(sig, expected)) return { ok: false, code: 401, error: "bad-hmac" };
+    return { ok: true, auth: "hmac" };
+  } catch {
+    return { ok: false, code: 401, error: "hmac-check-failed" };
+  }
+}
+
+function megaClaimLoadStore() {
+  try {
+    if (!fs.existsSync(MEGA_CLAIM_STORE)) return;
+    const raw = fs.readFileSync(MEGA_CLAIM_STORE, "utf8");
+    const data = JSON.parse(raw || "{}");
+    const claims = data && typeof data === "object" ? data.claims : null;
+    if (!claims || typeof claims !== "object") return;
+    const now = Date.now();
+    for (const [k, v] of Object.entries(claims)) {
+      if (v && typeof v === "object" && Number(v.expiresAt || 0) > now) megaClaims.set(String(k), v);
+    }
+  } catch (err) {
+    console.warn("MEGA claim store load failed:", String(err && err.message ? err.message : err));
+  }
+}
+
+function megaClaimSaveNow() {
+  try {
+    megaClaimSaveTimer = null;
+    if (!megaClaimsDirty) return;
+    megaClaimsDirty = false;
+    const dir = path.dirname(MEGA_CLAIM_STORE);
+    try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+    const claims = {};
+    for (const [k, v] of megaClaims.entries()) claims[k] = v;
+    const tmp = MEGA_CLAIM_STORE + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify({ version: 1, updated_at: Date.now(), claims }, null, 2), "utf8");
+    fs.renameSync(tmp, MEGA_CLAIM_STORE);
+  } catch (err) {
+    console.warn("MEGA claim store save failed:", String(err && err.message ? err.message : err));
+  }
+}
+
+function megaClaimMarkDirty() {
+  megaClaimsDirty = true;
+  if (!megaClaimSaveTimer) {
+    megaClaimSaveTimer = setTimeout(megaClaimSaveNow, 250);
+    try { if (megaClaimSaveTimer && typeof megaClaimSaveTimer.unref === "function") megaClaimSaveTimer.unref(); } catch {}
+  }
+}
+
+megaClaimLoadStore();
+
 function megaClaimSweep() {
   const now = Date.now();
+  let changed = false;
   for (const [k, v] of megaClaims.entries()) {
-    if (!v || Number(v.expiresAt || 0) <= now) megaClaims.delete(k);
+    if (!v || Number(v.expiresAt || 0) <= now) {
+      megaClaims.delete(k);
+      changed = true;
+    }
   }
+  if (changed) megaClaimMarkDirty();
 }
 
 try {
@@ -73,15 +255,9 @@ try {
   if (_megaClaimSweep && typeof _megaClaimSweep.unref === "function") _megaClaimSweep.unref();
 } catch {}
 
-function megaClaimReply(res, code, obj) {
+function megaClaimReply(req, res, code, obj) {
   try {
-    res.writeHead(code, {
-      "content-type": "application/json",
-      "cache-control": "no-store",
-      "access-control-allow-origin": "*",
-      "access-control-allow-methods": "POST,OPTIONS",
-      "access-control-allow-headers": "content-type,authorization"
-    });
+    res.writeHead(code, megaClaimCorsHeaders(req));
     if (code === 204) res.end();
     else res.end(JSON.stringify(obj));
   } catch {}
@@ -93,12 +269,21 @@ function handleMegaClaimHTTP(req, res) {
     const path = String(url.pathname || "").replace(/\/+$/, "") || "/";
     if (path !== "/mega-claim" && path !== "/api/mega-claim") return false;
 
+    if (!megaClaimOriginAllowed(req)) {
+      megaClaimReply(req, res, 403, { ok: false, error: "origin-not-allowed" });
+      return true;
+    }
+    if (!megaClaimRateAllow(req)) {
+      megaClaimReply(req, res, 429, { ok: false, error: "rate-limited" });
+      return true;
+    }
+
     if (req.method === "OPTIONS") {
-      megaClaimReply(res, 204, { ok: true });
+      megaClaimReply(req, res, 204, { ok: true });
       return true;
     }
     if (req.method !== "POST") {
-      megaClaimReply(res, 405, { ok: false, error: "method-not-allowed" });
+      megaClaimReply(req, res, 405, { ok: false, error: "method-not-allowed" });
       return true;
     }
 
@@ -110,10 +295,15 @@ function handleMegaClaimHTTP(req, res) {
       }
     });
     req.on("end", () => {
+      const auth = megaClaimVerifyHmac(req, body);
+      if (!auth || !auth.ok) {
+        megaClaimReply(req, res, Number((auth && auth.code) || 401), { ok: false, error: String((auth && auth.error) || "unauthorized") });
+        return;
+      }
       let m = null;
       try { m = JSON.parse(body || "{}"); } catch { m = null; }
       if (!m || typeof m !== "object") {
-        megaClaimReply(res, 400, { ok: false, error: "bad-json" });
+        megaClaimReply(req, res, 400, { ok: false, error: "bad-json" });
         return;
       }
 
@@ -128,13 +318,13 @@ function handleMegaClaimHTTP(req, res) {
       const now = Date.now();
 
       if (!key || !ownerId) {
-        megaClaimReply(res, 400, { ok: false, error: "missing-message-or-owner" });
+        megaClaimReply(req, res, 400, { ok: false, error: "missing-message-or-owner" });
         return;
       }
 
       const existing = megaClaims.get(key);
       if (op === "status") {
-        megaClaimReply(res, 200, {
+        megaClaimReply(req, res, 200, {
           ok: true,
           claimed: !!existing,
           owner_id: existing ? existing.owner_id : "",
@@ -147,8 +337,8 @@ function handleMegaClaimHTTP(req, res) {
       }
 
       if (op === "release") {
-        if (existing && existing.owner_id === ownerId) megaClaims.delete(key);
-        megaClaimReply(res, 200, { ok: true, released: true, owner_id: ownerId, ts: now });
+        if (existing && existing.owner_id === ownerId) { megaClaims.delete(key); megaClaimMarkDirty(); }
+        megaClaimReply(req, res, 200, { ok: true, released: true, owner_id: ownerId, ts: now });
         return;
       }
 
@@ -164,14 +354,15 @@ function handleMegaClaimHTTP(req, res) {
           completedAt: now,
           expiresAt: now + Math.max(MEGA_CLAIM_TTL_MS, ttlSeconds * 1000)
         });
-        megaClaimReply(res, 200, { ok: true, completed: true, claimed: true, owner_id: ownerId, ts: now });
+        megaClaimMarkDirty();
+        megaClaimReply(req, res, 200, { ok: true, completed: true, claimed: true, owner_id: ownerId, ts: now });
         return;
       }
 
       // Default op: claim. Existing owner wins until TTL expires. A completed
       // claim also blocks duplicate replies for the TTL window.
       if (existing && Number(existing.expiresAt || 0) > now && existing.owner_id && existing.owner_id !== ownerId) {
-        megaClaimReply(res, 200, {
+        megaClaimReply(req, res, 200, {
           ok: true,
           claimed: false,
           owner_id: existing.owner_id,
@@ -193,10 +384,11 @@ function handleMegaClaimHTTP(req, res) {
         claimedAt: existing ? existing.claimedAt : now,
         expiresAt: now + ttlSeconds * 1000
       });
-      megaClaimReply(res, 200, { ok: true, claimed: true, owner_id: ownerId, expires_at: now + ttlSeconds * 1000, ts: now });
+      megaClaimMarkDirty();
+      megaClaimReply(req, res, 200, { ok: true, claimed: true, owner_id: ownerId, expires_at: now + ttlSeconds * 1000, ts: now });
     });
   } catch (e) {
-    try { megaClaimReply(res, 500, { ok: false, error: String(e && e.message ? e.message : e).slice(0, 240) }); } catch {}
+    try { megaClaimReply(req, res, 500, { ok: false, error: String(e && e.message ? e.message : e).slice(0, 240) }); } catch {}
   }
   return true;
 }
@@ -5563,6 +5755,7 @@ setInterval(() => {
   }
 }, STUG_TICK_MS);
 // ------------------------------------------------------
-server.listen(PORT, "0.0.0.0", () => {
-  console.log("Merged relay (Dedset App) on port", PORT);
+server.listen(PORT, HOST, () => {
+  console.log("Merged relay (Dedset App) on", HOST + ":" + PORT);
+  if (MEGA_CLAIM_REQUIRE_AUTH && !MEGA_CLAIM_SECRET) console.warn("MEGA claim endpoint is locked until MEGA_CLAIM_SECRET is configured.");
 });
