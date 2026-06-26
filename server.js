@@ -32,10 +32,9 @@ const _hb = setInterval(() => {
   } catch {}
 }, HEARTBEAT_MS);
 try { if (_hb && typeof _hb.unref === "function") _hb.unref(); } catch {}
-
-// ------------------------------------------------------------
+// ---------------------------------------------------------
 // House Nocturne MEGA chat distributed reply claim endpoint
-// ------------------------------------------------------------
+// ---------------------------------------------------------
 // Vespera's autonomous MEGA responder runs inside each game copy, but this
 // Railway endpoint gives all copies one shared lock so only one Vespera answers
 // each incoming MEGA chat message.
@@ -88,7 +87,6 @@ const megaClaims = new Map();
 const megaClaimRate = new Map();
 let megaClaimsDirty = false;
 let megaClaimSaveTimer = null;
-
 function megaClaimCleanId(v, max = 220) {
   return String(v || "")
     .replace(/[\r\n\t]/g, " ")
@@ -96,7 +94,6 @@ function megaClaimCleanId(v, max = 220) {
     .trim()
     .slice(0, max);
 }
-
 function megaClaimRoom(v) {
   const s = String(v || "house_nocturne")
     .toLowerCase()
@@ -104,18 +101,15 @@ function megaClaimRoom(v) {
     .slice(0, 48);
   return s || "house_nocturne";
 }
-
 function megaClaimKey(room, messageId, fingerprint) {
   const rid = megaClaimRoom(room);
   const mid = megaClaimCleanId(messageId || fingerprint || "", 220);
   if (!mid) return "";
   return rid + ":" + mid;
 }
-
 function megaClaimClientIP(req) {
   try { return pickIP(req) || "local"; } catch { return "local"; }
 }
-
 function megaClaimOriginAllowed(req) {
   try {
     const origin = String((req && req.headers && req.headers.origin) || "").trim();
@@ -131,7 +125,6 @@ function megaClaimOriginAllowed(req) {
     return false;
   }
 }
-
 function megaClaimCorsHeaders(req) {
   const headers = {
     "content-type": "application/json",
@@ -146,7 +139,6 @@ function megaClaimCorsHeaders(req) {
   } catch {}
   return headers;
 }
-
 function megaClaimRateAllow(req) {
   const now = Date.now();
   const ip = megaClaimClientIP(req);
@@ -161,7 +153,6 @@ function megaClaimRateAllow(req) {
   }
   return rec.count <= MEGA_CLAIM_RATE_MAX;
 }
-
 function megaClaimSafeEqual(a, b) {
   try {
     const ab = Buffer.from(String(a || ""), "hex");
@@ -171,7 +162,6 @@ function megaClaimSafeEqual(a, b) {
     return false;
   }
 }
-
 function megaClaimVerifyHmac(req, body) {
   try {
     if (!MEGA_CLAIM_SECRET) {
@@ -194,7 +184,6 @@ function megaClaimVerifyHmac(req, body) {
     return { ok: false, code: 401, error: "hmac-check-failed" };
   }
 }
-
 function megaClaimLoadStore() {
   try {
     if (!fs.existsSync(MEGA_CLAIM_STORE)) return;
@@ -210,7 +199,6 @@ function megaClaimLoadStore() {
     console.warn("MEGA claim store load failed:", String(err && err.message ? err.message : err));
   }
 }
-
 function megaClaimSaveNow() {
   try {
     megaClaimSaveTimer = null;
@@ -227,7 +215,6 @@ function megaClaimSaveNow() {
     console.warn("MEGA claim store save failed:", String(err && err.message ? err.message : err));
   }
 }
-
 function megaClaimMarkDirty() {
   megaClaimsDirty = true;
   if (!megaClaimSaveTimer) {
@@ -235,9 +222,7 @@ function megaClaimMarkDirty() {
     try { if (megaClaimSaveTimer && typeof megaClaimSaveTimer.unref === "function") megaClaimSaveTimer.unref(); } catch {}
   }
 }
-
 megaClaimLoadStore();
-
 function megaClaimSweep() {
   const now = Date.now();
   let changed = false;
@@ -249,12 +234,10 @@ function megaClaimSweep() {
   }
   if (changed) megaClaimMarkDirty();
 }
-
 try {
   const _megaClaimSweep = setInterval(megaClaimSweep, 30000);
   if (_megaClaimSweep && typeof _megaClaimSweep.unref === "function") _megaClaimSweep.unref();
 } catch {}
-
 function megaClaimReply(req, res, code, obj) {
   try {
     res.writeHead(code, megaClaimCorsHeaders(req));
@@ -262,13 +245,11 @@ function megaClaimReply(req, res, code, obj) {
     else res.end(JSON.stringify(obj));
   } catch {}
 }
-
 function handleMegaClaimHTTP(req, res) {
   try {
     const url = new URL(req.url || "/", "http://localhost");
     const path = String(url.pathname || "").replace(/\/+$/, "") || "/";
     if (path !== "/mega-claim" && path !== "/api/mega-claim") return false;
-
     if (!megaClaimOriginAllowed(req)) {
       megaClaimReply(req, res, 403, { ok: false, error: "origin-not-allowed" });
       return true;
@@ -277,7 +258,6 @@ function handleMegaClaimHTTP(req, res) {
       megaClaimReply(req, res, 429, { ok: false, error: "rate-limited" });
       return true;
     }
-
     if (req.method === "OPTIONS") {
       megaClaimReply(req, res, 204, { ok: true });
       return true;
@@ -286,7 +266,6 @@ function handleMegaClaimHTTP(req, res) {
       megaClaimReply(req, res, 405, { ok: false, error: "method-not-allowed" });
       return true;
     }
-
     let body = "";
     req.on("data", (chunk) => {
       body += chunk.toString("utf8");
@@ -306,7 +285,6 @@ function handleMegaClaimHTTP(req, res) {
         megaClaimReply(req, res, 400, { ok: false, error: "bad-json" });
         return;
       }
-
       megaClaimSweep();
       const op = String(m.op || "claim").toLowerCase();
       const room = megaClaimRoom(m.room || "house_nocturne");
@@ -316,12 +294,10 @@ function handleMegaClaimHTTP(req, res) {
       const key = megaClaimKey(room, messageId, fingerprint);
       const ttlSeconds = Math.max(30, Math.min(900, Number(m.ttl_seconds || m.ttl || MEGA_CLAIM_TTL_MS / 1000) || 180));
       const now = Date.now();
-
       if (!key || !ownerId) {
         megaClaimReply(req, res, 400, { ok: false, error: "missing-message-or-owner" });
         return;
       }
-
       const existing = megaClaims.get(key);
       if (op === "status") {
         megaClaimReply(req, res, 200, {
@@ -335,13 +311,11 @@ function handleMegaClaimHTTP(req, res) {
         });
         return;
       }
-
       if (op === "release") {
         if (existing && existing.owner_id === ownerId) { megaClaims.delete(key); megaClaimMarkDirty(); }
         megaClaimReply(req, res, 200, { ok: true, released: true, owner_id: ownerId, ts: now });
         return;
       }
-
       if (op === "complete") {
         megaClaims.set(key, {
           owner_id: ownerId,
@@ -358,7 +332,6 @@ function handleMegaClaimHTTP(req, res) {
         megaClaimReply(req, res, 200, { ok: true, completed: true, claimed: true, owner_id: ownerId, ts: now });
         return;
       }
-
       // Default op: claim. Existing owner wins until TTL expires. A completed
       // claim also blocks duplicate replies for the TTL window.
       if (existing && Number(existing.expiresAt || 0) > now && existing.owner_id && existing.owner_id !== ownerId) {
@@ -373,7 +346,6 @@ function handleMegaClaimHTTP(req, res) {
         });
         return;
       }
-
       megaClaims.set(key, {
         owner_id: ownerId,
         owner_name: megaClaimCleanId(m.owner_name || "Vespera", 80),
@@ -392,7 +364,6 @@ function handleMegaClaimHTTP(req, res) {
   }
   return true;
 }
-
 // --------------
 // Shared helpers
 // --------------
@@ -694,9 +665,9 @@ function enforceReservedName(ws, desired, currentName, fallbackId, proto) {
   _sendReservedNameError(ws, proto, desired);
   return { name: fb, blocked: true, reservedKey };
 }
-// --------------------------------------
+// ------------------------
 // ECF legacy room registry
-// --------------------------------------
+// ------------------------
 const rooms = new Map();
 // ------------------------------------------------------------------------------------------------------------
 // ETHANE SEA PRISON protocol (p:...)
@@ -1940,7 +1911,6 @@ function growthHandle(ws, payloadStr) {
     try { if (host.visitors) host.visitors.clear(); } catch {}
     return;
   }
-
   if (t === "sluagh_request") {
     const hostId = growthSafeId(m.host_id || ws._growthHostId || ws._growthId || "");
     const host = hostId ? growthHosts.get(hostId) : null;
@@ -2012,7 +1982,6 @@ function growthHandle(ws, payloadStr) {
     for (const v of growthVisitorSockets(host)) if (v !== ws) growthSend(v, packet);
     return;
   }
-
   if (t === "sluagh_tongue") {
     const hostId = growthSafeId(m.host_id || ws._growthHostId || "");
     const host = hostId ? growthHosts.get(hostId) : null;
@@ -2021,7 +1990,6 @@ function growthHandle(ws, payloadStr) {
     growthSend(host.ws, packet);
     return;
   }
-
   if (t === "castle_chat" || t === "chat") {
     const hostId = growthSafeId(m.host_id || ws._growthHostId || m.id || ws._growthId || "");
     const host = hostId ? growthHosts.get(hostId) : null;
@@ -2093,8 +2061,7 @@ function growthHandle(ws, payloadStr) {
     return;
   }
 }
-
-// ---------------------------------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------------------------
 // ARMORBOUND protocol (2:...)
 // Small 700x400 co-op vampire-nest game. One room = two hunters, one shared drop-pod vehicle.
 // Clients send:  2:{"t":"join","room":"global","id":"H-XXXX","name":"Hunter","sprite":1}
@@ -2106,7 +2073,7 @@ function growthHandle(ws, payloadStr) {
 //                2:{"t":"shot","a":0}
 // Server sends:  2:{"t":"welcome"} / 2:{"t":"lobby"} / 2:{"t":"mission"} / 2:{"t":"start"}
 //                2:{"t":"vehicle"} / 2:{"t":"enemies"} / 2:{"t":"enemy_remove"} / 2:{"t":"complete"}
-// ---------------------------------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------------------------
 const twoRooms = new Map();
 function twoSafeId(s, fallback) {
   s = String(s || fallback || ("H-" + rid())).replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32);
@@ -2381,7 +2348,6 @@ function twoSharedMissionLevel(room, fallback = 1) {
   }
   return best;
 }
-
 function twoKinguStatsFromParty(room) {
   const keys = ["STR", "DEX", "CON", "INT", "WIS", "CHA"];
   const blocks = [];
@@ -2426,7 +2392,6 @@ function twoApplyKinguBalance(e, stats) {
   e.xp = 0;
   return e;
 }
-
 function twoMissionIsKinguStage(mission) {
   const c = mission && mission.campaign && typeof mission.campaign === "object" ? mission.campaign : {};
   return !!(c && (Number(c.stage || -1) === 5 || c.final));
@@ -2464,7 +2429,6 @@ function twoSyncLobby(room) {
   twoBroadcast(room, { t: "lobby", room: room.name, roles: room.roles, users: twoUsers(room), started: !!room.started, ts: Date.now() });
   twoSendRoleSync(room);
 }
-
 function twoMetaById(room, id) {
   id = String(id || "");
   if (!room || !id) return null;
@@ -2654,14 +2618,12 @@ function twoLineClear(room, x0, y0, x1, y1) {
   }
   return true;
 }
-
 const TWO_NEST_DELAY_SEC = 12.0;
 const TWO_NEST_BUILD_INTERVAL_SEC = 0.72;
 const TWO_NEST_RADIUS = 3;
 const TWO_NEST_BUILDER_COUNT = 3;
 const TWO_NEST_BUILD_RANGE = 1.55;
 const TWO_NEST_RALLY_RADIUS = 1.85;
-
 function twoMapCell(map, x, y, fallback = "1") {
   try {
     x = Math.floor(Number(x)); y = Math.floor(Number(y));
@@ -2759,7 +2721,6 @@ function twoChooseNestEntrance(map, cx, cy, radius, px, py) {
   }
   return best || choices[0];
 }
-
 function twoNestEntranceUnit(state) {
   try {
     const side = String((state && state.entrance && state.entrance.side) || "north").toLowerCase();
@@ -2840,7 +2801,6 @@ function twoFrontGatherSortKey(side, cx, cy, entrance, pt) {
   const x = Number(pt[0]), y = Number(pt[1]);
   return Math.hypot(x - ex, y - ey) * 1000 + Math.abs(x - (Number(cx) + 0.5)) + Math.abs(y - (Number(cy) + 0.5));
 }
-
 function twoIsEnemy2(e) {
   try {
     if (String((e && e.archetype) || "").toLowerCase() === "caster") return true;
@@ -2921,7 +2881,6 @@ function twoGarrisonPointsAwayFromDoor(state, gather) {
     return pts.length ? pts : (gather || []);
   } catch { return gather || []; }
 }
-
 function twoPlanNesting(room) {
   try {
     const mission = room && room.mission;
@@ -3040,7 +2999,6 @@ function twoCurrentBuildCell(state) {
   } catch {}
   return null;
 }
-
 function twoNestWorkCandidates(state, x, y) {
   const out = [];
   const seen = new Set();
@@ -3152,7 +3110,6 @@ function twoSelectReachableBuildCell(room, state) {
     return cell;
   } catch { return twoCurrentBuildCell(state); }
 }
-
 function twoRemainingBuildCells(room, state, limit = null) {
   const out = [];
   try {
@@ -3262,7 +3219,6 @@ function twoBuilderReadyForJob(room, state, key, job) {
   } catch {}
   return false;
 }
-
 function twoPrepareNestChamber(room, state, cells) {
   try {
     const map = room && room.mission && Array.isArray(room.mission.map) ? room.mission.map : [];
@@ -3272,7 +3228,6 @@ function twoPrepareNestChamber(room, state, cells) {
     }
   } catch {}
 }
-
 function twoNestBuilderNearCell(room, state, x, y) {
   const builders = twoNestBuilderIds(room, state);
   if (!builders.size) { twoNestDebug(state, "no live builders assigned"); return false; }
@@ -3299,7 +3254,6 @@ function twoNestBuilderNearCell(room, state, x, y) {
   if (bestD < 999998) twoNestDebug(state, `waiting: nearest builder ${bestD.toFixed(2)} from work point for wall ${x},${y}`);
   return false;
 }
-
 function twoAssignNestTargets(room, state) {
   try {
     const enemies = room && room.mission && Array.isArray(room.mission.enemies) ? room.mission.enemies : [];
@@ -3372,7 +3326,6 @@ function twoAssignNestTargets(room, state) {
     }
   } catch {}
 }
-
 function twoEnemyInNestDoorway(e) {
   try {
     const mode = String((e && e.nest_mode) || "");
@@ -3389,7 +3342,6 @@ function twoSameNestDoorway(a, b) {
       && Number(a.nest_door_y) === Number(b.nest_door_y);
   } catch { return false; }
 }
-
 function twoSameActiveNestSpace(a, b) {
   try {
     const ma = String((a && a.nest_mode) || "");
@@ -3405,7 +3357,6 @@ function twoSameActiveNestSpace(a, b) {
     return Math.hypot(ex - ax, ey - ay) <= 4.65 && Math.hypot(ox - bx, oy - by) <= 4.65;
   } catch { return false; }
 }
-
 function twoEnemyIdentity(e, idx) {
   const eid = Number(e && e.id);
   return Number.isFinite(eid) ? eid : Number(idx || 0) + 1;
@@ -3456,7 +3407,6 @@ function twoAlertEnemyUnderFire(e, sx, sy, duration = 7.0) {
   } catch (_) {}
   return e;
 }
-
 function twoCommitEnemyGoal(e, tx, ty, brain, tactic, force) {
   tx = Number(tx); ty = Number(ty);
   if (!Number.isFinite(tx) || !Number.isFinite(ty)) return null;
@@ -3516,8 +3466,6 @@ function twoArriveRadius(e, nestOrder, aware) {
   if (!aware) return Math.max(base, 0.34);
   return base;
 }
-
-
 function twoGridCellFromPoint(x, y) {
   return [Math.floor(Number(x) || 0), Math.floor(Number(y) || 0)];
 }
@@ -3644,7 +3592,6 @@ function twoHiveWaypointForGoal(room, e, ex, ey, tx, ty, vehicle, forcePath) {
     return { x: tx, y: ty };
   } catch { return { x: tx, y: ty }; }
 }
-
 function twoNestRepathGoal(room, e, ex, ey, tx, ty) {
   try {
     const oldD = Math.hypot(tx - ex, ty - ey);
@@ -3673,7 +3620,6 @@ function twoNestRepathGoal(room, e, ex, ey, tx, ty) {
   } catch {}
   return null;
 }
-
 function twoNestEnemyOccupiesCell(e, x, y) {
   try {
     const ex = Number(e.x || 0), ey = Number(e.y || 0);
@@ -3778,7 +3724,6 @@ function twoNestBuildWallNow(room, state, map, x, y, cells, reason) {
   } catch {}
   return false;
 }
-
 function twoNestSealCompletedShell(room, state, map, cells, force = false) {
   let changed = false;
   try {
@@ -3814,8 +3759,6 @@ function twoNestSealCompletedShell(room, state, map, cells, force = false) {
   } catch {}
   return changed;
 }
-
-
 function twoNestPerimeterCell(state, x, y) {
   try {
     const a = (state && state.anchor) || {};
@@ -3918,7 +3861,6 @@ function twoResumeNestingForNewWave(room) {
     return state;
   } catch { return room && room.nesting; }
 }
-
 function twoUpdateNesting(room, dtSec) {
   const state = twoEnsureNesting(room);
   const mission = room && room.mission;
@@ -4048,7 +3990,6 @@ function twoUpdateNesting(room, dtSec) {
   if (!cells.length && !phaseChanged) return null;
   return { cells, map, nesting: state };
 }
-
 function twoPointSegmentDistance(ax, ay, bx, by, px, py) {
   const vx = bx - ax, vy = by - ay;
   const denom = vx * vx + vy * vy;
@@ -4111,7 +4052,6 @@ function twoFindOpen(map, rnd, nearX, nearY) {
   }
   return { x: 2.5, y: 2.5, mx: 2, my: 2 };
 }
-
 function twoWaveDieForLevel(level) {
   level = Math.max(1, Math.min(20, Number(level || 1) | 0));
   if (level >= 17) return 12;
@@ -4156,7 +4096,6 @@ function twoInsideActiveNestSpawnBlock(nesting, x, y) {
     return Math.abs((Number(x) | 0) - cx) <= r + 2 && Math.abs((Number(y) | 0) - cy) <= r + 2;
   } catch { return false; }
 }
-
 function twoWaveSpawnCandidates(room) {
   const m = room && room.mission;
   const map = m && Array.isArray(m.map) ? m.map : [];
@@ -4183,7 +4122,6 @@ function twoWaveSpawnCandidates(room) {
   out.sort((a, b) => b.score - a.score);
   return out;
 }
-
 const TOXIC_GREEN_HEX = "#75e398";
 function twoMarkEliteTrait(tr, eliteType) {
   tr = Object.assign({}, tr || {});
@@ -4297,7 +4235,6 @@ function twoMaybeSpawnWaveElite(room, level) {
   if (elite) mission[`${key}_spawned`] = true;
   return elite;
 }
-
 function twoSpawnNextWave(room, level) {
   if (!room || !room.mission) return [];
   const mission = room.mission;
@@ -4434,7 +4371,6 @@ function twoResolveEnemyDamage(e, v) {
   const damage = Math.max(1, Math.floor(out));
   return { damage, text: `${label}${d20 === 20 ? " CRIT" : ""}: d20 ${d20}+${atk}=${total} vs TANK AC ${ac} -> HIT ${damage}` };
 }
-
 function twoScaleTraitForLevel(tr, level, wave) {
   tr = Object.assign({}, tr || {});
   tr.stats = Object.assign({}, tr.stats || {});
@@ -4464,7 +4400,6 @@ function twoScaleTraitForLevel(tr, level, wave) {
   tr.enemy_wave = wave;
   return tr;
 }
-
 function twoPrepareEnemy(e, rnd) {
   e = (e && typeof e === "object") ? e : {};
   const eid = Math.max(1, Number(e.id || 1) | 0);
@@ -4536,7 +4471,6 @@ const TWO_ENEMY_RADIUS = 0.32;
 const TWO_TANK_RADIUS = 0.48;
 const TWO_ENEMY_TANK_STANDOFF = TWO_ENEMY_RADIUS + TWO_TANK_RADIUS + 0.10;
 const TWO_ENEMY_ENEMY_STANDOFF = TWO_ENEMY_RADIUS * 2.0 + 0.10;
-
 function twoCircleOpen(room, x, y, radius) {
   const r = Math.max(0, Number(radius || 0)) * 1.08;
   if (twoIsWall(room, x, y)) return false;
@@ -4550,7 +4484,6 @@ function twoCircleOpen(room, x, y, radius) {
   for (const [ox, oy] of samples) if (twoIsWall(room, x + ox, y + oy)) return false;
   return true;
 }
-
 function twoVehicleCanStand(room, x, y, oldX = null, oldY = null) {
   if (!twoCircleOpen(room, x, y, 0.30)) return false;
   oldX = Number(oldX == null ? x : oldX);
@@ -4567,19 +4500,16 @@ function twoVehicleCanStand(room, x, y, oldX = null, oldY = null) {
   }
   return true;
 }
-
 function twoEnemyBodyClear(room, e, nx, ny, enemies, vehicle) {
   const ex = Number(e.x || 0), ey = Number(e.y || 0);
   const radius = Number(e.body_radius || TWO_ENEMY_RADIUS);
   if (!twoCircleOpen(room, nx, ny, radius)) return false;
-
   const v = vehicle || room.vehicle || { x: 2.5, y: 2.5 };
   const px = Number(v.x || 2.5), py = Number(v.y || 2.5);
   const minTankD = radius + Number(v.body_radius || TWO_TANK_RADIUS) + 0.08;
   const oldTankD = Math.hypot(ex - px, ey - py);
   const newTankD = Math.hypot(nx - px, ny - py);
   if (newTankD < minTankD && newTankD <= oldTankD + 0.006) return false;
-
   for (const o of (enemies || [])) {
     if (!o || o === e || Number(o.hp || 1) <= 0) continue;
     if (twoSameNestDoorway(e, o) || twoSameActiveNestSpace(e, o)) continue;
@@ -4592,7 +4522,6 @@ function twoEnemyBodyClear(room, e, nx, ny, enemies, vehicle) {
   }
   return true;
 }
-
 function twoMoveEnemy(room, e, nx, ny, enemies, vehicle) {
   const ex = Number(e.x || 0), ey = Number(e.y || 0);
   if (twoEnemyBodyClear(room, e, nx, ny, enemies, vehicle)) { e.x = Math.round(nx * 1000) / 1000; e.y = Math.round(ny * 1000) / 1000; return true; }
@@ -4600,7 +4529,6 @@ function twoMoveEnemy(room, e, nx, ny, enemies, vehicle) {
   if (twoEnemyBodyClear(room, e, ex, ny, enemies, vehicle)) { e.y = Math.round(ny * 1000) / 1000; return true; }
   return false;
 }
-
 function twoBodyPressureScore(e, nx, ny, enemies, vehicle) {
   const radius = Number(e.body_radius || TWO_ENEMY_RADIUS);
   let score = 0;
@@ -4648,7 +4576,6 @@ function twoWallContactVector(room, nx, ny, radius) {
     return { x: ax / mag, y: ay / mag, hits };
   } catch { return { x: 0, y: 0, hits: 0 }; }
 }
-
 function twoEmergencyUnstickStep(room, e, ex, ey, tx, ty, step, enemies, vehicle) {
   try {
     const radius = Number(e.body_radius || TWO_ENEMY_RADIUS);
@@ -4693,7 +4620,6 @@ function twoEmergencyUnstickStep(room, e, ex, ey, tx, ty, step, enemies, vehicle
     return true;
   } catch { return false; }
 }
-
 function twoSteeredMove(room, e, ex, ey, mx, my, step, tx, ty, enemies, vehicle) {
   if (!Number.isFinite(step) || step <= 0.0001) return false;
   const base = Math.atan2(my, mx);
@@ -4727,7 +4653,6 @@ function twoSteeredMove(room, e, ex, ey, mx, my, step, tx, ty, enemies, vehicle)
   else { e.avoidT = Math.max(0, Number(e.avoidT || 0) - 0.08); if (e.avoidT <= 0) e.avoidBias = 0; }
   return true;
 }
-
 function twoFindCoverPoint(room, ex, ey, px, py) {
   const away = Math.atan2(ey - py, ex - px);
   let best = null;
@@ -4749,7 +4674,6 @@ function twoFindCoverPoint(room, ex, ey, px, py) {
   if (best) return best;
   return { x: ex + Math.cos(away) * 2.0, y: ey + Math.sin(away) * 2.0, covered: false };
 }
-
 function twoCampaignPayload(raw) {
   try {
     if (!raw || typeof raw !== "object" || !raw.enabled) return null;
@@ -4774,7 +4698,6 @@ function twoCampaignPayload(raw) {
     };
   } catch { return null; }
 }
-
 function twoMissionMatchesCampaign(mission, campaignReq = null) {
   const campaign = twoCampaignPayload(campaignReq);
   if (!campaign) return true;
@@ -4789,7 +4712,6 @@ function twoMissionMatchesCampaign(mission, campaignReq = null) {
   if (cLoc && mLoc && mLoc !== cLoc) return false;
   return true;
 }
-
 function twoSpawnMission(room, campaignReq = null, level = 1) {
   const seed = nowSeed();
   const rnd = twoRnd(seed);
@@ -5114,7 +5036,6 @@ function twoTickRoom(room, dt) {
   let damaged = acidDamage > 0;
   const nestUpdate = twoUpdateNesting(room, dtSec);
   if (nestUpdate) twoBroadcast(room, { t: "nest_update", cells: nestUpdate.cells, map: nestUpdate.map, nesting: nestUpdate.nesting, ts: Date.now() });
-
   for (let idx = 0; idx < room.mission.enemies.length; idx++) {
     const e = twoPrepareEnemy(room.mission.enemies[idx]);
     twoEnsureEnemyMind(e, idx);
@@ -5142,7 +5063,6 @@ function twoTickRoom(room, dt) {
     const nestInterruptRange = nestMode === "building" ? Math.max(1.55, meleeAttackRange + 0.55) : Math.max(4.2, meleeAttackRange + 2.2);
     const nestInterrupt = !!(nestHasTarget && ((visible && dist <= nestInterruptRange) || shotReact));
     const nestHardOrder = !!(nestHasTarget && !nestInterrupt);
-
     if (shotReact || ((!nestHardOrder) && visible && (dist <= aggro || closeVisible || alreadyHurt))) {
       // CHA / aggro only lowers the first trigger radius.  Close, wounded, or
       // already-engaged vampires keep hunting and never freeze in front of the tank.
@@ -5166,7 +5086,6 @@ function twoTickRoom(room, dt) {
     e.lungeT = Math.max(0, Number(e.lungeT || 0) - dtSec);
     e.castingT = Math.max(0, Number(e.castingT || 0) - dtSec);
     e.castBlockedT = Math.max(0, Number(e.castBlockedT || 0) - dtSec);
-
     if (isCaster) {
       const maxSlots = Math.max(1, Number(e.spell_slots_max || 3) | 0);
       e.spell_slots_max = maxSlots;
@@ -5183,7 +5102,6 @@ function twoTickRoom(room, dt) {
       e.spell_slots = 0;
       e.spellRechargeT = 0;
     }
-
     // Both enemy types are cooldown-driven. Brutes never require fake spell slots.
     const hasCharge = true;
     const effectiveAttackRange = isCaster ? Number(e.attack_range || 0.74) : meleeAttackRange;
@@ -5217,7 +5135,6 @@ function twoTickRoom(room, dt) {
       moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: false, lunge_t: e.lungeT, casting_t: e.castingT, cast: didCast, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot, brain: e.brain, tactic: e.tactic, ai_goal: e.aiGoal, ai_waypoint_x: e.aiWaypointX, ai_waypoint_y: e.aiWaypointY, nest_mode: e.nest_mode, nest_builder: e.nest_builder, nest_tx: e.nest_tx, nest_ty: e.nest_ty, hive_job: e.hive_job, hive_target: e.hive_target, debug_thought: e.debug_thought });
       if (!isCaster || dist >= Math.max(1.0, Number(e.prefer_range || 0) * 0.65)) continue;
     }
-
     let tx, ty;
     const aggroMove = Number(v.aggro_range || 8.5);
     const nestOrder = nestHardOrder;
@@ -5269,7 +5186,6 @@ function twoTickRoom(room, dt) {
       moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: false, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot, brain: e.brain, tactic: e.tactic, ai_goal: e.aiGoal, ai_waypoint_x: e.aiWaypointX, ai_waypoint_y: e.aiWaypointY, nest_mode: e.nest_mode, nest_builder: e.nest_builder, nest_tx: e.nest_tx, nest_ty: e.nest_ty, hive_job: e.hive_job, hive_target: e.hive_target, debug_thought: e.debug_thought });
       continue;
     }
-
     const awareMove = !!(shotReact || (visible && (dist <= aggroMove || closeVisible || Number(e.engagedT || 0) > 0)) || Number(e.smellT || 0) > 1.9 || Number(e.alertT || 0) > 0.55);
     const forceGoal = !!((nestOrder && String(e.nest_mode || "") === "building") || (awareMove && visible && dist <= Math.max(5.0, meleeAttackRange + 1.15)) || (e.elite && visible));
     const committed = twoCommitEnemyGoal(e, tx, ty, e.brain || "move", e.tactic || "move", forceGoal);
@@ -5286,14 +5202,12 @@ function twoTickRoom(room, dt) {
       moved.push({ id: e.id, x: e.x, y: e.y, hp: e.hp, max_hp: e.max_hp, kind: e.kind, ac: e.ac, xp: e.xp, archetype: e.archetype, attack_mode: e.attack_mode, moving: false, lunge_t: e.lungeT, casting_t: e.castingT, spell_slots: e.spell_slots, spell_slots_max: e.spell_slots_max, elite: e.elite, elite_type: e.elite_type, acid_dot: e.acid_dot, brain: e.brain, tactic: e.tactic, ai_goal: e.aiGoal, ai_waypoint_x: e.aiWaypointX, ai_waypoint_y: e.aiWaypointY, nest_mode: e.nest_mode, nest_builder: e.nest_builder, nest_tx: e.nest_tx, nest_ty: e.nest_ty, hive_job: e.hive_job, hive_target: e.hive_target, debug_thought: e.debug_thought });
       continue;
     }
-
     const pathForce = !!((nestOrder && (String(e.nest_mode || "") === "building" || String(e.nest_mode || "") === "built")) || (!visible && awareMove) || Number(e.stuckT || 0) > 0.12);
     const wp = twoHiveWaypointForGoal(room, e, ex, ey, tx, ty, v, pathForce);
     const moveTx = Number(wp.x), moveTy = Number(wp.y);
     let vx = moveTx - ex, vy = moveTy - ey;
     let mag = Math.hypot(vx, vy) || 1;
     vx /= mag; vy /= mag;
-
     let sepX = 0, sepY = 0;
     if (targetDist > Math.max(0.42, Number(e.body_radius || TWO_ENEMY_RADIUS) * 1.15)) {
       for (let j = 0; j < room.mission.enemies.length; j++) {
@@ -5305,7 +5219,6 @@ function twoTickRoom(room, dt) {
         if (od > 0.001 && od < TWO_ENEMY_ENEMY_STANDOFF) { sepX += ox / od * (TWO_ENEMY_ENEMY_STANDOFF - od); sepY += oy / od * (TWO_ENEMY_ENEMY_STANDOFF - od); }
       }
     }
-
     const fd = Number(e.flank_dir || 1) < 0 ? -1 : 1;
     const wounded = (Number(e.hp || 1) <= Math.max(1, (Number(e.max_hp || 3) | 0) >> 1));
     let flank = Number(e.flank_bias || 0.5) * (visible ? 1.0 : 1.45) * (wounded && !isCaster ? 1.08 : 1.0);
@@ -5318,7 +5231,6 @@ function twoTickRoom(room, dt) {
     let mx = vx + lx + sepX * 1.7, my = vy + ly + sepY * 1.7;
     mag = Math.hypot(mx, my) || 1;
     mx /= mag; my /= mag;
-
     let speed = Number(e.speed || 1.0);
     if (!isCaster && visible && dist < 5.0) speed *= 1.16;
     if (isCaster) speed *= 0.92;
@@ -5405,11 +5317,7 @@ function twoTickRoom(room, dt) {
     twoSyncLobby(room);
   }
 }
-
-
-
-
-// ---------------------------------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------------------------------------------
 // HOUSE NOCTURNE / VESPERA Umbral Rail protocol
 // Raw JSON, plus optional ur: prefix for future clients.
 // Python client connects to: wss://nodejs-production-740bc.up.railway.app
@@ -5418,14 +5326,13 @@ function twoTickRoom(room, dt) {
 //                {"type":"visit_position","target":"UR-OTHER","visitor":{...}}
 //                {"type":"leave","target":"UR-OTHER","id":"UR-XXXX"}
 // Server sends:  {"type":"presence",...} / {"type":"peer_left",...} / relayed visit packets
-// ---------------------------------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------------------------------------------
 const umbralRooms = new Map(); // roomName -> { name, clients:Map<id,client> }
 const UMBRAL_DEFAULT_ROOM = "house_nocturne";
 const UMBRAL_PEER_TTL_MS = 45000;
 const UMBRAL_MAX_MAP_FLOORS = 8;
 const UMBRAL_MAX_MAP_ROWS = 128;
 const UMBRAL_MAX_MAP_COLS = 160;
-
 function umbralSafeId(s) {
   try {
     const out = String(s || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
@@ -5582,13 +5489,11 @@ function umbralHandle(ws, payloadStr, prefixed = false) {
     umbralBroadcast(got.room, umbralPublicPeer(got.client), ws);
     return;
   }
-
   if (typ === "list" || typ === "request_peers" || typ === "sync") {
     const room = umbralGetRoom(m.room || ws._umbralRoomName || UMBRAL_DEFAULT_ROOM);
     umbralSendPeerList(ws, room, ws._umbralId || "");
     return;
   }
-
   if (typ === "rail_chat" || typ === "visitor_chat" || typ === "chat") {
     const text = String(m.text || m.msg || m.message || "").replace(/\r?\n/g, " ").slice(0, 240);
     if (!text) return;
@@ -5603,7 +5508,6 @@ function umbralHandle(ws, payloadStr, prefixed = false) {
     if (m.target || m.host) umbralRelayToTarget(ws, m);
     return;
   }
-
   if (typ === "visit" || typ === "visit_position") {
     const visitor = (m.visitor && typeof m.visitor === "object") ? m.visitor : m;
     const id = umbralSafeId(visitor.id || ws._umbralId || "");
@@ -5626,7 +5530,6 @@ function umbralHandle(ws, payloadStr, prefixed = false) {
     umbralRelayToTarget(ws, m);
     return;
   }
-
   if (typ === "leave") {
     const id = String(m.id || ws._umbralId || "").slice(0, 64);
     if (ws._umbralId && id === ws._umbralId) {
@@ -5642,7 +5545,6 @@ function umbralHandle(ws, payloadStr, prefixed = false) {
     if (m.target || m.host) umbralRelayToTarget(ws, m);
     return;
   }
-
   if (typ === "ping") {
     umbralSend(ws, { type: "pong", peers: umbralGetRoom(ws._umbralRoomName || UMBRAL_DEFAULT_ROOM).clients.size, ts: Date.now() });
     return;
@@ -5666,10 +5568,9 @@ try {
   const _umbralSweep = setInterval(umbralCleanRooms, 15000);
   if (_umbralSweep && typeof _umbralSweep.unref === "function") _umbralSweep.unref();
 } catch {}
-
-// ------------------------------------------------------
+// ----------------------------------
 // Shared WebSocket connection router
-// ------------------------------------------------------
+// ----------------------------------
 function detachAllProtocols(ws) {
   try { umbralDetach(ws, true); } catch {}
   try { twoDetach(ws); } catch {}
@@ -5677,7 +5578,6 @@ function detachAllProtocols(ws) {
   try { stugDetach(ws, true); } catch {}
   try { prisonDetach(ws, true); } catch {}
 }
-
 function routeSocketMessage(ws, data) {
   let raw = "";
   try {
@@ -5686,13 +5586,11 @@ function routeSocketMessage(ws, data) {
     raw = "";
   }
   if (!raw) return;
-
   if (raw.startsWith("ur:")) { umbralHandle(ws, raw.slice(3), true); return; }
   if (raw.startsWith("2:")) { twoHandle(ws, raw.slice(2)); return; }
   if (raw.startsWith("gf:")) { growthHandle(ws, raw.slice(3)); return; }
   if (raw.startsWith("s:")) { stugHandle(ws, raw.slice(2)); return; }
   if (raw.startsWith("p:")) { prisonHandle(ws, raw.slice(2)); return; }
-
   // Legacy/no-prefix fallback.
   let m = null;
   try { m = JSON.parse(raw); } catch { m = null; }
@@ -5703,7 +5601,6 @@ function routeSocketMessage(ws, data) {
     if (game === "growth" || game === "gf") { growthHandle(ws, raw); return; }
     if (game === "stug" || game === "s") { stugHandle(ws, raw); return; }
     if (game === "prison" || game === "ethane" || game === "p") { prisonHandle(ws, raw); return; }
-
     const t = String(m.t || m.type || "").toLowerCase();
     if (t === "presence" || t === "peer" || t === "visit" || t === "visit_position" || t === "rail_chat" || t === "visitor_chat" || t === "leave" || t === "request_peers" || t === "sync") {
       umbralHandle(ws, raw, false);
@@ -5714,11 +5611,9 @@ function routeSocketMessage(ws, data) {
       return;
     }
   }
-
   // Plain text fallback.
   prisonHandle(ws, raw);
 }
-
 wss.on("connection", (ws, req) => {
   ws.isAlive = true;
   ws._ip = pickIP(req) || "";
@@ -5733,17 +5628,15 @@ wss.on("connection", (ws, req) => {
   ws.on("close", () => { detachAllProtocols(ws); });
   ws.on("error", () => { detachAllProtocols(ws); });
 });
-
-// -----------------------------
+// ------------------------
 // ARMORBOUND enemy AI tick
-// -----------------------------
+// ------------------------
 const TWO_TICK_MS = 80;
 setInterval(() => {
   try {
     for (const room of twoRooms.values()) twoTickRoom(room, TWO_TICK_MS);
   } catch {}
 }, TWO_TICK_MS);
-
 // -------------------------
 // STUG shared theater pulse
 // -------------------------
@@ -5754,7 +5647,7 @@ setInterval(() => {
     stugTickRoom(room, STUG_TICK_MS);
   }
 }, STUG_TICK_MS);
-// ------------------------------------------------------
+// --------------------------------------------------------------
 server.listen(PORT, HOST, () => {
   console.log("Merged relay (Dedset App) on", HOST + ":" + PORT);
   if (MEGA_CLAIM_REQUIRE_AUTH && !MEGA_CLAIM_SECRET) console.warn("MEGA claim endpoint is locked until MEGA_CLAIM_SECRET is configured.");
