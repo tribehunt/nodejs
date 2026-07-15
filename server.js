@@ -5317,6 +5317,163 @@ function twoTickRoom(room, dt) {
     twoSyncLobby(room);
   }
 }
+// -------------------------------------------------------------------------------
+// ALMIGHTY PYTHON // Velvet Byte multiplayer lobby
+// Python client connects to: wss://nodejs-production-740bc.up.railway.app
+// Protocol prefix: ap:
+// Four players per lobby. The first connected player is the Real Almighty Python;
+// the other three are story-canon clones.
+// -------------------------------------------------------------------------------
+const almightyPythonRooms = new Map();
+let almightyPythonRoomCounter = 1;
+const ALMIGHTY_PYTHON_MAX_PLAYERS = 4;
+const ALMIGHTY_PYTHON_TTL_MS = 15000;
+function almightyPythonSafeId(value) {
+  const out = String(value || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+  return out || ("AP-" + rid());
+}
+function almightyPythonSafeName(value) {
+  const out = String(value || "Almighty Python").replace(/\s+/g, " ").trim().slice(0, 28);
+  return out || "Almighty Python";
+}
+function almightyPythonChooseRoom() {
+  for (const room of almightyPythonRooms.values()) {
+    if (room && room.clients && room.clients.size < ALMIGHTY_PYTHON_MAX_PLAYERS) return room;
+  }
+  const name = "velvet-byte-" + String(almightyPythonRoomCounter++);
+  const room = { name, clients: new Map(), joinedOrder: [], hostId: "" };
+  almightyPythonRooms.set(name, room);
+  return room;
+}
+function almightyPythonSend(ws, obj) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  try { ws.send(JSON.stringify(obj)); return true; } catch { return false; }
+}
+function almightyPythonPublicPlayer(client, room) {
+  return {
+    t: "presence",
+    game: "almighty_python",
+    room: String(room && room.name || ""),
+    id: String(client && client.id || ""),
+    name: almightyPythonSafeName(client && client.name),
+    x: Math.max(1.1, Math.min(22.9, Number(client && client.x || 12.0))),
+    y: Math.max(1.1, Math.min(15.8, Number(client && client.y || 15.25))),
+    angle: Number(client && client.angle || -1.5707963),
+    moving: !!(client && client.moving),
+    host: !!(room && String(room.hostId || "") === String(client && client.id || "")),
+    host_id: String(room && room.hostId || ""),
+    ts: Date.now()
+  };
+}
+function almightyPythonSnapshot(room, ws = null, kind = "snapshot") {
+  if (!room || !room.clients) return;
+  const players = [...room.clients.values()].slice(0, ALMIGHTY_PYTHON_MAX_PLAYERS).map(c => almightyPythonPublicPlayer(c, room));
+  const packet = { t: kind, game: "almighty_python", room: room.name, host_id: String(room.hostId || ""), players, ts: Date.now() };
+  if (ws) almightyPythonSend(ws, packet);
+  else for (const c of room.clients.values()) almightyPythonSend(c.ws, packet);
+}
+function almightyPythonPromoteHost(room) {
+  if (!room || !room.clients) return;
+  room.joinedOrder = (room.joinedOrder || []).filter(id => room.clients.has(id));
+  if (!room.hostId || !room.clients.has(room.hostId)) room.hostId = room.joinedOrder[0] || "";
+}
+function almightyPythonDetach(ws, announce = true) {
+  const id = String(ws && ws._almightyPythonId || "");
+  const roomName = String(ws && ws._almightyPythonRoom || "");
+  if (!id || !roomName) return;
+  const room = almightyPythonRooms.get(roomName);
+  if (room && room.clients) {
+    const client = room.clients.get(id);
+    if (client && client.ws === ws) room.clients.delete(id);
+    room.joinedOrder = (room.joinedOrder || []).filter(value => value !== id);
+    almightyPythonPromoteHost(room);
+    if (announce) {
+      const packet = { t: "peer_left", game: "almighty_python", room: room.name, id, host_id: String(room.hostId || ""), ts: Date.now() };
+      for (const c of room.clients.values()) almightyPythonSend(c.ws, packet);
+      almightyPythonSnapshot(room);
+    }
+    if (room.clients.size === 0) almightyPythonRooms.delete(roomName);
+  }
+  ws._almightyPythonId = "";
+  ws._almightyPythonRoom = "";
+}
+function almightyPythonJoin(ws, message) {
+  almightyPythonDetach(ws, false);
+  const id = almightyPythonSafeId(message.id);
+  const room = almightyPythonChooseRoom();
+  const previous = room.clients.get(id);
+  if (previous && previous.ws && previous.ws !== ws) {
+    try { previous.ws.close(4001, "Reconnected"); } catch {}
+    room.clients.delete(id);
+    room.joinedOrder = room.joinedOrder.filter(value => value !== id);
+  }
+  const client = {
+    id,
+    name: almightyPythonSafeName(message.name),
+    ws,
+    x: 12.0,
+    y: 15.25,
+    angle: -1.5707963,
+    moving: false,
+    lastSeen: Date.now()
+  };
+  room.clients.set(id, client);
+  room.joinedOrder.push(id);
+  if (!room.hostId) room.hostId = id;
+  ws._almightyPythonId = id;
+  ws._almightyPythonRoom = room.name;
+  almightyPythonSnapshot(room, ws, "welcome");
+  almightyPythonSnapshot(room);
+  return client;
+}
+function almightyPythonHandle(ws, payload) {
+  let message = null;
+  try { message = JSON.parse(String(payload || "")); } catch { message = null; }
+  if (!message || typeof message !== "object") return;
+  const kind = String(message.t || message.type || "").toLowerCase();
+  if (kind === "join" || kind === "hello") {
+    almightyPythonJoin(ws, message);
+    return;
+  }
+  if (!ws._almightyPythonId || !ws._almightyPythonRoom) almightyPythonJoin(ws, message);
+  const room = almightyPythonRooms.get(String(ws._almightyPythonRoom || ""));
+  const client = room && room.clients ? room.clients.get(String(ws._almightyPythonId || "")) : null;
+  if (!room || !client) return;
+  client.lastSeen = Date.now();
+  if (kind === "presence" || kind === "move") {
+    client.x = Math.max(1.1, Math.min(22.9, Number(message.x != null ? message.x : client.x)));
+    client.y = Math.max(1.1, Math.min(15.8, Number(message.y != null ? message.y : client.y)));
+    client.angle = Number(message.angle != null ? message.angle : client.angle);
+    client.moving = !!message.moving;
+    const packet = almightyPythonPublicPlayer(client, room);
+    for (const c of room.clients.values()) if (c.ws !== ws) almightyPythonSend(c.ws, packet);
+    return;
+  }
+  if (kind === "sync" || kind === "list") {
+    almightyPythonSnapshot(room, ws);
+    return;
+  }
+  if (kind === "leave") almightyPythonDetach(ws, true);
+}
+function almightyPythonCleanRooms() {
+  const now = Date.now();
+  for (const [roomName, room] of [...almightyPythonRooms.entries()]) {
+    if (!room || !room.clients) { almightyPythonRooms.delete(roomName); continue; }
+    for (const [id, client] of [...room.clients.entries()]) {
+      const open = !!(client && client.ws && client.ws.readyState === WebSocket.OPEN);
+      if (!open || now - Number(client.lastSeen || 0) > ALMIGHTY_PYTHON_TTL_MS) {
+        if (client && client.ws) almightyPythonDetach(client.ws, true);
+        else room.clients.delete(id);
+      }
+    }
+    almightyPythonPromoteHost(room);
+    if (room.clients.size === 0) almightyPythonRooms.delete(roomName);
+  }
+}
+try {
+  const _almightyPythonSweep = setInterval(almightyPythonCleanRooms, 5000);
+  if (_almightyPythonSweep && typeof _almightyPythonSweep.unref === "function") _almightyPythonSweep.unref();
+} catch {}
 // ------------------------------------------------------------------------------------------------------------------
 // HOUSE NOCTURNE / VESPERA Umbral Rail protocol
 // Raw JSON, plus optional ur: prefix for future clients.
@@ -5572,6 +5729,7 @@ try {
 // Shared WebSocket connection router
 // ----------------------------------
 function detachAllProtocols(ws) {
+  try { almightyPythonDetach(ws, true); } catch {}
   try { umbralDetach(ws, true); } catch {}
   try { twoDetach(ws); } catch {}
   try { growthDetach(ws); } catch {}
@@ -5586,6 +5744,7 @@ function routeSocketMessage(ws, data) {
     raw = "";
   }
   if (!raw) return;
+  if (raw.startsWith("ap:")) { almightyPythonHandle(ws, raw.slice(3)); return; }
   if (raw.startsWith("ur:")) { umbralHandle(ws, raw.slice(3), true); return; }
   if (raw.startsWith("2:")) { twoHandle(ws, raw.slice(2)); return; }
   if (raw.startsWith("gf:")) { growthHandle(ws, raw.slice(3)); return; }
@@ -5596,6 +5755,7 @@ function routeSocketMessage(ws, data) {
   try { m = JSON.parse(raw); } catch { m = null; }
   if (m && typeof m === "object") {
     const game = String(m.game || m.proto || m.protocol || m.g || "").toLowerCase();
+    if (game === "almighty_python" || game === "almighty" || game === "ap") { almightyPythonHandle(ws, raw); return; }
     if (game === "umbral" || game === "umbral_rail" || game === "house_nocturne" || game === "vespera" || game === "ur") { umbralHandle(ws, raw, false); return; }
     if (game === "two" || game === "2" || game === "hunters") { twoHandle(ws, raw); return; }
     if (game === "growth" || game === "gf") { growthHandle(ws, raw); return; }
