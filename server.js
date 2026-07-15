@@ -5317,15 +5317,16 @@ function twoTickRoom(room, dt) {
     twoSyncLobby(room);
   }
 }
-// -------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------------------------------------------
 // ALMIGHTY PYTHON // Velvet Byte multiplayer lobby
 // Python client connects to: wss://nodejs-production-740bc.up.railway.app
 // Protocol prefix: ap:
 // Four players per lobby. The first connected player is the Real Almighty Python;
 // the other three are story-canon clones.
-// -------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------------------------------------------
 const almightyPythonRooms = new Map();
 let almightyPythonRoomCounter = 1;
+let almightyPythonPartyCounter = 1;
 const ALMIGHTY_PYTHON_MAX_PLAYERS = 4;
 const ALMIGHTY_PYTHON_TTL_MS = 15000;
 function almightyPythonSafeId(value) {
@@ -5335,6 +5336,12 @@ function almightyPythonSafeId(value) {
 function almightyPythonSafeName(value) {
   const out = String(value || "Almighty Python").replace(/\s+/g, " ").trim().slice(0, 28);
   return out || "Almighty Python";
+}
+function almightyPythonSafeMessage(value) {
+  return String(value || "").replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 420);
+}
+function almightyPythonSafeMid(value) {
+  return String(value || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 96) || ("APM-" + rid());
 }
 function almightyPythonChooseRoom() {
   for (const room of almightyPythonRooms.values()) {
@@ -5360,6 +5367,7 @@ function almightyPythonPublicPlayer(client, room) {
     y: Math.max(1.1, Math.min(15.8, Number(client && client.y || 15.25))),
     angle: Number(client && client.angle || -1.5707963),
     moving: !!(client && client.moving),
+    party_id: String(client && client.partyId || ""),
     host: !!(room && String(room.hostId || "") === String(client && client.id || "")),
     host_id: String(room && room.hostId || ""),
     ts: Date.now()
@@ -5377,6 +5385,25 @@ function almightyPythonPromoteHost(room) {
   room.joinedOrder = (room.joinedOrder || []).filter(id => room.clients.has(id));
   if (!room.hostId || !room.clients.has(room.hostId)) room.hostId = room.joinedOrder[0] || "";
 }
+function almightyPythonNormalizeParties(room) {
+  if (!room || !room.clients) return;
+  const groups = new Map();
+  for (const client of room.clients.values()) {
+    const partyId = String(client && client.partyId || "");
+    if (!partyId) continue;
+    if (!groups.has(partyId)) groups.set(partyId, []);
+    groups.get(partyId).push(client);
+  }
+  for (const members of groups.values()) {
+    if (members.length >= 2) continue;
+    for (const client of members) client.partyId = "";
+  }
+}
+function almightyPythonPartyMembers(room, partyId) {
+  const id = String(partyId || "");
+  if (!room || !room.clients || !id) return [];
+  return [...room.clients.values()].filter(client => String(client && client.partyId || "") === id);
+}
 function almightyPythonDetach(ws, announce = true) {
   const id = String(ws && ws._almightyPythonId || "");
   const roomName = String(ws && ws._almightyPythonRoom || "");
@@ -5386,6 +5413,7 @@ function almightyPythonDetach(ws, announce = true) {
     const client = room.clients.get(id);
     if (client && client.ws === ws) room.clients.delete(id);
     room.joinedOrder = (room.joinedOrder || []).filter(value => value !== id);
+    almightyPythonNormalizeParties(room);
     almightyPythonPromoteHost(room);
     if (announce) {
       const packet = { t: "peer_left", game: "almighty_python", room: room.name, id, host_id: String(room.hostId || ""), ts: Date.now() };
@@ -5415,6 +5443,7 @@ function almightyPythonJoin(ws, message) {
     y: 15.25,
     angle: -1.5707963,
     moving: false,
+    partyId: "",
     lastSeen: Date.now()
   };
   room.clients.set(id, client);
@@ -5449,6 +5478,50 @@ function almightyPythonHandle(ws, payload) {
     for (const c of room.clients.values()) if (c.ws !== ws) almightyPythonSend(c.ws, packet);
     return;
   }
+  if (kind === "chat" || kind === "msg") {
+    const targetId = almightyPythonSafeId(message.to || message.target_id || message.target);
+    const target = room.clients.get(targetId);
+    const msg = almightyPythonSafeMessage(message.msg != null ? message.msg : message.text);
+    if (!target || target.id === client.id || !msg) return;
+    const packet = {
+      t: "chat",
+      game: "almighty_python",
+      room: room.name,
+      from: client.id,
+      to: target.id,
+      name: almightyPythonSafeName(client.name),
+      msg,
+      mid: almightyPythonSafeMid(message.mid),
+      ts: Date.now()
+    };
+    almightyPythonSend(client.ws, packet);
+    almightyPythonSend(target.ws, packet);
+    return;
+  }
+  if (kind === "team_up" || kind === "party_join") {
+    const targetId = almightyPythonSafeId(message.target_id || message.to || message.target);
+    const target = room.clients.get(targetId);
+    if (!target || target.id === client.id) return;
+    if (client.partyId && client.partyId === target.partyId) {
+      almightyPythonSnapshot(room);
+      return;
+    }
+    const left = client.partyId ? almightyPythonPartyMembers(room, client.partyId) : [client];
+    const right = target.partyId ? almightyPythonPartyMembers(room, target.partyId) : [target];
+    const merged = [];
+    const seen = new Set();
+    for (const member of [...left, ...right, client, target]) {
+      if (!member || seen.has(member.id)) continue;
+      seen.add(member.id);
+      merged.push(member);
+    }
+    if (merged.length > ALMIGHTY_PYTHON_MAX_PLAYERS) return;
+    const partyId = String(client.partyId || target.partyId || ("python-party-" + String(almightyPythonPartyCounter++)));
+    for (const member of merged) member.partyId = partyId;
+    almightyPythonNormalizeParties(room);
+    almightyPythonSnapshot(room, null, "party");
+    return;
+  }
   if (kind === "sync" || kind === "list") {
     almightyPythonSnapshot(room, ws);
     return;
@@ -5466,6 +5539,7 @@ function almightyPythonCleanRooms() {
         else room.clients.delete(id);
       }
     }
+    almightyPythonNormalizeParties(room);
     almightyPythonPromoteHost(room);
     if (room.clients.size === 0) almightyPythonRooms.delete(roomName);
   }
