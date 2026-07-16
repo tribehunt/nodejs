@@ -5317,13 +5317,13 @@ function twoTickRoom(room, dt) {
     twoSyncLobby(room);
   }
 }
-// -------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------------------------------------------
 // ALMIGHTY PYTHON // Velvet Byte multiplayer lobby
 // Python client connects to: wss://nodejs-production-740bc.up.railway.app
 // Protocol prefix: ap:
 // Four players per lobby. The first connected player is the Real Almighty Python;
 // the other three are story-canon clones.
-// -------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------------------------------------------
 const almightyPythonRooms = new Map();
 let almightyPythonRoomCounter = 1;
 let almightyPythonPartyCounter = 1;
