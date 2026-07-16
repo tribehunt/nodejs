@@ -5317,13 +5317,13 @@ function twoTickRoom(room, dt) {
     twoSyncLobby(room);
   }
 }
-// ------------------------------------------------------------------------------------------------------------------
+// -------------------------------------------------------------------------------
 // ALMIGHTY PYTHON // Velvet Byte multiplayer lobby
 // Python client connects to: wss://nodejs-production-740bc.up.railway.app
 // Protocol prefix: ap:
 // Four players per lobby. The first connected player is the Real Almighty Python;
 // the other three are story-canon clones.
-// ------------------------------------------------------------------------------------------------------------------
+// -------------------------------------------------------------------------------
 const almightyPythonRooms = new Map();
 let almightyPythonRoomCounter = 1;
 let almightyPythonPartyCounter = 1;
@@ -5348,13 +5348,26 @@ function almightyPythonChooseRoom() {
     if (room && room.clients && room.clients.size < ALMIGHTY_PYTHON_MAX_PLAYERS) return room;
   }
   const name = "velvet-byte-" + String(almightyPythonRoomCounter++);
-  const room = { name, clients: new Map(), joinedOrder: [], hostId: "" };
+  const room = { name, clients: new Map(), joinedOrder: [], hostId: "", hideouts: new Map() };
   almightyPythonRooms.set(name, room);
   return room;
 }
 function almightyPythonSend(ws, obj) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false;
   try { ws.send(JSON.stringify(obj)); return true; } catch { return false; }
+}
+function almightyPythonFinite(value, fallback = 0, limit = 10000000) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return Number(fallback) || 0;
+  return Math.max(-limit, Math.min(limit, n));
+}
+function almightyPythonSafeScene(value) {
+  const scene = String(value || "velvet_byte").toLowerCase();
+  return ["velvet_byte", "ride", "hideout"].includes(scene) ? scene : "velvet_byte";
+}
+function almightyPythonSafeHand(value) {
+  const hand = String(value || "").toLowerCase();
+  return hand === "left" || hand === "right" ? hand : "";
 }
 function almightyPythonPublicPlayer(client, room) {
   return {
@@ -5363,22 +5376,47 @@ function almightyPythonPublicPlayer(client, room) {
     room: String(room && room.name || ""),
     id: String(client && client.id || ""),
     name: almightyPythonSafeName(client && client.name),
-    x: Math.max(1.1, Math.min(22.9, Number(client && client.x || 12.0))),
-    y: Math.max(1.1, Math.min(15.8, Number(client && client.y || 15.25))),
-    angle: Number(client && client.angle || -1.5707963),
+    x: almightyPythonFinite(client && client.x, 12.0),
+    y: almightyPythonFinite(client && client.y, 15.25),
+    angle: almightyPythonFinite(client && client.angle, -1.5707963, 100000),
     moving: !!(client && client.moving),
+    scene: almightyPythonSafeScene(client && client.scene),
+    speed: almightyPythonFinite(client && client.speed, 0, 1000),
+    lean: Math.max(-1, Math.min(1, almightyPythonFinite(client && client.lean, 0, 1))),
+    fists_drawn: !!(client && client.fistsDrawn),
+    punch_hand: almightyPythonSafeHand(client && client.punchHand),
+    punch_progress: Math.max(0, Math.min(1, almightyPythonFinite(client && client.punchProgress, 0, 1))),
+    hideout_id: String(client && client.hideoutId || "").slice(0, 96),
     party_id: String(client && client.partyId || ""),
     host: !!(room && String(room.hostId || "") === String(client && client.id || "")),
     host_id: String(room && room.hostId || ""),
     ts: Date.now()
   };
 }
+function almightyPythonMissionForClient(room, client) {
+  if (!room || !room.hideouts || !client || !client.partyId) return null;
+  const mission = room.hideouts.get(String(client.partyId || ""));
+  return mission ? Object.assign({}, mission) : null;
+}
 function almightyPythonSnapshot(room, ws = null, kind = "snapshot") {
   if (!room || !room.clients) return;
   const players = [...room.clients.values()].slice(0, ALMIGHTY_PYTHON_MAX_PLAYERS).map(c => almightyPythonPublicPlayer(c, room));
-  const packet = { t: kind, game: "almighty_python", room: room.name, host_id: String(room.hostId || ""), players, ts: Date.now() };
-  if (ws) almightyPythonSend(ws, packet);
-  else for (const c of room.clients.values()) almightyPythonSend(c.ws, packet);
+  const sendOne = (client) => {
+    if (!client) return;
+    const packet = { t: kind, game: "almighty_python", room: room.name, host_id: String(room.hostId || ""), players, ts: Date.now() };
+    const mission = almightyPythonMissionForClient(room, client);
+    if (mission) packet.hideout = mission;
+    almightyPythonSend(client.ws, packet);
+  };
+  if (ws) {
+    const client = [...room.clients.values()].find(c => c && c.ws === ws);
+    if (client) sendOne(client);
+  } else {
+    for (const c of room.clients.values()) sendOne(c);
+  }
+}
+function almightyPythonPartyBroadcast(room, partyId, packet) {
+  for (const member of almightyPythonPartyMembers(room, partyId)) almightyPythonSend(member.ws, packet);
 }
 function almightyPythonPromoteHost(room) {
   if (!room || !room.clients) return;
@@ -5394,9 +5432,32 @@ function almightyPythonNormalizeParties(room) {
     if (!groups.has(partyId)) groups.set(partyId, []);
     groups.get(partyId).push(client);
   }
-  for (const members of groups.values()) {
-    if (members.length >= 2) continue;
-    for (const client of members) client.partyId = "";
+  for (const [partyId, members] of groups.entries()) {
+    if (members.length < 2) {
+      for (const client of members) client.partyId = "";
+      if (room.hideouts) room.hideouts.delete(partyId);
+      continue;
+    }
+    // A three/four-player crew must not lose its Hideout authority when the
+    // original host drops. Promote the room host when present, otherwise the
+    // oldest remaining party member. Every client receives the updated mission
+    // in the next party snapshot.
+    const mission = room.hideouts ? room.hideouts.get(partyId) : null;
+    if (mission && String(mission.status || "active") === "complete") {
+      const returned = mission.returned && typeof mission.returned === "object" ? mission.returned : {};
+      if (members.every(member => !!returned[member.id])) {
+        room.hideouts.delete(partyId);
+        almightyPythonPartyBroadcast(room, partyId, { t: "hideout_cleared", game: "almighty_python", room: room.name, hideout_id: String(mission.id || ""), ts: Date.now() });
+        continue;
+      }
+    }
+    if (mission && !members.some(member => member.id === String(mission.authority_id || ""))) {
+      const replacement = members.find(member => member.id === String(room.hostId || "")) || members[0];
+      mission.authority_id = String(replacement && replacement.id || "");
+    }
+  }
+  if (room.hideouts) {
+    for (const partyId of [...room.hideouts.keys()]) if (!groups.has(partyId)) room.hideouts.delete(partyId);
   }
 }
 function almightyPythonPartyMembers(room, partyId) {
@@ -5443,6 +5504,13 @@ function almightyPythonJoin(ws, message) {
     y: 15.25,
     angle: -1.5707963,
     moving: false,
+    scene: "velvet_byte",
+    speed: 0,
+    lean: 0,
+    fistsDrawn: false,
+    punchHand: "",
+    punchProgress: 0,
+    hideoutId: "",
     partyId: "",
     lastSeen: Date.now()
   };
@@ -5470,10 +5538,21 @@ function almightyPythonHandle(ws, payload) {
   if (!room || !client) return;
   client.lastSeen = Date.now();
   if (kind === "presence" || kind === "move") {
-    client.x = Math.max(1.1, Math.min(22.9, Number(message.x != null ? message.x : client.x)));
-    client.y = Math.max(1.1, Math.min(15.8, Number(message.y != null ? message.y : client.y)));
-    client.angle = Number(message.angle != null ? message.angle : client.angle);
+    client.scene = almightyPythonSafeScene(message.scene != null ? message.scene : client.scene);
+    client.x = almightyPythonFinite(message.x != null ? message.x : client.x, client.x);
+    client.y = almightyPythonFinite(message.y != null ? message.y : client.y, client.y);
+    if (client.scene === "velvet_byte" || client.scene === "hideout") {
+      client.x = Math.max(1.1, Math.min(22.9, client.x));
+      client.y = Math.max(1.1, Math.min(15.8, client.y));
+    }
+    client.angle = almightyPythonFinite(message.angle != null ? message.angle : client.angle, client.angle, 100000);
     client.moving = !!message.moving;
+    client.speed = almightyPythonFinite(message.speed != null ? message.speed : client.speed, client.speed, 1000);
+    client.lean = Math.max(-1, Math.min(1, almightyPythonFinite(message.lean != null ? message.lean : client.lean, client.lean, 1)));
+    client.fistsDrawn = !!message.fists_drawn;
+    client.punchHand = almightyPythonSafeHand(message.punch_hand);
+    client.punchProgress = Math.max(0, Math.min(1, almightyPythonFinite(message.punch_progress, 0, 1)));
+    client.hideoutId = String(message.hideout_id || "").slice(0, 96);
     const packet = almightyPythonPublicPlayer(client, room);
     for (const c of room.clients.values()) if (c.ws !== ws) almightyPythonSend(c.ws, packet);
     return;
@@ -5506,8 +5585,10 @@ function almightyPythonHandle(ws, payload) {
       almightyPythonSnapshot(room);
       return;
     }
-    const left = client.partyId ? almightyPythonPartyMembers(room, client.partyId) : [client];
-    const right = target.partyId ? almightyPythonPartyMembers(room, target.partyId) : [target];
+    const leftParty = String(client.partyId || "");
+    const rightParty = String(target.partyId || "");
+    const left = leftParty ? almightyPythonPartyMembers(room, leftParty) : [client];
+    const right = rightParty ? almightyPythonPartyMembers(room, rightParty) : [target];
     const merged = [];
     const seen = new Set();
     for (const member of [...left, ...right, client, target]) {
@@ -5516,10 +5597,115 @@ function almightyPythonHandle(ws, payload) {
       merged.push(member);
     }
     if (merged.length > ALMIGHTY_PYTHON_MAX_PLAYERS) return;
-    const partyId = String(client.partyId || target.partyId || ("python-party-" + String(almightyPythonPartyCounter++)));
+    const partyId = String(leftParty || rightParty || ("python-party-" + String(almightyPythonPartyCounter++)));
+    let inheritedMission = null;
+    if (room.hideouts) inheritedMission = room.hideouts.get(leftParty) || room.hideouts.get(rightParty) || null;
     for (const member of merged) member.partyId = partyId;
+    if (room.hideouts) {
+      if (leftParty && leftParty !== partyId) room.hideouts.delete(leftParty);
+      if (rightParty && rightParty !== partyId) room.hideouts.delete(rightParty);
+      if (inheritedMission) {
+        inheritedMission.party_id = partyId;
+        room.hideouts.set(partyId, inheritedMission);
+      }
+    }
     almightyPythonNormalizeParties(room);
     almightyPythonSnapshot(room, null, "party");
+    return;
+  }
+  if (kind === "kick_ass" || kind === "hideout_request") {
+    const partyId = String(client.partyId || "");
+    const members = almightyPythonPartyMembers(room, partyId);
+    if (!partyId || members.length < 2) return;
+    let mission = room.hideouts ? room.hideouts.get(partyId) : null;
+    if (!mission) {
+      const raw = message.hideout && typeof message.hideout === "object" ? message.hideout : {};
+      const id = String(raw.id || ("hideout-" + rid())).replace(/[^A-Za-z0-9_-]/g, "").slice(0, 96);
+      const authority = members.find(member => member.id === room.hostId) || client;
+      mission = {
+        id: id || ("hideout-" + rid()),
+        name: String(raw.name || "Snake City Hideout").replace(/\s+/g, " ").trim().slice(0, 72) || "Snake City Hideout",
+        seed: Math.abs(Math.trunc(almightyPythonFinite(raw.seed, Date.now(), 2147483647))),
+        entrance_x: almightyPythonFinite(raw.entrance_x, client.x),
+        entrance_y: almightyPythonFinite(raw.entrance_y, client.y),
+        wall_x: almightyPythonFinite(raw.wall_x, client.x),
+        wall_y: almightyPythonFinite(raw.wall_y, client.y),
+        facing: almightyPythonFinite(raw.facing, client.angle, 100000),
+        origin_x: almightyPythonFinite(raw.origin_x, client.x),
+        origin_y: almightyPythonFinite(raw.origin_y, client.y),
+        enemy_count: Math.max(3, Math.min(14, Number(raw.enemy_count || (4 + members.length * 2)) | 0)),
+        status: "active",
+        party_id: partyId,
+        authority_id: String(authority.id || client.id),
+        created_at: Date.now()
+      };
+      if (!room.hideouts) room.hideouts = new Map();
+      room.hideouts.set(partyId, mission);
+    }
+    almightyPythonPartyBroadcast(room, partyId, { t: "hideout", game: "almighty_python", room: room.name, hideout: Object.assign({}, mission), ts: Date.now() });
+    almightyPythonSnapshot(room);
+    return;
+  }
+  if (kind === "combat_punch") {
+    const partyId = String(client.partyId || "");
+    const mission = room.hideouts && room.hideouts.get(partyId);
+    if (!mission || mission.status !== "active" || String(message.hideout_id || "") !== String(mission.id || "")) return;
+    const authority = room.clients.get(String(mission.authority_id || ""));
+    if (!authority) return;
+    almightyPythonSend(authority.ws, {
+      t: "combat_punch", game: "almighty_python", room: room.name,
+      from: client.id, hand: almightyPythonSafeHand(message.hand) || "right",
+      x: almightyPythonFinite(message.x, client.x), y: almightyPythonFinite(message.y, client.y),
+      angle: almightyPythonFinite(message.angle, client.angle, 100000),
+      hideout_id: String(mission.id || ""), ts: Date.now()
+    });
+    return;
+  }
+  if (kind === "combat_snapshot") {
+    const partyId = String(client.partyId || "");
+    const mission = room.hideouts && room.hideouts.get(partyId);
+    if (!mission || String(mission.authority_id || "") !== client.id || String(message.hideout_id || "") !== String(mission.id || "")) return;
+    const snapshot = message.snapshot && typeof message.snapshot === "object" ? message.snapshot : null;
+    if (!snapshot) return;
+    almightyPythonPartyBroadcast(room, partyId, { t: "combat_snapshot", game: "almighty_python", room: room.name, hideout_id: mission.id, snapshot, ts: Date.now() });
+    return;
+  }
+  if (kind === "combat_damage") {
+    const partyId = String(client.partyId || "");
+    const mission = room.hideouts && room.hideouts.get(partyId);
+    if (!mission || String(mission.authority_id || "") !== client.id || String(message.hideout_id || "") !== String(mission.id || "")) return;
+    const target = room.clients.get(almightyPythonSafeId(message.target_id));
+    if (!target || String(target.partyId || "") !== partyId) return;
+    almightyPythonSend(target.ws, { t: "combat_damage", game: "almighty_python", room: room.name, from: client.id, to: target.id, amount: Math.max(0, Math.min(50, Number(message.amount || 0))), hideout_id: mission.id, ts: Date.now() });
+    return;
+  }
+  if (kind === "hideout_complete") {
+    const partyId = String(client.partyId || "");
+    const mission = room.hideouts && room.hideouts.get(partyId);
+    if (!mission || mission.status === "complete" || String(mission.authority_id || "") !== client.id || String(message.hideout_id || "") !== String(mission.id || "")) return;
+    mission.status = "complete";
+    const rawStats = message.stats && typeof message.stats === "object" ? message.stats : {};
+    const stats = {
+      xp: Math.max(0, Math.min(100000, Number(rawStats.xp || 0) | 0)),
+      hardest_hit: Math.max(0, Math.min(100000, Number(rawStats.hardest_hit || 0))),
+      total_kills: Math.max(0, Math.min(1000, Number(rawStats.total_kills || 0) | 0)),
+      reputation: Math.max(0, Math.min(10000, Number(rawStats.reputation || 0) | 0)),
+      credits: Math.max(0, Math.min(100000, Number(rawStats.credits || 0) | 0))
+    };
+    almightyPythonPartyBroadcast(room, partyId, { t: "hideout_complete", game: "almighty_python", room: room.name, hideout_id: mission.id, stats, ts: Date.now() });
+    return;
+  }
+  if (kind === "mission_return") {
+    const partyId = String(client.partyId || "");
+    const mission = room.hideouts && room.hideouts.get(partyId);
+    if (!mission || String(message.hideout_id || "") !== String(mission.id || "")) return;
+    if (!mission.returned) mission.returned = {};
+    mission.returned[client.id] = true;
+    const members = almightyPythonPartyMembers(room, partyId);
+    if (members.length && members.every(member => mission.returned[member.id])) {
+      room.hideouts.delete(partyId);
+      almightyPythonPartyBroadcast(room, partyId, { t: "hideout_cleared", game: "almighty_python", room: room.name, hideout_id: mission.id, ts: Date.now() });
+    }
     return;
   }
   if (kind === "sync" || kind === "list") {
