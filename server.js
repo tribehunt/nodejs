@@ -5329,6 +5329,9 @@ let almightyPythonRoomCounter = 1;
 let almightyPythonPartyCounter = 1;
 const ALMIGHTY_PYTHON_MAX_PLAYERS = 4;
 const ALMIGHTY_PYTHON_TTL_MS = 15000;
+const ALMIGHTY_PYTHON_HIDEOUT_ENTRY_RADIUS = 2.0;
+const ALMIGHTY_PYTHON_HIDEOUT_STOP_SPEED = 0.08;
+const ALMIGHTY_PYTHON_ENTRY_PRESENCE_MAX_AGE_MS = 2500;
 function almightyPythonSafeId(value) {
   const out = String(value || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
   return out || ("AP-" + rid());
@@ -5633,7 +5636,8 @@ function almightyPythonHandle(ws, payload) {
         facing: almightyPythonFinite(raw.facing, client.angle, 100000),
         origin_x: almightyPythonFinite(raw.origin_x, client.x),
         origin_y: almightyPythonFinite(raw.origin_y, client.y),
-        enemy_count: Math.max(3, Math.min(14, Number(raw.enemy_count || (4 + members.length * 2)) | 0)),
+        enemy_count: Math.max(8, Math.min(14, Number(raw.enemy_count || (6 + members.length * 2)) | 0)),
+        floor_count: Math.max(3, Math.min(5, Number(raw.floor_count || 3) | 0)),
         status: "active",
         party_id: partyId,
         authority_id: String(authority.id || client.id),
@@ -5643,6 +5647,68 @@ function almightyPythonHandle(ws, payload) {
       room.hideouts.set(partyId, mission);
     }
     almightyPythonPartyBroadcast(room, partyId, { t: "hideout", game: "almighty_python", room: room.name, hideout: Object.assign({}, mission), ts: Date.now() });
+    almightyPythonSnapshot(room);
+    return;
+  }
+  if (kind === "hideout_enter" || kind === "hideout_entry") {
+    const partyId = String(client.partyId || "");
+    const members = almightyPythonPartyMembers(room, partyId);
+    const mission = room.hideouts && room.hideouts.get(partyId);
+    const requestedId = String(message.hideout_id || "").slice(0, 96);
+    const deny = (reason) => almightyPythonSend(client.ws, {
+      t: "hideout_enter_denied",
+      game: "almighty_python",
+      room: room.name,
+      hideout_id: requestedId,
+      reason: String(reason || "BOTH PLAYERS MUST BE AT THE DOOR AND STOPPED").slice(0, 96),
+      ts: Date.now()
+    });
+    if (!partyId || members.length < 2 || !mission || mission.status !== "active" || requestedId !== String(mission.id || "")) {
+      deny("HIDEOUT PARTY LINK NOT READY");
+      return;
+    }
+    const now = Date.now();
+    let failure = "";
+    for (const member of members) {
+      if (!member || now - Number(member.lastSeen || 0) > ALMIGHTY_PYTHON_ENTRY_PRESENCE_MAX_AGE_MS) {
+        failure = "WAITING FOR BOTH PLAYERS AT THE HIDEOUT DOOR";
+        break;
+      }
+      if (almightyPythonSafeScene(member.scene) !== "ride" || String(member.hideoutId || "") !== String(mission.id || "")) {
+        failure = "BOTH PLAYERS MUST BE AT THE SAME HIDEOUT DOOR";
+        break;
+      }
+      const dx = almightyPythonFinite(member.x, 0) - almightyPythonFinite(mission.entrance_x, 0);
+      const dy = almightyPythonFinite(member.y, 0) - almightyPythonFinite(mission.entrance_y, 0);
+      if (Math.hypot(dx, dy) > ALMIGHTY_PYTHON_HIDEOUT_ENTRY_RADIUS) {
+        failure = "BOTH PLAYERS MUST BE IN THE DOOR RADIUS";
+        break;
+      }
+      if (!!member.moving || Math.abs(almightyPythonFinite(member.speed, 0, 1000)) > ALMIGHTY_PYTHON_HIDEOUT_STOP_SPEED) {
+        failure = "BOTH BIKES MUST BE COMPLETELY STOPPED";
+        break;
+      }
+    }
+    if (failure) {
+      deny(failure);
+      return;
+    }
+    if (!mission.entry_token) {
+      mission.entry_token = "hideout-entry-" + rid() + "-" + String(now);
+      mission.entry_started_at = now;
+      mission.entry_triggered_by = client.id;
+    }
+    almightyPythonPartyBroadcast(room, partyId, {
+      t: "hideout_enter",
+      game: "almighty_python",
+      room: room.name,
+      hideout_id: String(mission.id || ""),
+      entry_token: String(mission.entry_token || ""),
+      triggered_by: String(mission.entry_triggered_by || client.id),
+      ts: Number(mission.entry_started_at || now)
+    });
+    // Snapshot the token too, so a party member reconnecting during the breach
+    // is still pulled into the same authored transition instead of remaining outside.
     almightyPythonSnapshot(room);
     return;
   }
