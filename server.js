@@ -1,4 +1,4 @@
-// server.js - supports Eldritch Cyber Front,
+// server.js - supports Eldritch Cyber Front, Almighty Python,
 // Ethane Sea, STUG, GROWTH, ARMORBOUND & House Nocturne
 // One process, one port, isolated rooms by game.
 // by Dedset Media 02/24/2026
@@ -5332,6 +5332,7 @@ const ALMIGHTY_PYTHON_TTL_MS = 15000;
 const ALMIGHTY_PYTHON_HIDEOUT_ENTRY_RADIUS = 2.0;
 const ALMIGHTY_PYTHON_HIDEOUT_STOP_SPEED = 0.08;
 const ALMIGHTY_PYTHON_ENTRY_PRESENCE_MAX_AGE_MS = 2500;
+const ALMIGHTY_PYTHON_MISSION_DISCONNECT_MS = 5 * 60 * 1000;
 function almightyPythonSafeId(value) {
   const out = String(value || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
   return out || ("AP-" + rid());
@@ -5421,6 +5422,17 @@ function almightyPythonSnapshot(room, ws = null, kind = "snapshot") {
 function almightyPythonPartyBroadcast(room, partyId, packet) {
   for (const member of almightyPythonPartyMembers(room, partyId)) almightyPythonSend(member.ws, packet);
 }
+function almightyPythonCancelHideout(room, partyId, mission, reason) {
+  if (!room || !mission) return false;
+  const packet = { t: "hideout_cancelled", game: "almighty_python", room: room.name,
+    hideout_id: String(mission.id || ""), reason: String(reason || "TEAM MISSION CANCELLED").slice(0, 120), ts: Date.now() };
+  for (const client of room.clients.values()) {
+    if (String(client.partyId || "") === String(partyId || "") || (Array.isArray(mission.member_ids) && mission.member_ids.includes(client.id))) almightyPythonSend(client.ws, packet);
+  }
+  if (room.hideouts) room.hideouts.delete(String(partyId || ""));
+  for (const client of room.clients.values()) if (String(client.partyId || "") === String(partyId || "")) client.partyId = "";
+  return true;
+}
 function almightyPythonPromoteHost(room) {
   if (!room || !room.clients) return;
   room.joinedOrder = (room.joinedOrder || []).filter(id => room.clients.has(id));
@@ -5436,7 +5448,24 @@ function almightyPythonNormalizeParties(room) {
     groups.get(partyId).push(client);
   }
   for (const [partyId, members] of groups.entries()) {
+    const activeMission = room.hideouts ? room.hideouts.get(partyId) : null;
+    let missionMissing = [];
+    if (activeMission && String(activeMission.status || "active") === "active") {
+      const expected = Array.isArray(activeMission.member_ids) ? activeMission.member_ids.map(String) : [];
+      const connected = new Set(members.map(member => String(member.id || "")));
+      missionMissing = expected.filter(id => !connected.has(id));
+      if (missionMissing.length) {
+        if (!Number(activeMission.disconnect_since || 0)) activeMission.disconnect_since = Date.now();
+        if (Date.now() - Number(activeMission.disconnect_since || 0) >= ALMIGHTY_PYTHON_MISSION_DISCONNECT_MS) {
+          almightyPythonCancelHideout(room, partyId, activeMission, "TEAMMATE DISCONNECTED FOR MORE THAN FIVE MINUTES");
+          continue;
+        }
+      } else {
+        activeMission.disconnect_since = 0;
+      }
+    }
     if (members.length < 2) {
+      if (activeMission && missionMissing.length) continue;
       for (const client of members) client.partyId = "";
       if (room.hideouts) room.hideouts.delete(partyId);
       continue;
@@ -5517,6 +5546,17 @@ function almightyPythonJoin(ws, message) {
     partyId: "",
     lastSeen: Date.now()
   };
+  // Reclaim a reserved active mission when the same player reconnects within
+  // the five-minute grace period.
+  if (room.hideouts) {
+    for (const [partyId, mission] of room.hideouts.entries()) {
+      if (mission && String(mission.status || "active") === "active" && Array.isArray(mission.member_ids) && mission.member_ids.map(String).includes(id)) {
+        client.partyId = String(partyId || "");
+        mission.disconnect_since = 0;
+        break;
+      }
+    }
+  }
   room.clients.set(id, client);
   room.joinedOrder.push(id);
   if (!room.hostId) room.hostId = id;
@@ -5641,6 +5681,9 @@ function almightyPythonHandle(ws, payload) {
         status: "active",
         party_id: partyId,
         authority_id: String(authority.id || client.id),
+        member_ids: members.map(member => String(member.id || "")).filter(Boolean),
+        defeated: {},
+        disconnect_since: 0,
         created_at: Date.now()
       };
       if (!room.hideouts) room.hideouts = new Map();
@@ -5742,7 +5785,35 @@ function almightyPythonHandle(ws, payload) {
     if (!mission || String(mission.authority_id || "") !== client.id || String(message.hideout_id || "") !== String(mission.id || "")) return;
     const target = room.clients.get(almightyPythonSafeId(message.target_id));
     if (!target || String(target.partyId || "") !== partyId) return;
-    almightyPythonSend(target.ws, { t: "combat_damage", game: "almighty_python", room: room.name, from: client.id, to: target.id, amount: Math.max(0, Math.min(50, Number(message.amount || 0))), hideout_id: mission.id, ts: Date.now() });
+    almightyPythonSend(target.ws, { t: "combat_damage", game: "almighty_python", room: room.name, from: client.id, to: target.id, amount: Math.max(0, Math.min(500, Number(message.amount || 0))), blocking: Boolean(message.blocking), hideout_id: mission.id, ts: Date.now() });
+    return;
+  }
+  if (kind === "hideout_defeat") {
+    const partyId = String(client.partyId || "");
+    const mission = room.hideouts && room.hideouts.get(partyId);
+    if (!mission || String(mission.status || "active") !== "active" || String(message.hideout_id || "") !== String(mission.id || "")) return;
+    if (!mission.defeated || typeof mission.defeated !== "object") mission.defeated = {};
+    mission.defeated[client.id] = true;
+    const expected = Array.isArray(mission.member_ids) ? mission.member_ids.map(String) : almightyPythonPartyMembers(room, partyId).map(member => String(member.id || ""));
+    if (expected.length >= 2 && expected.every(id => !!mission.defeated[id])) {
+      almightyPythonCancelHideout(room, partyId, mission, "EVERY RIDER WAS KNOCKED OUT // TEAM MISSION CANCELLED");
+      almightyPythonSnapshot(room);
+    } else {
+      if (String(mission.authority_id || "") === String(client.id || "")) {
+        const replacement = almightyPythonPartyMembers(room, partyId).find(member => !mission.defeated[String(member.id || "")]);
+        if (replacement) mission.authority_id = String(replacement.id || "");
+      }
+      almightyPythonPartyBroadcast(room, partyId, { t: "hideout_state", game: "almighty_python", room: room.name, hideout: Object.assign({}, mission), ts: Date.now() });
+      almightyPythonSnapshot(room);
+    }
+    return;
+  }
+  if (kind === "hideout_cancel") {
+    const partyId = String(client.partyId || "");
+    const mission = room.hideouts && room.hideouts.get(partyId);
+    if (!mission || String(message.hideout_id || "") !== String(mission.id || "")) return;
+    almightyPythonCancelHideout(room, partyId, mission, message.reason || "TEAM MISSION CANCELLED");
+    almightyPythonSnapshot(room);
     return;
   }
   if (kind === "hideout_complete") {
