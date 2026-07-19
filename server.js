@@ -5884,6 +5884,7 @@ try {
 const umbralRooms = new Map(); // roomName -> { name, clients:Map<id,client> }
 const UMBRAL_DEFAULT_ROOM = "house_nocturne";
 const UMBRAL_PEER_TTL_MS = 45000;
+const UMBRAL_MAX_CLIENTS = 16;
 const UMBRAL_MAX_MAP_FLOORS = 8;
 const UMBRAL_MAX_MAP_ROWS = 128;
 const UMBRAL_MAX_MAP_COLS = 160;
@@ -5968,6 +5969,20 @@ function umbralSendPeerList(ws, room, selfId) {
     umbralSend(ws, umbralPublicPeer(c, ws));
   }
 }
+function umbralRoster(room, viewerWs = null) {
+  if (!room || !room.clients) return [];
+  return [...room.clients.values()].slice(0, UMBRAL_MAX_CLIENTS).map(c => umbralPublicPeer(c, viewerWs));
+}
+function umbralSendWelcome(ws, room, selfId) {
+  umbralSend(ws, {
+    type: "roster",
+    game: "house_nocturne",
+    room: room.name,
+    self_id: String(selfId || ""),
+    peers: umbralRoster(room, ws),
+    ts: Date.now()
+  });
+}
 function umbralDetach(ws, announce = true) {
   if (!ws || !ws._umbralId) return;
   const id = String(ws._umbralId || "");
@@ -5975,8 +5990,9 @@ function umbralDetach(ws, announce = true) {
   const room = umbralRooms.get(roomName);
   if (room && room.clients) {
     const c = room.clients.get(id);
-    if (c && c.ws === ws) room.clients.delete(id);
-    if (announce && id) umbralBroadcast(room, { type: "peer_left", id, room: room.name, ts: Date.now() }, ws);
+    const removed = !!(c && c.ws === ws);
+    if (removed) room.clients.delete(id);
+    if (removed && announce && id) umbralBroadcast(room, { type: "peer_left", id, room: room.name, ts: Date.now() }, ws);
     if (room.clients.size === 0) umbralRooms.delete(roomName);
   }
   ws._umbralId = "";
@@ -5989,7 +6005,15 @@ function umbralRememberPresence(ws, m) {
   const id = umbralSafeId(m.id || ws._umbralId || "");
   ws._umbralId = id;
   ws._umbralRoomName = room.name;
-  const existing = room.clients.get(id) || { id, room: room.name, ws };
+  const prior = room.clients.get(id);
+  if (prior && prior.ws && prior.ws !== ws) {
+    try { prior.ws._umbralId = ""; prior.ws._umbralRoomName = ""; prior.ws.close(4001, "newer House connection"); } catch {}
+  }
+  if (!prior && room.clients.size >= UMBRAL_MAX_CLIENTS) {
+    umbralSend(ws, { type: "error", code: "umbral_room_full", message: "This House junction is full.", ts: Date.now() });
+    return null;
+  }
+  const existing = prior || { id, room: room.name, ws };
   existing.ws = ws;
   existing.id = id;
   existing.room = room.name;
@@ -6039,7 +6063,7 @@ function umbralHandle(ws, payloadStr, prefixed = false) {
   if (typ === "presence" || typ === "peer" || typ === "hello" || typ === "join") {
     const got = umbralRememberPresence(ws, m);
     if (!got || !got.client) return;
-    umbralSendPeerList(ws, got.room, got.client.id);
+    umbralSendWelcome(ws, got.room, got.client.id);
     umbralBroadcast(got.room, umbralPublicPeer(got.client), ws);
     return;
   }
