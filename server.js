@@ -2160,6 +2160,68 @@ try {
   const _umbralSweep = setInterval(umbralCleanRooms, 15000);
   if (_umbralSweep && typeof _umbralSweep.unref === "function") _umbralSweep.unref();
 } catch {}
+
+// ----------------------------------
+// Illithid Throne world chat protocol (it:...)
+// ----------------------------------
+const illithidClients = new Map();
+let illithidJoinSeq = 0;
+function illithidSend(ws, packet) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  try { ws.send(JSON.stringify(packet)); return true; } catch { return false; }
+}
+function illithidLiveClients() {
+  return [...illithidClients.values()].filter(c => c && c.ws && c.ws.readyState === WebSocket.OPEN);
+}
+function illithidHost() {
+  const live = illithidLiveClients().sort((a,b) => a.seq-b.seq);
+  return live.length ? live[0] : null;
+}
+function illithidShade(client) {
+  if (!client) return 160;
+  const shades = [218,204,190,176,162,148,134,120,106,92];
+  return shades[Math.abs(Number(client.seq || 0)) % shades.length];
+}
+function illithidBroadcast(packet, exceptWs=null) {
+  for (const c of illithidLiveClients()) if (c.ws !== exceptWs) illithidSend(c.ws, packet);
+}
+function illithidAnnounceHost() {
+  const host = illithidHost();
+  illithidBroadcast({ t:'host', game:'illithid_throne', id:host ? host.id : '', name:host ? host.name : '', ts:Date.now() });
+}
+function illithidJoin(ws, m) {
+  illithidDetach(ws, true);
+  const id = String(m.id || '').replace(/[^a-zA-Z0-9_.:-]/g,'').slice(0,80) || `duke-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const name = String(m.name || 'The Duke').replace(/[\r\n\t]/g,' ').replace(/\s+/g,' ').trim().slice(0,48) || 'The Duke';
+  const client = { id, name, ws, seq:++illithidJoinSeq };
+  illithidClients.set(id, client); ws._illithidId=id;
+  const host=illithidHost();
+  illithidSend(ws,{t:'welcome',game:'illithid_throne',id,name,host:!!host&&host.id===id,shade:illithidShade(client),online:illithidLiveClients().length,ts:Date.now()});
+  illithidBroadcast({t:'join',game:'illithid_throne',id,name,host:!!host&&host.id===id,shade:illithidShade(client),text:'Another shadow lurks...',ts:Date.now()});
+  illithidAnnounceHost();
+}
+function illithidHandle(ws, payload) {
+  let m=null; try { m=JSON.parse(String(payload||'')); } catch { return; }
+  if (!m || typeof m !== 'object') return;
+  const t=String(m.t||m.type||'').toLowerCase();
+  if (t==='join') { illithidJoin(ws,m); return; }
+  const client=illithidClients.get(ws._illithidId); if (!client) return;
+  if (t==='chat') {
+    const text=String(m.text||m.msg||m.message||'').replace(/[\r\n\t]/g,' ').replace(/\s+/g,' ').trim().slice(0,220);
+    if (!text) return;
+    const host=illithidHost();
+    illithidBroadcast({t:'chat',game:'illithid_throne',id:client.id,name:client.name,text,host:!!host&&host.id===client.id,shade:illithidShade(client),ts:Date.now()});
+  }
+}
+function illithidDetach(ws, silent=false) {
+  const id=ws && ws._illithidId; if (!id) return;
+  const client=illithidClients.get(id); illithidClients.delete(id); try { delete ws._illithidId; } catch {}
+  if (client && !silent) {
+    illithidBroadcast({t:'leave',game:'illithid_throne',id:client.id,name:client.name,host:false,shade:illithidShade(client),text:'A shadow slips beyond the veil...',ts:Date.now()});
+    illithidAnnounceHost();
+  }
+}
+
 // ----------------------------------
 // Shared WebSocket connection router
 // ----------------------------------
@@ -2167,6 +2229,7 @@ function detachAllProtocols(ws) {
   try { almightyPythonDetach(ws, true); } catch {}
   try { umbralDetach(ws, true); } catch {}
   try { growthDetach(ws); } catch {}
+  try { illithidDetach(ws); } catch {}
 }
 function routeSocketMessage(ws, data) {
   let raw = "";
@@ -2179,6 +2242,7 @@ function routeSocketMessage(ws, data) {
   if (raw.startsWith("ap:")) { almightyPythonHandle(ws, raw.slice(3)); return; }
   if (raw.startsWith("ur:")) { umbralHandle(ws, raw.slice(3), true); return; }
   if (raw.startsWith("gf:")) { growthHandle(ws, raw.slice(3)); return; }
+  if (raw.startsWith("it:")) { illithidHandle(ws, raw.slice(3)); return; }
   // Legacy/no-prefix fallback.
   let m = null;
   try { m = JSON.parse(raw); } catch { m = null; }
@@ -2187,13 +2251,14 @@ function routeSocketMessage(ws, data) {
     if (game === "almighty_python" || game === "almighty" || game === "ap") { almightyPythonHandle(ws, raw); return; }
     if (game === "umbral" || game === "umbral_rail" || game === "house_nocturne" || game === "vespera" || game === "ur") { umbralHandle(ws, raw, false); return; }
     if (game === "growth" || game === "gf") { growthHandle(ws, raw); return; }
+    if (game === "illithid_throne" || game === "illithid" || game === "it") { illithidHandle(ws, raw); return; }
     const t = String(m.t || m.type || "").toLowerCase();
     if (t === "presence" || t === "peer" || t === "visit" || t === "visit_position" || t === "rail_chat" || t === "visitor_chat" || t === "leave" || t === "request_peers" || t === "sync") {
       umbralHandle(ws, raw, false);
       return;
     }
   }
-  try { ws.send(JSON.stringify({ type: "error", code: "unsupported_protocol", message: "Use Almighty Python, House Nocturne, or GROWTH protocol routing." })); } catch {}
+  try { ws.send(JSON.stringify({ type: "error", code: "unsupported_protocol", message: "Use Almighty Python, House Nocturne, GROWTH, or Illithid Throne protocol routing." })); } catch {}
 }
 wss.on("connection", (ws, req) => {
   ws.isAlive = true;
@@ -2211,6 +2276,6 @@ wss.on("connection", (ws, req) => {
 });
 // --------------------------------------------------------------
 server.listen(PORT, HOST, () => {
-  console.log("Dedset relay (Almighty Python / GROWTH / House Nocturne) on", HOST + ":" + PORT);
+  console.log("Dedset relay (Almighty Python / GROWTH / House Nocturne / Illithid Throne) on", HOST + ":" + PORT);
   if (MEGA_CLAIM_REQUIRE_AUTH && !MEGA_CLAIM_SECRET) console.warn("MEGA claim endpoint is locked until MEGA_CLAIM_SECRET is configured.");
 });
