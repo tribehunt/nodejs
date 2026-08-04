@@ -2158,6 +2158,7 @@ try {
 // -------------------------------------
 const illithidClients = new Map();
 let illithidJoinSeq = 0;
+const ILLITHID_MAX_PLAYERS = 4;
 const ILLITHID_STATE_MIN_MS = 75;
 const ILLITHID_EVENT_RATE_MAX = 48;
 const ILLITHID_MAX_STATE_BYTES = 768 * 1024;
@@ -2210,6 +2211,11 @@ function illithidPublicClient(c, host) {
 }
 function illithidJoin(ws, m) {
   illithidDetach(ws, true);
+  if (illithidLiveClients().length >= ILLITHID_MAX_PLAYERS) {
+    illithidSend(ws,{t:'party_full',game:'illithid_throne',message:'The current co-op world already holds four Dukes.',online:illithidLiveClients().length,ts:Date.now()});
+    try { ws.close(1008,'illithid co-op party full'); } catch {}
+    return;
+  }
   const id = String(m.id || '').replace(/[^a-zA-Z0-9_.:-]/g,'').slice(0,80) || `duke-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const name = String(m.name || 'The Duke').replace(/[\r\n\t]/g,' ').replace(/\s+/g,' ').trim().slice(0,48) || 'The Duke';
   const profile=illithidSafeProfile(m.profile);
@@ -2222,7 +2228,7 @@ function illithidJoin(ws, m) {
   };
   illithidClients.set(id, client); ws._illithidId=id;
   const host=illithidHost();
-  illithidSend(ws,{t:'welcome',game:'illithid_throne',id,name,host:!!host&&host.id===id,shade:illithidShade(client),online:illithidLiveClients().length,players:illithidLiveClients().map(c=>illithidPublicClient(c,host)),ts:Date.now()});
+  illithidSend(ws,{t:'welcome',game:'illithid_throne',id,name,host:!!host&&host.id===id,host_id:host?host.id:'',shade:illithidShade(client),online:illithidLiveClients().length,max_players:ILLITHID_MAX_PLAYERS,players:illithidLiveClients().map(c=>illithidPublicClient(c,host)),ts:Date.now()});
   illithidBroadcast({t:'join',game:'illithid_throne',id,name,host:!!host&&host.id===id,shade:illithidShade(client),profile:client.profile,text:'Another shadow lurks...',ts:Date.now()},ws);
   illithidAnnounceHost();
 }
@@ -2267,7 +2273,8 @@ function illithidHandle(ws, payload) {
     let bytes=0; try { bytes=Buffer.byteLength(JSON.stringify(m.state),'utf8'); } catch { return; }
     if (bytes>ILLITHID_MAX_STATE_BYTES) return;
     client.lastStateAt=now; client.state=m.state;
-    illithidBroadcast({t:'world_state',game:'illithid_throne',id:client.id,name:client.name,state:client.state,ts:now},ws);
+    const host=illithidHost();
+    illithidBroadcast({t:'world_state',game:'illithid_throne',id:client.id,name:client.name,host:!!host&&host.id===client.id,host_id:host?host.id:'',state:client.state,ts:now},ws);
     return;
   }
   if (t==='world_event') {
