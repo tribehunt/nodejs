@@ -1,5 +1,5 @@
-// server.js - supports Almighty Python, GROWTH & House Nocturne
-// One process, one port, isolated rooms by game.
+// server.js - supports Almighty Python, GROWTH, House Nocturne
+// and Illithid Throne. One process, one port, isolated rooms by game.
 // by Dedset Media 08/04/2026
 const http = require("http");
 const https = require("https");
@@ -2193,11 +2193,15 @@ function illithidJoin(ws, m) {
   illithidDetach(ws, true);
   const id = String(m.id || '').replace(/[^a-zA-Z0-9_.:-]/g,'').slice(0,80) || `duke-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const name = String(m.name || 'The Duke').replace(/[\r\n\t]/g,' ').replace(/\s+/g,' ').trim().slice(0,48) || 'The Duke';
-  const client = { id, name, ws, seq:++illithidJoinSeq };
+  const rawProfile=(m.profile&&typeof m.profile==='object')?m.profile:{};
+  const profile={head:Math.max(0,Math.min(99,Number(rawProfile.head||0)|0)),armor_head:String(rawProfile.armor_head||'').replace(/[^a-zA-Z0-9_.:-]/g,'').slice(0,80)};
+  const rawBalances=(m.balances&&typeof m.balances==='object')?m.balances:{};
+  const balances={matter:Math.max(0,Math.min(1000000000,Number(rawBalances.matter||0)|0)),essence:Math.max(0,Math.min(1000000000,Number(rawBalances.essence||0)|0))};
+  const client = { id, name, ws, seq:++illithidJoinSeq, profile, balances };
   illithidClients.set(id, client); ws._illithidId=id;
   const host=illithidHost();
-  illithidSend(ws,{t:'welcome',game:'illithid_throne',id,name,host:!!host&&host.id===id,shade:illithidShade(client),online:illithidLiveClients().length,ts:Date.now()});
-  illithidBroadcast({t:'join',game:'illithid_throne',id,name,host:!!host&&host.id===id,shade:illithidShade(client),text:'Another shadow lurks...',ts:Date.now()});
+  illithidSend(ws,{t:'welcome',game:'illithid_throne',id,name,host:!!host&&host.id===id,shade:illithidShade(client),online:illithidLiveClients().length,players:illithidLiveClients().map(c=>({id:c.id,name:c.name,host:!!host&&host.id===c.id,shade:illithidShade(c),profile:c.profile})),ts:Date.now()});
+  illithidBroadcast({t:'join',game:'illithid_throne',id,name,host:!!host&&host.id===id,shade:illithidShade(client),profile:client.profile,text:'Another shadow lurks...',ts:Date.now()});
   illithidAnnounceHost();
 }
 function illithidHandle(ws, payload) {
@@ -2211,7 +2215,24 @@ function illithidHandle(ws, payload) {
     if (!text) return;
     const host=illithidHost();
     illithidBroadcast({t:'chat',game:'illithid_throne',id:client.id,name:client.name,text,host:!!host&&host.id===client.id,shade:illithidShade(client),ts:Date.now()});
+    if (t==='balance') {
+    const b=(m.balances&&typeof m.balances==='object')?m.balances:{};
+    client.balances={matter:Math.max(0,Math.min(1000000000,Number(b.matter||0)|0)),essence:Math.max(0,Math.min(1000000000,Number(b.essence||0)|0))};
+    return;
   }
+  if (t==='gift') {
+    const target=illithidClients.get(String(m.target||''));
+    const resource=String(m.resource||'').toLowerCase();
+    const amount=Math.max(1,Math.min(1000000000,Number(m.amount||0)|0));
+    if (!target || !target.ws || target.ws.readyState!==WebSocket.OPEN || target.id===client.id) { illithidSend(ws,{t:'gift_error',message:'That Duke is no longer within the veil.'}); return; }
+    if (resource!=='matter' && resource!=='essence') { illithidSend(ws,{t:'gift_error',message:'Unknown tribute.'}); return; }
+    if (!client.balances || Number(client.balances[resource]||0)<amount) { illithidSend(ws,{t:'gift_error',message:`You do not possess enough ${resource.toUpperCase()}.`}); return; }
+    client.balances[resource]-=amount; target.balances=target.balances||{matter:0,essence:0}; target.balances[resource]=Math.max(0,Number(target.balances[resource]||0))+amount;
+    illithidSend(ws,{t:'gift_ok',resource,amount,target:target.id,target_name:target.name,balances:client.balances,ts:Date.now()});
+    illithidSend(target.ws,{t:'gift_receive',resource,amount,from:client.id,from_name:client.name,balances:target.balances,ts:Date.now()});
+    return;
+  }
+}
 }
 function illithidDetach(ws, silent=false) {
   const id=ws && ws._illithidId; if (!id) return;
