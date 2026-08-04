@@ -1,6 +1,7 @@
 // server.js - supports Almighty Python, GROWTH, House Nocturne
 // and Illithid Throne. One process, one port, isolated rooms by game.
-// by Dedset Media 08/04/2026
+// https://raw.githubusercontent.com/tribehunt/nodejs/refs/heads/main/server.js
+// all games produced and engineered by © Dedset Media 08/04/2026
 const http = require("http");
 const https = require("https");
 const zlib = require("zlib");
