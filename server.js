@@ -1332,13 +1332,13 @@ function growthHandle(ws, payloadStr) {
     return;
   }
 }
-// ------------------------------------------------------------------------------------------------------------------
+// -------------------------------------------------------------------------------
 // ALMIGHTY PYTHON // Velvet Byte multiplayer lobby
 // Python client connects to: wss://nodejs-production-740bc.up.railway.app
 // Protocol prefix: ap:
 // Four players per lobby. The first connected player is the Real Almighty Python;
 // the other three are story-canon clones.
-// ------------------------------------------------------------------------------------------------------------------
+// -------------------------------------------------------------------------------
 const almightyPythonRooms = new Map();
 let almightyPythonRoomCounter = 1;
 let almightyPythonPartyCounter = 1;
@@ -1485,10 +1485,6 @@ function almightyPythonNormalizeParties(room) {
       if (room.hideouts) room.hideouts.delete(partyId);
       continue;
     }
-    // A three/four-player crew must not lose its Hideout authority when the
-    // original host drops. Promote the room host when present, otherwise the
-    // oldest remaining party member. Every client receives the updated mission
-    // in the next party snapshot.
     const mission = room.hideouts ? room.hideouts.get(partyId) : null;
     if (mission && String(mission.status || "active") === "complete") {
       const returned = mission.returned && typeof mission.returned === "object" ? mission.returned : {};
@@ -1561,8 +1557,6 @@ function almightyPythonJoin(ws, message) {
     partyId: "",
     lastSeen: Date.now()
   };
-  // Reclaim a reserved active mission when the same player reconnects within
-  // the five-minute grace period.
   if (room.hideouts) {
     for (const [partyId, mission] of room.hideouts.entries()) {
       if (mission && String(mission.status || "active") === "active" && Array.isArray(mission.member_ids) && mission.member_ids.map(String).includes(id)) {
@@ -1765,8 +1759,6 @@ function almightyPythonHandle(ws, payload) {
       triggered_by: String(mission.entry_triggered_by || client.id),
       ts: Number(mission.entry_started_at || now)
     });
-    // Snapshot the token too, so a party member reconnecting during the breach
-    // is still pulled into the same authored transition instead of remaining outside.
     almightyPythonSnapshot(room);
     return;
   }
@@ -2161,12 +2153,15 @@ try {
   const _umbralSweep = setInterval(umbralCleanRooms, 15000);
   if (_umbralSweep && typeof _umbralSweep.unref === "function") _umbralSweep.unref();
 } catch {}
-
-// ----------------------------------
-// Illithid Throne world chat protocol (it:...)
-// ----------------------------------
+// -------------------------------------
+// Illithid Throne shared-world protocol
+// -------------------------------------
 const illithidClients = new Map();
 let illithidJoinSeq = 0;
+const ILLITHID_STATE_MIN_MS = 75;
+const ILLITHID_EVENT_RATE_MAX = 48;
+const ILLITHID_MAX_STATE_BYTES = 768 * 1024;
+const ILLITHID_MAX_EVENT_BYTES = 96 * 1024;
 function illithidSend(ws, packet) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false;
   try { ws.send(JSON.stringify(packet)); return true; } catch { return false; }
@@ -2190,19 +2185,45 @@ function illithidAnnounceHost() {
   const host = illithidHost();
   illithidBroadcast({ t:'host', game:'illithid_throne', id:host ? host.id : '', name:host ? host.name : '', ts:Date.now() });
 }
+function illithidSafeProfile(rawProfile) {
+  rawProfile=(rawProfile&&typeof rawProfile==='object')?rawProfile:{};
+  return {
+    head:Math.max(0,Math.min(99,Number(rawProfile.head||0)|0)),
+    armor_head:String(rawProfile.armor_head||'').replace(/[^a-zA-Z0-9_.:\/-]/g,'').slice(0,160),
+    armor_torso:String(rawProfile.armor_torso||'').replace(/[^a-zA-Z0-9_.:\/-]/g,'').slice(0,160),
+    armor_hands:String(rawProfile.armor_hands||'').replace(/[^a-zA-Z0-9_.:\/-]/g,'').slice(0,160)
+  };
+}
+function illithidSafeBalances(rawBalances) {
+  rawBalances=(rawBalances&&typeof rawBalances==='object')?rawBalances:{};
+  return {
+    matter:Math.max(0,Math.min(1000000000,Number(rawBalances.matter||0)|0)),
+    essence:Math.max(0,Math.min(1000000000,Number(rawBalances.essence||0)|0))
+  };
+}
+function illithidPublicClient(c, host) {
+  return {
+    id:c.id, name:c.name, host:!!host&&host.id===c.id,
+    shade:illithidShade(c), profile:c.profile,
+    balances:c.balances, state:c.state || null
+  };
+}
 function illithidJoin(ws, m) {
   illithidDetach(ws, true);
   const id = String(m.id || '').replace(/[^a-zA-Z0-9_.:-]/g,'').slice(0,80) || `duke-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const name = String(m.name || 'The Duke').replace(/[\r\n\t]/g,' ').replace(/\s+/g,' ').trim().slice(0,48) || 'The Duke';
-  const rawProfile=(m.profile&&typeof m.profile==='object')?m.profile:{};
-  const profile={head:Math.max(0,Math.min(99,Number(rawProfile.head||0)|0)),armor_head:String(rawProfile.armor_head||'').replace(/[^a-zA-Z0-9_.:-]/g,'').slice(0,80)};
-  const rawBalances=(m.balances&&typeof m.balances==='object')?m.balances:{};
-  const balances={matter:Math.max(0,Math.min(1000000000,Number(rawBalances.matter||0)|0)),essence:Math.max(0,Math.min(1000000000,Number(rawBalances.essence||0)|0))};
-  const client = { id, name, ws, seq:++illithidJoinSeq, profile, balances };
+  const profile=illithidSafeProfile(m.profile);
+  const balances=illithidSafeBalances(m.balances);
+  const old=illithidClients.get(id);
+  if (old && old.ws && old.ws !== ws) { try { old.ws.close(1008, 'duplicate duke id'); } catch {} }
+  const client = {
+    id, name, ws, seq:++illithidJoinSeq, profile, balances, state:null,
+    lastStateAt:0, eventWindowAt:Date.now(), eventCount:0
+  };
   illithidClients.set(id, client); ws._illithidId=id;
   const host=illithidHost();
-  illithidSend(ws,{t:'welcome',game:'illithid_throne',id,name,host:!!host&&host.id===id,shade:illithidShade(client),online:illithidLiveClients().length,players:illithidLiveClients().map(c=>({id:c.id,name:c.name,host:!!host&&host.id===c.id,shade:illithidShade(c),profile:c.profile})),ts:Date.now()});
-  illithidBroadcast({t:'join',game:'illithid_throne',id,name,host:!!host&&host.id===id,shade:illithidShade(client),profile:client.profile,text:'Another shadow lurks...',ts:Date.now()});
+  illithidSend(ws,{t:'welcome',game:'illithid_throne',id,name,host:!!host&&host.id===id,shade:illithidShade(client),online:illithidLiveClients().length,players:illithidLiveClients().map(c=>illithidPublicClient(c,host)),ts:Date.now()});
+  illithidBroadcast({t:'join',game:'illithid_throne',id,name,host:!!host&&host.id===id,shade:illithidShade(client),profile:client.profile,text:'Another shadow lurks...',ts:Date.now()},ws);
   illithidAnnounceHost();
 }
 function illithidHandle(ws, payload) {
@@ -2216,9 +2237,15 @@ function illithidHandle(ws, payload) {
     if (!text) return;
     const host=illithidHost();
     illithidBroadcast({t:'chat',game:'illithid_throne',id:client.id,name:client.name,text,host:!!host&&host.id===client.id,shade:illithidShade(client),ts:Date.now()});
-    if (t==='balance') {
-    const b=(m.balances&&typeof m.balances==='object')?m.balances:{};
-    client.balances={matter:Math.max(0,Math.min(1000000000,Number(b.matter||0)|0)),essence:Math.max(0,Math.min(1000000000,Number(b.essence||0)|0))};
+    return;
+  }
+  if (t==='balance') {
+    client.balances=illithidSafeBalances(m.balances);
+    return;
+  }
+  if (t==='profile') {
+    client.profile=illithidSafeProfile(m.profile);
+    illithidBroadcast({t:'profile',game:'illithid_throne',id:client.id,name:client.name,profile:client.profile,ts:Date.now()},ws);
     return;
   }
   if (t==='gift') {
@@ -2233,7 +2260,33 @@ function illithidHandle(ws, payload) {
     illithidSend(target.ws,{t:'gift_receive',resource,amount,from:client.id,from_name:client.name,balances:target.balances,ts:Date.now()});
     return;
   }
-}
+  if (t==='world_state') {
+    const now=Date.now();
+    if (now-Number(client.lastStateAt||0)<ILLITHID_STATE_MIN_MS) return;
+    if (!m.state || typeof m.state!=='object' || Array.isArray(m.state)) return;
+    let bytes=0; try { bytes=Buffer.byteLength(JSON.stringify(m.state),'utf8'); } catch { return; }
+    if (bytes>ILLITHID_MAX_STATE_BYTES) return;
+    client.lastStateAt=now; client.state=m.state;
+    illithidBroadcast({t:'world_state',game:'illithid_throne',id:client.id,name:client.name,state:client.state,ts:now},ws);
+    return;
+  }
+  if (t==='world_event') {
+    const now=Date.now();
+    if (now-Number(client.eventWindowAt||0)>=1000) { client.eventWindowAt=now; client.eventCount=0; }
+    client.eventCount=Number(client.eventCount||0)+1;
+    if (client.eventCount>ILLITHID_EVENT_RATE_MAX) return;
+    if (!m.event || typeof m.event!=='object' || Array.isArray(m.event)) return;
+    let bytes=0; try { bytes=Buffer.byteLength(JSON.stringify(m.event),'utf8'); } catch { return; }
+    if (bytes>ILLITHID_MAX_EVENT_BYTES) return;
+    illithidBroadcast({t:'world_event',game:'illithid_throne',id:client.id,name:client.name,event:m.event,ts:now},ws);
+    return;
+  }
+  if (t==='request_world') {
+    const host=illithidHost();
+    illithidSend(ws,{t:'world_snapshot',game:'illithid_throne',host_id:host?host.id:'',players:illithidLiveClients().filter(c=>c.id!==client.id).map(c=>illithidPublicClient(c,host)),ts:Date.now()});
+    return;
+  }
+  if (t==='ping') { illithidSend(ws,{t:'pong',game:'illithid_throne',ts:Date.now()}); return; }
 }
 function illithidDetach(ws, silent=false) {
   const id=ws && ws._illithidId; if (!id) return;
@@ -2243,7 +2296,6 @@ function illithidDetach(ws, silent=false) {
     illithidAnnounceHost();
   }
 }
-
 // ----------------------------------
 // Shared WebSocket connection router
 // ----------------------------------
