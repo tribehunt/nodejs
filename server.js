@@ -2272,7 +2272,15 @@ function illithidHandle(ws, payload) {
     if (!m.state || typeof m.state!=='object' || Array.isArray(m.state)) return;
     let bytes=0; try { bytes=Buffer.byteLength(JSON.stringify(m.state),'utf8'); } catch { return; }
     if (bytes>ILLITHID_MAX_STATE_BYTES) return;
-    client.lastStateAt=now; client.state=m.state;
+    const incoming=Object.assign({},m.state);
+    const legacyHorde=Array.isArray(incoming.horde)?incoming.horde:[];
+    let daemonCount=Number(incoming.daemon_count);
+    if (!Number.isFinite(daemonCount)) {
+      daemonCount=legacyHorde.reduce((n,u)=>n+(u&&typeof u==='object'&&u.loyal!==false&&Number(u.hp||1)>0&&String(u.duty||'FIELD')==='FIELD'?1:0),0);
+    }
+    incoming.daemon_count=Math.max(0,Math.min(999,daemonCount|0));
+    delete incoming.horde;
+    client.lastStateAt=now; client.state=incoming;
     const host=illithidHost();
     illithidBroadcast({t:'world_state',game:'illithid_throne',id:client.id,name:client.name,host:!!host&&host.id===client.id,host_id:host?host.id:'',state:client.state,ts:now},ws);
     return;
