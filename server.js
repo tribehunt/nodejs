@@ -1,5 +1,5 @@
 // server.js - supports Almighty Python, GROWTH, House Nocturne
-// and Illithid Throne. One process, one port, isolated rooms by game.
+// LUXBOUND and Illithid Throne. One process, one port, isolated rooms by game.
 // https://raw.githubusercontent.com/tribehunt/nodejs/refs/heads/main/server.js
 // all games produced and engineered by © Dedset Media 08/04/2026
 const http = require("http");
@@ -2311,6 +2311,111 @@ function illithidDetach(ws, silent=false) {
     illithidAnnounceHost();
   }
 }
+// ----------------------------------------
+// LUXBOUND / LYRALAN observer-admin protocol
+// ----------------------------------------
+const luxboundPlayers = new Map();
+const luxboundAdmins = new Map();
+const LUXBOUND_STATE_MIN_MS = 120;
+function luxboundSend(ws, packet) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  try { ws.send("lb:" + JSON.stringify(packet)); return true; } catch { return false; }
+}
+function luxboundClean(v, max=96) {
+  return String(v || "").replace(/[\r\n\t]/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
+}
+function luxboundPublic(c) {
+  return { id:c.id, name:c.name, state:c.state || null, last_seen:Number(c.lastSeen || Date.now()) };
+}
+function luxboundRoster() {
+  return [...luxboundPlayers.values()].filter(c => c && c.ws && c.ws.readyState === WebSocket.OPEN).map(luxboundPublic);
+}
+function luxboundBroadcastAdmins(packet) {
+  for (const a of luxboundAdmins.values()) if (a && a.ws && a.ws.readyState === WebSocket.OPEN) luxboundSend(a.ws, packet);
+}
+function luxboundSendRoster(ws=null) {
+  const packet = { t:"roster", game:"luxbound", players:luxboundRoster(), ts:Date.now() };
+  if (ws) luxboundSend(ws, packet); else luxboundBroadcastAdmins(packet);
+}
+function luxboundDetach(ws) {
+  const pid = ws && ws._luxboundPlayerId;
+  const aid = ws && ws._luxboundAdminId;
+  if (pid) {
+    const c = luxboundPlayers.get(pid);
+    if (c && c.ws === ws) luxboundPlayers.delete(pid);
+    try { delete ws._luxboundPlayerId; } catch {}
+    luxboundBroadcastAdmins({ t:"player_left", game:"luxbound", id:String(pid), ts:Date.now() });
+    luxboundSendRoster();
+  }
+  if (aid) {
+    const a = luxboundAdmins.get(aid);
+    if (a && a.ws === ws) luxboundAdmins.delete(aid);
+    try { delete ws._luxboundAdminId; } catch {}
+  }
+}
+function luxboundJoin(ws, m) {
+  luxboundDetach(ws);
+  const role = String(m.role || "player").toLowerCase() === "admin" ? "admin" : "player";
+  const id = luxboundClean(m.id || `${role}-${Date.now()}-${Math.random().toString(16).slice(2)}`, 80);
+  const name = luxboundClean(m.name || (role === "admin" ? "LYRALAN" : "LUXBOUND"), 64);
+  if (role === "admin") {
+    const old = luxboundAdmins.get(id); if (old && old.ws && old.ws !== ws) { try { old.ws.close(1008,"duplicate lyralan id"); } catch {} }
+    luxboundAdmins.set(id, {id,name,ws,lastSeen:Date.now()}); ws._luxboundAdminId=id;
+    luxboundSend(ws, {t:"welcome",game:"luxbound",role:"admin",id,name,players:luxboundRoster(),ts:Date.now()});
+    luxboundSendRoster(ws);
+    return;
+  }
+  const old = luxboundPlayers.get(id); if (old && old.ws && old.ws !== ws) { try { old.ws.close(1008,"duplicate luxbound id"); } catch {} }
+  const client = {id,name,ws,state:null,lastStateAt:0,lastSeen:Date.now()};
+  luxboundPlayers.set(id, client); ws._luxboundPlayerId=id;
+  luxboundSend(ws,{t:"welcome",game:"luxbound",role:"player",id,name,ts:Date.now()});
+  luxboundSendRoster();
+}
+function luxboundHandle(ws, payload) {
+  let m=null; try { m=JSON.parse(String(payload||"")); } catch { return; }
+  if (!m || typeof m !== "object") return;
+  const t=String(m.t || m.type || "").toLowerCase();
+  if (t === "join") { luxboundJoin(ws,m); return; }
+  const pid=ws._luxboundPlayerId, aid=ws._luxboundAdminId;
+  if (t === "state" && pid) {
+    const client=luxboundPlayers.get(pid); if (!client || !m.state || typeof m.state !== "object" || Array.isArray(m.state)) return;
+    const now=Date.now(); if (now-Number(client.lastStateAt||0)<LUXBOUND_STATE_MIN_MS) return;
+    let bytes=0; try { bytes=Buffer.byteLength(JSON.stringify(m.state),"utf8"); } catch { return; }
+    if (bytes > 256*1024) return;
+    client.lastStateAt=now; client.lastSeen=now; client.state=m.state;
+    luxboundBroadcastAdmins({t:"state",game:"luxbound",id:client.id,name:client.name,state:client.state,ts:now});
+    return;
+  }
+  if (t === "player_chat" && pid) {
+    const client = luxboundPlayers.get(pid);
+    const text = luxboundClean(m.text,500);
+    if (!client || !text) return;
+    client.lastSeen = Date.now();
+    luxboundBroadcastAdmins({
+      t:"player_chat",
+      game:"luxbound",
+      id:client.id,
+      name:client.name,
+      text,
+      ts:Date.now()
+    });
+    return;
+  }
+  if (t === "chat" && aid) {
+    const target=luxboundPlayers.get(luxboundClean(m.target,80));
+    const text=luxboundClean(m.text,500);
+    if (!target || !target.ws || target.ws.readyState !== WebSocket.OPEN || !text) {
+      luxboundSend(ws,{t:"chat_error",game:"luxbound",message:"That LUXBOUND session is no longer online.",ts:Date.now()}); return;
+    }
+    const packet={t:"admin_chat",game:"luxbound",target:target.id,text,from:aid,from_name:"LYRALAN",ts:Date.now()};
+    luxboundSend(target.ws,packet);
+    luxboundBroadcastAdmins({t:"chat",game:"luxbound",target:target.id,text,from:"LYRALAN",ts:Date.now()});
+    return;
+  }
+  if (t === "request_players" && aid) { luxboundSendRoster(ws); return; }
+  if (t === "ping") { luxboundSend(ws,{t:"pong",game:"luxbound",ts:Date.now()}); return; }
+}
+
 // ----------------------------------
 // Shared WebSocket connection router
 // ----------------------------------
@@ -2319,6 +2424,7 @@ function detachAllProtocols(ws) {
   try { umbralDetach(ws, true); } catch {}
   try { growthDetach(ws); } catch {}
   try { illithidDetach(ws); } catch {}
+  try { luxboundDetach(ws); } catch {}
 }
 function routeSocketMessage(ws, data) {
   let raw = "";
@@ -2332,6 +2438,7 @@ function routeSocketMessage(ws, data) {
   if (raw.startsWith("ur:")) { umbralHandle(ws, raw.slice(3), true); return; }
   if (raw.startsWith("gf:")) { growthHandle(ws, raw.slice(3)); return; }
   if (raw.startsWith("it:")) { illithidHandle(ws, raw.slice(3)); return; }
+  if (raw.startsWith("lb:")) { luxboundHandle(ws, raw.slice(3)); return; }
   // Legacy/no-prefix fallback.
   let m = null;
   try { m = JSON.parse(raw); } catch { m = null; }
@@ -2341,13 +2448,14 @@ function routeSocketMessage(ws, data) {
     if (game === "umbral" || game === "umbral_rail" || game === "house_nocturne" || game === "vespera" || game === "ur") { umbralHandle(ws, raw, false); return; }
     if (game === "growth" || game === "gf") { growthHandle(ws, raw); return; }
     if (game === "illithid_throne" || game === "illithid" || game === "it") { illithidHandle(ws, raw); return; }
+    if (game === "luxbound" || game === "lyralan" || game === "lb") { luxboundHandle(ws, raw); return; }
     const t = String(m.t || m.type || "").toLowerCase();
     if (t === "presence" || t === "peer" || t === "visit" || t === "visit_position" || t === "rail_chat" || t === "visitor_chat" || t === "leave" || t === "request_peers" || t === "sync") {
       umbralHandle(ws, raw, false);
       return;
     }
   }
-  try { ws.send(JSON.stringify({ type: "error", code: "unsupported_protocol", message: "Use Almighty Python, House Nocturne, GROWTH, or Illithid Throne protocol routing." })); } catch {}
+  try { ws.send(JSON.stringify({ type: "error", code: "unsupported_protocol", message: "Use Almighty Python, House Nocturne, GROWTH, Illithid Throne, or LUXBOUND protocol routing." })); } catch {}
 }
 wss.on("connection", (ws, req) => {
   ws.isAlive = true;
@@ -2365,6 +2473,6 @@ wss.on("connection", (ws, req) => {
 });
 // --------------------------------------------------------------
 server.listen(PORT, HOST, () => {
-  console.log("Dedset relay (Almighty Python / GROWTH / House Nocturne / Illithid Throne) on", HOST + ":" + PORT);
+  console.log("Dedset relay (Almighty Python / GROWTH / House Nocturne / Illithid Throne / LUXBOUND) on", HOST + ":" + PORT);
   if (MEGA_CLAIM_REQUIRE_AUTH && !MEGA_CLAIM_SECRET) console.warn("MEGA claim endpoint is locked until MEGA_CLAIM_SECRET is configured.");
 });
