@@ -1,5 +1,5 @@
 // server.js - supports Almighty Python, GROWTH, House Nocturne
-// LUXBOUND and Illithid Throne. One process, one port, isolated rooms by game.
+// LUXBOUND, Mechmariner and Illithid Throne. One process, one port, isolated rooms by game.
 // https://raw.githubusercontent.com/tribehunt/nodejs/refs/heads/main/server.js
 // all games produced and engineered by © Dedset Media 08/04/2026
 const http = require("http");
@@ -2416,6 +2416,185 @@ function luxboundHandle(ws, payload) {
   if (t === "ping") { luxboundSend(ws,{t:"pong",game:"luxbound",ts:Date.now()}); return; }
 }
 
+// ----------------------------------------
+// MECHMARINER shared expedition protocol
+// Protocol prefix: mm:
+// ----------------------------------------
+const MECHMARINER_MAX_PLAYERS = Math.max(2, Math.min(64, Number(process.env.MECHMARINER_MAX_PLAYERS || 32) || 32));
+const MECHMARINER_PRESENCE_MIN_MS = 50;
+const mechmarinerClients = new Map();
+let mechmarinerJoinOrder = [];
+let mechmarinerAuthorityId = "";
+const mechmarinerSeenHits = new Map();
+const mechmarinerSeenChats = new Map();
+function mechmarinerClean(v, max=96) {
+  return String(v || "").replace(/[\r\n\t]/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
+}
+function mechmarinerSafeId(v) {
+  return mechmarinerClean(v, 80).replace(/[^A-Za-z0-9_.-]/g, "");
+}
+function mechmarinerSend(ws, packet) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  try { ws.send("mm:" + JSON.stringify(packet)); return true; } catch { return false; }
+}
+function mechmarinerBroadcast(packet, exclude=null) {
+  for (const client of mechmarinerClients.values()) {
+    if (!client || !client.ws || client.ws === exclude || client.ws.readyState !== WebSocket.OPEN) continue;
+    mechmarinerSend(client.ws, packet);
+  }
+}
+function mechmarinerChooseAuthority() {
+  mechmarinerJoinOrder = mechmarinerJoinOrder.filter(id => mechmarinerClients.has(id));
+  if (!mechmarinerAuthorityId || !mechmarinerClients.has(mechmarinerAuthorityId)) {
+    mechmarinerAuthorityId = mechmarinerJoinOrder[0] || "";
+  }
+  return mechmarinerAuthorityId;
+}
+function mechmarinerRosterPacket(t="roster") {
+  const players = [...mechmarinerClients.values()].map(c => ({id:c.id,name:c.name}));
+  return {
+    t,
+    game:"mechmariner",
+    authority_id:mechmarinerChooseAuthority(),
+    max_players:MECHMARINER_MAX_PLAYERS,
+    count:players.length,
+    players,
+    ts:Date.now()
+  };
+}
+function mechmarinerAnnounceAuthority() {
+  mechmarinerBroadcast(mechmarinerRosterPacket("authority"));
+}
+function mechmarinerSweepSeen(map, now=Date.now()) {
+  if (map.size <= 2048) return;
+  const cutoff = now - 30000;
+  for (const [k, at] of map.entries()) if (Number(at || 0) < cutoff) map.delete(k);
+}
+function mechmarinerDetach(ws, silent=false) {
+  const id = ws && ws._mechmarinerId;
+  if (!id) return;
+  const client = mechmarinerClients.get(id);
+  try { delete ws._mechmarinerId; } catch {}
+  // A reconnect may already have replaced this id with a new socket. Never let
+  // the old socket's close event evict or de-authorize the replacement.
+  if (!client || client.ws !== ws) return;
+  mechmarinerClients.delete(id);
+  mechmarinerJoinOrder = mechmarinerJoinOrder.filter(v => v !== id);
+  const oldAuthority = mechmarinerAuthorityId;
+  if (oldAuthority === id) mechmarinerAuthorityId = "";
+  mechmarinerChooseAuthority();
+  if (!silent) {
+    mechmarinerBroadcast({t:"leave",game:"mechmariner",id:client.id,name:client.name,authority_id:mechmarinerAuthorityId,ts:Date.now()});
+    mechmarinerAnnounceAuthority();
+  }
+}
+function mechmarinerJoin(ws, m) {
+  const id = mechmarinerSafeId(m.id);
+  if (!id) { mechmarinerSend(ws,{t:"error",game:"mechmariner",message:"Missing MECHMARINER peer id.",ts:Date.now()}); return; }
+  const existing = mechmarinerClients.get(id);
+  if (!existing && mechmarinerClients.size >= MECHMARINER_MAX_PLAYERS) {
+    mechmarinerSend(ws,{t:"error",game:"mechmariner",code:"room_full",message:`MECHMARINER relay full (${MECHMARINER_MAX_PLAYERS}).`,max_players:MECHMARINER_MAX_PLAYERS,ts:Date.now()});
+    try { ws.close(1008,"mechmariner room full"); } catch {}
+    return;
+  }
+  if (existing && existing.ws && existing.ws !== ws) {
+    try { existing.ws.close(1008,"duplicate mechmariner peer id"); } catch {}
+    mechmarinerClients.delete(id);
+  }
+  const name = mechmarinerClean(m.name || "MARINER", 64) || "MARINER";
+  const client = {id,name,ws,lastSeen:Date.now(),lastPresenceAt:0};
+  mechmarinerClients.set(id, client);
+  if (!mechmarinerJoinOrder.includes(id)) mechmarinerJoinOrder.push(id);
+  ws._mechmarinerId = id;
+  mechmarinerChooseAuthority();
+  mechmarinerSend(ws, {
+    ...mechmarinerRosterPacket("welcome"),
+    id,
+    name
+  });
+  mechmarinerBroadcast({t:"join",game:"mechmariner",id,name,authority_id:mechmarinerAuthorityId,ts:Date.now()}, ws);
+  mechmarinerAnnounceAuthority();
+}
+function mechmarinerHandle(ws, payload) {
+  let m=null; try { m=JSON.parse(String(payload || "")); } catch { return; }
+  if (!m || typeof m !== "object" || Array.isArray(m)) return;
+  const t=String(m.t || m.type || "").toLowerCase();
+  if (t === "join") { mechmarinerJoin(ws,m); return; }
+  const id=ws && ws._mechmarinerId;
+  const client=id ? mechmarinerClients.get(id) : null;
+  if (!client || client.ws !== ws) return;
+  client.lastSeen=Date.now();
+
+  if (t === "presence") {
+    const now=Date.now();
+    if (now-Number(client.lastPresenceAt || 0) < MECHMARINER_PRESENCE_MIN_MS) return;
+    client.lastPresenceAt=now;
+    const packet={
+      t:"presence",game:"mechmariner",id:client.id,name:client.name,
+      x:Number(m.x)||0,y:Number(m.y)||0,heading:Number(m.heading)||0,
+      moving:!!m.moving,firing:!!m.firing,
+      weapon:mechmarinerClean(m.weapon,8),shot_seq:Number(m.shot_seq)||0,
+      surface:mechmarinerClean(m.surface,12),ts:now
+    };
+    mechmarinerBroadcast(packet,ws);
+    return;
+  }
+
+  if (t === "chat") {
+    const text=mechmarinerClean(m.text,500);
+    if (!text) return;
+    const msgId=mechmarinerSafeId(m.msg_id || `${client.id}-${Date.now()}`);
+    const now=Date.now();
+    if (msgId && mechmarinerSeenChats.has(msgId)) return;
+    if (msgId) mechmarinerSeenChats.set(msgId,now);
+    mechmarinerSweepSeen(mechmarinerSeenChats,now);
+    mechmarinerBroadcast({t:"chat",game:"mechmariner",id:client.id,name:client.name,text,msg_id:msgId,ts:now},ws);
+    return;
+  }
+
+  if (t === "enemies") {
+    mechmarinerChooseAuthority();
+    if (client.id !== mechmarinerAuthorityId) return;
+    const incoming=Array.isArray(m.items) ? m.items.slice(0,512) : [];
+    const items=[];
+    for (const row of incoming) {
+      if (!Array.isArray(row) || row.length < 6) continue;
+      const uid=mechmarinerSafeId(row[0]);
+      if (!uid) continue;
+      items.push([
+        uid,
+        Number(row[1])||0,
+        Number(row[2])||0,
+        Math.max(0,Math.trunc(Number(row[3])||0)),
+        Math.max(1,Math.trunc(Number(row[4])||1)),
+        Math.trunc(Number(row[5])||0)
+      ]);
+    }
+    mechmarinerBroadcast({t:"enemies",game:"mechmariner",id:client.id,name:client.name,authority_id:client.id,items,ts:Date.now()},ws);
+    return;
+  }
+
+  if (t === "enemy_hit") {
+    mechmarinerChooseAuthority();
+    if (!mechmarinerAuthorityId || client.id === mechmarinerAuthorityId) return;
+    const authority=mechmarinerClients.get(mechmarinerAuthorityId);
+    if (!authority || !authority.ws || authority.ws.readyState !== WebSocket.OPEN) return;
+    const uid=mechmarinerSafeId(m.uid);
+    const damage=Math.max(0,Math.min(1000,Math.trunc(Number(m.damage)||0)));
+    const hitId=mechmarinerSafeId(m.hit_id || `${client.id}-${Date.now()}`);
+    if (!uid || damage <= 0) return;
+    const now=Date.now();
+    if (hitId && mechmarinerSeenHits.has(hitId)) return;
+    if (hitId) mechmarinerSeenHits.set(hitId,now);
+    mechmarinerSweepSeen(mechmarinerSeenHits,now);
+    mechmarinerSend(authority.ws,{t:"enemy_hit",game:"mechmariner",id:client.id,name:client.name,uid,damage,hit_id:hitId,ts:now});
+    return;
+  }
+
+  if (t === "request_roster") { mechmarinerSend(ws,mechmarinerRosterPacket("roster")); return; }
+  if (t === "ping") { mechmarinerSend(ws,{t:"pong",game:"mechmariner",authority_id:mechmarinerAuthorityId,ts:Date.now()}); return; }
+}
+
 // ----------------------------------
 // Shared WebSocket connection router
 // ----------------------------------
@@ -2425,6 +2604,7 @@ function detachAllProtocols(ws) {
   try { growthDetach(ws); } catch {}
   try { illithidDetach(ws); } catch {}
   try { luxboundDetach(ws); } catch {}
+  try { mechmarinerDetach(ws); } catch {}
 }
 function routeSocketMessage(ws, data) {
   let raw = "";
@@ -2439,6 +2619,7 @@ function routeSocketMessage(ws, data) {
   if (raw.startsWith("gf:")) { growthHandle(ws, raw.slice(3)); return; }
   if (raw.startsWith("it:")) { illithidHandle(ws, raw.slice(3)); return; }
   if (raw.startsWith("lb:")) { luxboundHandle(ws, raw.slice(3)); return; }
+  if (raw.startsWith("mm:")) { mechmarinerHandle(ws, raw.slice(3)); return; }
   // Legacy/no-prefix fallback.
   let m = null;
   try { m = JSON.parse(raw); } catch { m = null; }
@@ -2449,13 +2630,14 @@ function routeSocketMessage(ws, data) {
     if (game === "growth" || game === "gf") { growthHandle(ws, raw); return; }
     if (game === "illithid_throne" || game === "illithid" || game === "it") { illithidHandle(ws, raw); return; }
     if (game === "luxbound" || game === "lyralan" || game === "lb") { luxboundHandle(ws, raw); return; }
+    if (game === "mechmariner" || game === "mm") { mechmarinerHandle(ws, raw); return; }
     const t = String(m.t || m.type || "").toLowerCase();
     if (t === "presence" || t === "peer" || t === "visit" || t === "visit_position" || t === "rail_chat" || t === "visitor_chat" || t === "leave" || t === "request_peers" || t === "sync") {
       umbralHandle(ws, raw, false);
       return;
     }
   }
-  try { ws.send(JSON.stringify({ type: "error", code: "unsupported_protocol", message: "Use Almighty Python, House Nocturne, GROWTH, Illithid Throne, or LUXBOUND protocol routing." })); } catch {}
+  try { ws.send(JSON.stringify({ type: "error", code: "unsupported_protocol", message: "Use Almighty Python, House Nocturne, GROWTH, Illithid Throne, LUXBOUND, or MECHMARINER protocol routing." })); } catch {}
 }
 wss.on("connection", (ws, req) => {
   ws.isAlive = true;
@@ -2473,6 +2655,6 @@ wss.on("connection", (ws, req) => {
 });
 // --------------------------------------------------------------
 server.listen(PORT, HOST, () => {
-  console.log("Dedset relay (Almighty Python / GROWTH / House Nocturne / Illithid Throne / LUXBOUND) on", HOST + ":" + PORT);
+  console.log("Dedset relay (Almighty Python / GROWTH / House Nocturne / Illithid Throne / LUXBOUND / MECHMARINER) on", HOST + ":" + PORT);
   if (MEGA_CLAIM_REQUIRE_AUTH && !MEGA_CLAIM_SECRET) console.warn("MEGA claim endpoint is locked until MEGA_CLAIM_SECRET is configured.");
 });
