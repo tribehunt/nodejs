@@ -1,5 +1,5 @@
 // server.js - supports Almighty Python, GROWTH, House Nocturne
-// LUXBOUND, Mechmariner and Illithid Throne. One process, one port, isolated rooms by game.
+// LUXBOUND and Illithid Throne. One process, one port, isolated rooms by game.
 // https://raw.githubusercontent.com/tribehunt/nodejs/refs/heads/main/server.js
 // all games produced and engineered by © Dedset Media 08/04/2026
 const http = require("http");
@@ -2426,6 +2426,7 @@ const mechmarinerClients = new Map();
 let mechmarinerJoinOrder = [];
 let mechmarinerAuthorityId = "";
 const mechmarinerSeenHits = new Map();
+const mechmarinerSeenBlasts = new Map();
 const mechmarinerSeenChats = new Map();
 function mechmarinerClean(v, max=96) {
   return String(v || "").replace(/[\r\n\t]/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
@@ -2588,6 +2589,25 @@ function mechmarinerHandle(ws, payload) {
     if (hitId) mechmarinerSeenHits.set(hitId,now);
     mechmarinerSweepSeen(mechmarinerSeenHits,now);
     mechmarinerSend(authority.ws,{t:"enemy_hit",game:"mechmariner",id:client.id,name:client.name,uid,damage,hit_id:hitId,ts:now});
+    return;
+  }
+
+  if (t === "enemy_blast") {
+    mechmarinerChooseAuthority();
+    if (!mechmarinerAuthorityId || client.id === mechmarinerAuthorityId) return;
+    const authority=mechmarinerClients.get(mechmarinerAuthorityId);
+    if (!authority || !authority.ws || authority.ws.readyState !== WebSocket.OPEN) return;
+    const x=Number(m.x)||0;
+    const y=Number(m.y)||0;
+    const radius=Math.max(0,Math.min(30,Number(m.radius)||0));
+    const force=Math.max(0,Math.min(30,Number(m.force)||0));
+    const blastId=mechmarinerSafeId(m.blast_id || `${client.id}-${Date.now()}`);
+    if (radius <= 0 || force <= 0) return;
+    const now=Date.now();
+    if (blastId && mechmarinerSeenBlasts.has(blastId)) return;
+    if (blastId) mechmarinerSeenBlasts.set(blastId,now);
+    mechmarinerSweepSeen(mechmarinerSeenBlasts,now);
+    mechmarinerSend(authority.ws,{t:"enemy_blast",game:"mechmariner",id:client.id,name:client.name,x,y,radius,force,blast_id:blastId,ts:now});
     return;
   }
 
