@@ -2618,6 +2618,204 @@ function mechmarinerHandle(ws, payload) {
 // ----------------------------------
 // Shared WebSocket connection router
 // ----------------------------------
+
+// ----------------------------------------
+// A STRANGE PLACE persistent REALM protocol
+// Protocol prefix: asp:
+// Shared by design: player presence/stats, quest/collision objects, enemy state.
+// Incidental local scenery/weather is intentionally NOT relayed.
+// ----------------------------------------
+const ASTRANGEPLACE_MAX_PLAYERS = Math.max(2, Math.min(64, Number(process.env.ASTRANGEPLACE_MAX_PLAYERS || 32) || 32));
+const ASTRANGEPLACE_PRESENCE_MIN_MS = 20;
+const strangePlaceClients = new Map();
+let strangePlaceJoinOrder = [];
+let strangePlaceAuthorityId = "";
+const strangePlaceStateFile = String(process.env.ASTRANGEPLACE_STATE_FILE || path.join(process.cwd(), "a_strange_place_state.json"));
+let strangePlaceWorld = { version: 1, objects: {}, enemies: {}, updated_at: Date.now() };
+let strangePlaceSaveTimer = null;
+function strangePlaceClean(v, max=96) {
+  return String(v == null ? "" : v).replace(/[\r\n\t]/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
+}
+function strangePlaceSafeId(v) {
+  return strangePlaceClean(v, 96).replace(/[^A-Za-z0-9_.-]/g, "");
+}
+function strangePlaceFinite(v, fallback=0, limit=1000000) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return Number(fallback) || 0;
+  return Math.max(-limit, Math.min(limit, n));
+}
+function strangePlaceAttackMods(v) {
+  const src = v && typeof v === "object" && !Array.isArray(v) ? v : {};
+  const out = {};
+  for (const [rawId, rawBonus] of Object.entries(src)) {
+    const id = strangePlaceSafeId(rawId);
+    if (!id || Object.keys(out).length >= 64) continue;
+    out[id] = Math.max(0, Math.min(99, Math.round(strangePlaceFinite(rawBonus,0,99))));
+  }
+  return out;
+}
+function strangePlaceSend(ws, packet) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  try { ws.send("asp:" + JSON.stringify(packet)); return true; } catch { return false; }
+}
+function strangePlaceBroadcast(packet, exclude=null) {
+  for (const c of strangePlaceClients.values()) {
+    if (!c || !c.ws || c.ws === exclude || c.ws.readyState !== WebSocket.OPEN) continue;
+    strangePlaceSend(c.ws, packet);
+  }
+}
+function strangePlaceChooseAuthority() {
+  strangePlaceJoinOrder = strangePlaceJoinOrder.filter(id => strangePlaceClients.has(id));
+  if (!strangePlaceAuthorityId || !strangePlaceClients.has(strangePlaceAuthorityId)) {
+    strangePlaceAuthorityId = strangePlaceJoinOrder[0] || "";
+    strangePlaceBroadcast({t:"authority",game:"a_strange_place",id:strangePlaceAuthorityId});
+  }
+  return strangePlaceAuthorityId;
+}
+function strangePlacePlayerPacket(c) {
+  if (!c) return null;
+  return { id:c.id, name:c.name || "Nobody", role:c.role || "Janus", x:c.x || 0, y:c.y || 0,
+    level:c.level || 1, xp:c.xp || 0, hp:c.hp || 0, max_hp:c.max_hp || 0, ac:c.ac || 10,
+    stats:c.stats || {}, broom_head:c.broom_head || "", staff_state:c.staff_state || "", ts:c.lastPresence || Date.now() };
+}
+function strangePlaceRoster() {
+  return [...strangePlaceClients.values()].map(strangePlacePlayerPacket).filter(Boolean);
+}
+function strangePlaceLoadWorld() {
+  try {
+    if (!fs.existsSync(strangePlaceStateFile)) return;
+    const parsed = JSON.parse(fs.readFileSync(strangePlaceStateFile, "utf8"));
+    if (!parsed || typeof parsed !== "object") return;
+    strangePlaceWorld = {
+      version: Math.max(1, Number(parsed.version || 1) || 1),
+      objects: parsed.objects && typeof parsed.objects === "object" ? parsed.objects : {},
+      enemies: parsed.enemies && typeof parsed.enemies === "object" ? parsed.enemies : {},
+      updated_at: Number(parsed.updated_at || Date.now()) || Date.now()
+    };
+  } catch (err) { console.warn("A STRANGE PLACE state load failed:", err && err.message ? err.message : err); }
+}
+function strangePlaceSaveWorldSoon() {
+  strangePlaceWorld.updated_at = Date.now();
+  if (strangePlaceSaveTimer) return;
+  strangePlaceSaveTimer = setTimeout(() => {
+    strangePlaceSaveTimer = null;
+    try {
+      const dir = path.dirname(strangePlaceStateFile);
+      try { fs.mkdirSync(dir, {recursive:true}); } catch {}
+      const tmp = strangePlaceStateFile + ".tmp";
+      fs.writeFileSync(tmp, JSON.stringify(strangePlaceWorld));
+      fs.renameSync(tmp, strangePlaceStateFile);
+    } catch (err) { console.warn("A STRANGE PLACE state save failed:", err && err.message ? err.message : err); }
+  }, 300);
+  try { if (strangePlaceSaveTimer && typeof strangePlaceSaveTimer.unref === "function") strangePlaceSaveTimer.unref(); } catch {}
+}
+strangePlaceLoadWorld();
+function strangePlaceDetach(ws, broadcast=true) {
+  const id = ws && ws._strangePlaceId ? String(ws._strangePlaceId) : "";
+  if (!id) return;
+  const c = strangePlaceClients.get(id);
+  if (c && c.ws === ws) strangePlaceClients.delete(id);
+  try { delete ws._strangePlaceId; } catch {}
+  strangePlaceJoinOrder = strangePlaceJoinOrder.filter(x => x !== id);
+  if (broadcast) strangePlaceBroadcast({t:"leave",game:"a_strange_place",id,ts:Date.now()});
+  if (strangePlaceAuthorityId === id) strangePlaceAuthorityId = "";
+  strangePlaceChooseAuthority();
+}
+function strangePlaceSanitizeStats(stats) {
+  const src = stats && typeof stats === "object" ? stats : {};
+  const out = {};
+  for (const k of ["str","dex","con","int","wis","cha"]) out[k] = Math.max(1, Math.min(30, Math.round(strangePlaceFinite(src[k],10,30))));
+  return out;
+}
+function strangePlaceApplyPresence(c, m) {
+  c.name = strangePlaceClean(m.name || c.name || "Nobody", 32) || "Nobody";
+  c.role = strangePlaceClean(m.role || c.role || "Janus", 32) || "Janus";
+  c.x = strangePlaceFinite(m.x, c.x || 0, 512); c.y = strangePlaceFinite(m.y, c.y || 0, 512);
+  c.level = Math.max(1, Math.min(99, Math.round(strangePlaceFinite(m.level,c.level || 1,99))));
+  c.xp = Math.max(0, Math.round(strangePlaceFinite(m.xp,c.xp || 0,1000000000)));
+  c.hp = Math.round(strangePlaceFinite(m.hp,c.hp || 0,1000000));
+  c.max_hp = Math.max(1, Math.round(strangePlaceFinite(m.max_hp,c.max_hp || 1,1000000)));
+  c.ac = Math.max(1, Math.min(99, Math.round(strangePlaceFinite(m.ac,c.ac || 10,99))));
+  c.stats = strangePlaceSanitizeStats(m.stats || c.stats);
+  c.broom_head = strangePlaceClean(m.broom_head || c.broom_head,48);
+  c.staff_state = strangePlaceClean(m.staff_state || c.staff_state,48);
+  c.lastPresence = Date.now();
+}
+function strangePlaceHandle(ws, payload) {
+  let m = null;
+  try { m = typeof payload === "string" ? JSON.parse(payload) : JSON.parse(String(payload || "")); } catch { return; }
+  if (!m || typeof m !== "object") return;
+  const t = String(m.t || m.type || "").toLowerCase();
+  if (t === "hello" || t === "join") {
+    let id = strangePlaceSafeId(m.id);
+    if (!id) id = "ASP-" + rid();
+    const existing = strangePlaceClients.get(id);
+    if (existing && existing.ws && existing.ws !== ws) { try { existing.ws.close(); } catch {} strangePlaceClients.delete(id); }
+    if (!existing && strangePlaceClients.size >= ASTRANGEPLACE_MAX_PLAYERS) { strangePlaceSend(ws,{t:"error",code:"realm_full",message:"The REALM is full."}); return; }
+    strangePlaceDetach(ws, false);
+    const c = {id, ws, name:"Nobody", role:"Janus", x:36, y:256, level:1, xp:0, hp:10, max_hp:10, ac:12, stats:{}, lastPresence:Date.now()};
+    strangePlaceApplyPresence(c,m);
+    strangePlaceClients.set(id,c); ws._strangePlaceId=id; strangePlaceJoinOrder.push(id); strangePlaceChooseAuthority();
+    strangePlaceSend(ws,{t:"welcome",game:"a_strange_place",id,authority_id:strangePlaceAuthorityId,players:strangePlaceRoster(),world:strangePlaceWorld,ts:Date.now()});
+    strangePlaceBroadcast({t:"peer",game:"a_strange_place",...strangePlacePlayerPacket(c)},ws);
+    return;
+  }
+  const id = ws && ws._strangePlaceId ? String(ws._strangePlaceId) : strangePlaceSafeId(m.id);
+  const c = id ? strangePlaceClients.get(id) : null;
+  if (!c || c.ws !== ws) { strangePlaceSend(ws,{t:"error",code:"not_joined",message:"Send asp: hello first."}); return; }
+  if (t === "presence") {
+    const now=Date.now(); if (now-(c.lastPresence || 0) < ASTRANGEPLACE_PRESENCE_MIN_MS) return;
+    strangePlaceApplyPresence(c,m); strangePlaceBroadcast({t:"presence",game:"a_strange_place",...strangePlacePlayerPacket(c)},ws); return;
+  }
+  if (t === "request_world" || t === "sync") { strangePlaceSend(ws,{t:"world_snapshot",game:"a_strange_place",world:strangePlaceWorld,players:strangePlaceRoster(),authority_id:strangePlaceAuthorityId,ts:Date.now()}); return; }
+  if (t === "object_state") {
+    const oid=strangePlaceSafeId(m.id); const state=strangePlaceClean(m.state,64); if (!oid || !state) return;
+    if (Object.keys(strangePlaceWorld.objects).length >= 2048 && !(oid in strangePlaceWorld.objects)) return;
+    strangePlaceWorld.objects[oid]=state; strangePlaceSaveWorldSoon(); strangePlaceBroadcast({t:"object_state",game:"a_strange_place",id:oid,state,by:c.id,ts:Date.now()}); return;
+  }
+  if (t === "enemy_state") {
+    const eid=strangePlaceSafeId(m.id); const st=m.state && typeof m.state === "object" ? m.state : m; if (!eid) return;
+    if (Object.keys(strangePlaceWorld.enemies).length >= 4096 && !(eid in strangePlaceWorld.enemies)) return;
+    const prev = strangePlaceWorld.enemies[eid] && typeof strangePlaceWorld.enemies[eid] === "object" ? strangePlaceWorld.enemies[eid] : {};
+    const clean = {
+      species:strangePlaceClean(st.species || prev.species,32),x:strangePlaceFinite(st.x,prev.x || 0,512),y:strangePlaceFinite(st.y,prev.y || 0,512),
+      hp:Math.round(strangePlaceFinite(st.hp,prev.hp || 0,1000000)),alive:!!st.alive,
+      role:strangePlaceClean(st.role || prev.role,48),sprite_path:strangePlaceClean(st.sprite_path || prev.sprite_path,240),
+      attack_sprite_path:strangePlaceClean(st.attack_sprite_path || prev.attack_sprite_path,240),display_name:strangePlaceClean(st.display_name || prev.display_name,96),
+      damage:Math.max(0,Math.round(strangePlaceFinite(st.damage,prev.damage || 0,1000000))),scale:Math.max(0.01,Math.min(8,strangePlaceFinite(st.scale,prev.scale || 1,8))),
+      non_hostile:(st.non_hostile === undefined ? !!prev.non_hostile : !!st.non_hostile),invulnerable:(st.invulnerable === undefined ? !!prev.invulnerable : !!st.invulnerable),group:strangePlaceClean(st.group || prev.group,64),master_id:strangePlaceSafeId(st.master_id || prev.master_id)
+    };
+    clean.anchor_x=strangePlaceFinite(st.anchor_x,prev.anchor_x === undefined ? clean.x : prev.anchor_x,512);
+    clean.anchor_y=strangePlaceFinite(st.anchor_y,prev.anchor_y === undefined ? clean.y : prev.anchor_y,512);
+    clean.max_hp=Math.max(1,Math.round(strangePlaceFinite(st.max_hp,prev.max_hp || Math.max(1,clean.hp),1000000)));
+    clean.ac=Math.max(1,Math.min(99,Math.round(strangePlaceFinite(st.ac,prev.ac || 10,99))));
+    clean.level=Math.max(1,Math.min(99,Math.round(strangePlaceFinite(st.level,prev.level || 1,99))));
+    clean.xp=Math.max(0,Math.round(strangePlaceFinite(st.xp,prev.xp || 0,1000000000)));
+    clean.sex=/^[FM]$/.test(String(st.sex === undefined ? prev.sex || "" : st.sex).toUpperCase()) ? String(st.sex === undefined ? prev.sex || "" : st.sex).toUpperCase() : "";
+    clean.born_at=strangePlaceFinite(st.born_at,prev.born_at || 0,10000000000000);
+    clean.generation=Math.max(0,Math.min(9999,Math.round(strangePlaceFinite(st.generation,prev.generation || 0,9999))));
+    clean.dynamic_spawn=(st.dynamic_spawn === undefined ? !!prev.dynamic_spawn : !!st.dynamic_spawn);
+    clean.ecology_state=strangePlaceClean(st.ecology_state === undefined ? prev.ecology_state : st.ecology_state,32);
+    clean.mate_id=strangePlaceSafeId(st.mate_id === undefined ? prev.mate_id : st.mate_id);
+    clean.breed_ready_at=strangePlaceFinite(st.breed_ready_at,prev.breed_ready_at || 0,10000000000000);
+    clean.gestation_until=strangePlaceFinite(st.gestation_until,prev.gestation_until || 0,10000000000000);
+    clean.nursery_x=strangePlaceFinite(st.nursery_x,prev.nursery_x || 0,512);
+    clean.nursery_y=strangePlaceFinite(st.nursery_y,prev.nursery_y || 0,512);
+    clean.respawn_at=strangePlaceFinite(st.respawn_at,prev.respawn_at || 0,10000000000000);
+    const mergedMods = Object.assign({}, strangePlaceAttackMods(prev.absorbed_attack_mods), strangePlaceAttackMods(st.absorbed_attack_mods));
+    if (Object.keys(mergedMods).length) {
+      clean.absorbed_attack_mods = mergedMods;
+      if (clean.species === "harpy_king" || clean.role === "harpy_king") clean.damage = 15 + Object.values(mergedMods).reduce((a,b)=>a+b,0);
+    }
+    strangePlaceWorld.enemies[eid]=clean; strangePlaceSaveWorldSoon(); strangePlaceBroadcast({t:"enemy_state",game:"a_strange_place",id:eid,state:clean,by:c.id,ts:Date.now()}); return;
+  }
+  if (t === "chat") {
+    const text=strangePlaceClean(m.text,420); if (!text) return;
+    strangePlaceBroadcast({t:"chat",game:"a_strange_place",id:c.id,name:c.name,text,ts:Date.now()}); return;
+  }
+  if (t === "ping") { strangePlaceSend(ws,{t:"pong",game:"a_strange_place",ts:Date.now()}); return; }
+}
+
 function detachAllProtocols(ws) {
   try { almightyPythonDetach(ws, true); } catch {}
   try { umbralDetach(ws, true); } catch {}
@@ -2625,6 +2823,7 @@ function detachAllProtocols(ws) {
   try { illithidDetach(ws); } catch {}
   try { luxboundDetach(ws); } catch {}
   try { mechmarinerDetach(ws); } catch {}
+  try { strangePlaceDetach(ws, true); } catch {}
 }
 function routeSocketMessage(ws, data) {
   let raw = "";
@@ -2640,6 +2839,7 @@ function routeSocketMessage(ws, data) {
   if (raw.startsWith("it:")) { illithidHandle(ws, raw.slice(3)); return; }
   if (raw.startsWith("lb:")) { luxboundHandle(ws, raw.slice(3)); return; }
   if (raw.startsWith("mm:")) { mechmarinerHandle(ws, raw.slice(3)); return; }
+  if (raw.startsWith("asp:")) { strangePlaceHandle(ws, raw.slice(4)); return; }
   // Legacy/no-prefix fallback.
   let m = null;
   try { m = JSON.parse(raw); } catch { m = null; }
@@ -2651,13 +2851,14 @@ function routeSocketMessage(ws, data) {
     if (game === "illithid_throne" || game === "illithid" || game === "it") { illithidHandle(ws, raw); return; }
     if (game === "luxbound" || game === "lyralan" || game === "lb") { luxboundHandle(ws, raw); return; }
     if (game === "mechmariner" || game === "mm") { mechmarinerHandle(ws, raw); return; }
+    if (game === "a_strange_place" || game === "strange_place" || game === "asp") { strangePlaceHandle(ws, raw); return; }
     const t = String(m.t || m.type || "").toLowerCase();
     if (t === "presence" || t === "peer" || t === "visit" || t === "visit_position" || t === "rail_chat" || t === "visitor_chat" || t === "leave" || t === "request_peers" || t === "sync") {
       umbralHandle(ws, raw, false);
       return;
     }
   }
-  try { ws.send(JSON.stringify({ type: "error", code: "unsupported_protocol", message: "Use Almighty Python, House Nocturne, GROWTH, Illithid Throne, LUXBOUND, or MECHMARINER protocol routing." })); } catch {}
+  try { ws.send(JSON.stringify({ type: "error", code: "unsupported_protocol", message: "Use Almighty Python, House Nocturne, GROWTH, Illithid Throne, LUXBOUND, MECHMARINER, or A STRANGE PLACE protocol routing." })); } catch {}
 }
 wss.on("connection", (ws, req) => {
   ws.isAlive = true;
@@ -2675,6 +2876,6 @@ wss.on("connection", (ws, req) => {
 });
 // --------------------------------------------------------------
 server.listen(PORT, HOST, () => {
-  console.log("Dedset relay (Almighty Python / GROWTH / House Nocturne / Illithid Throne / LUXBOUND / MECHMARINER) on", HOST + ":" + PORT);
+  console.log("Dedset relay (Almighty Python / GROWTH / House Nocturne / Illithid Throne / LUXBOUND / MECHMARINER / A STRANGE PLACE) on", HOST + ":" + PORT);
   if (MEGA_CLAIM_REQUIRE_AUTH && !MEGA_CLAIM_SECRET) console.warn("MEGA claim endpoint is locked until MEGA_CLAIM_SECRET is configured.");
 });
