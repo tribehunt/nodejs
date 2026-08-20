@@ -2811,7 +2811,10 @@ function strangePlaceHandle(ws, payload) {
   }
   if (t === "chat") {
     const text=strangePlaceClean(m.text,420); if (!text) return;
-    strangePlaceBroadcast({t:"chat",game:"a_strange_place",id:c.id,name:c.name,text,ts:Date.now()}); return;
+    const allowedIcons=new Set(["player","minion","sidhetree","ashberry","broom_trainer"]);
+    const requestedIcon=strangePlaceClean(m.icon,32);
+    const icon=allowedIcons.has(requestedIcon) ? requestedIcon : "player";
+    strangePlaceBroadcast({t:"chat",game:"a_strange_place",id:c.id,name:c.name,text,icon,ts:Date.now()}); return;
   }
   if (t === "ping") { strangePlaceSend(ws,{t:"pong",game:"a_strange_place",ts:Date.now()}); return; }
 }
