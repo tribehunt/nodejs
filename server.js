@@ -1,5 +1,6 @@
 // server.js - supports Almighty Python, GROWTH, House Nocturne
-// LUXBOUND, Mechmariner and Illithid Throne. One process, one port, isolated rooms by game.
+// LUXBOUND, Mechmariner, Illithid Throne, and _ASTRANGEPLACE_
+// One process, one port, isolated rooms by game.
 // https://raw.githubusercontent.com/tribehunt/nodejs/refs/heads/main/server.js
 // all games produced and engineered by © Dedset Media 08/04/2026
 const http = require("http");
