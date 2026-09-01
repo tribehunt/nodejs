@@ -1,8 +1,7 @@
-// server.js - supports Almighty Python, GROWTH, House Nocturne
-// LUXBOUND, Mechmariner, Illithid Throne, and _ASTRANGEPLACE_
-// One process, one port, isolated rooms by game.
+// server.js - supports Almighty Python, GROWTH, House Nocturne, Illithid Throne,
+// LUXBOUND, MECHMARINER and A STRANGE PLACE. One process, one port, isolated rooms by game.
 // https://raw.githubusercontent.com/tribehunt/nodejs/refs/heads/main/server.js
-// all games produced and engineered by © Dedset Media 08/04/2026
+// all games produced and engineered by © Dedset Media 08/31/2026
 const http = require("http");
 const https = require("https");
 const zlib = require("zlib");
@@ -2421,7 +2420,8 @@ function luxboundHandle(ws, payload) {
 // MECHMARINER shared expedition protocol
 // Protocol prefix: mm:
 // ----------------------------------------
-const MECHMARINER_MAX_PLAYERS = Math.max(2, Math.min(64, Number(process.env.MECHMARINER_MAX_PLAYERS || 32) || 32));
+const MECHMARINER_PROTOCOL_VERSION = 3;
+const MECHMARINER_MAX_PLAYERS = Math.max(2, Math.min(32, Number(process.env.MECHMARINER_MAX_PLAYERS || 32) || 32));
 const MECHMARINER_PRESENCE_MIN_MS = 50;
 const mechmarinerClients = new Map();
 let mechmarinerJoinOrder = [];
@@ -2429,11 +2429,30 @@ let mechmarinerAuthorityId = "";
 const mechmarinerSeenHits = new Map();
 const mechmarinerSeenBlasts = new Map();
 const mechmarinerSeenChats = new Map();
+const mechmarinerSeenKillCredits = new Map();
 function mechmarinerClean(v, max=96) {
   return String(v || "").replace(/[\r\n\t]/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
 }
 function mechmarinerSafeId(v) {
   return mechmarinerClean(v, 80).replace(/[^A-Za-z0-9_.-]/g, "");
+}
+function mechmarinerFinite(v, fallback=0, limit=1000000) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return Number(fallback) || 0;
+  return Math.max(-limit, Math.min(limit, n));
+}
+function mechmarinerAllocatePlayerNum(existing=0) {
+  const prior = Math.trunc(Number(existing) || 0);
+  if (prior >= 1 && prior <= MECHMARINER_MAX_PLAYERS) {
+    let occupied = false;
+    for (const c of mechmarinerClients.values()) {
+      if (c && Number(c.playerNum || 0) === prior) { occupied = true; break; }
+    }
+    if (!occupied) return prior;
+  }
+  const used = new Set([...mechmarinerClients.values()].map(c => Math.trunc(Number(c && c.playerNum) || 0)));
+  for (let n=1; n<=MECHMARINER_MAX_PLAYERS; n++) if (!used.has(n)) return n;
+  return 0;
 }
 function mechmarinerSend(ws, packet) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false;
@@ -2453,10 +2472,11 @@ function mechmarinerChooseAuthority() {
   return mechmarinerAuthorityId;
 }
 function mechmarinerRosterPacket(t="roster") {
-  const players = [...mechmarinerClients.values()].map(c => ({id:c.id,name:c.name}));
+  const players = [...mechmarinerClients.values()].map(c => ({id:c.id,name:c.name,player_num:Number(c.playerNum)||0}));
   return {
     t,
     game:"mechmariner",
+    protocol_version:MECHMARINER_PROTOCOL_VERSION,
     authority_id:mechmarinerChooseAuthority(),
     max_players:MECHMARINER_MAX_PLAYERS,
     count:players.length,
@@ -2504,7 +2524,8 @@ function mechmarinerJoin(ws, m) {
     mechmarinerClients.delete(id);
   }
   const name = mechmarinerClean(m.name || "MARINER", 64) || "MARINER";
-  const client = {id,name,ws,lastSeen:Date.now(),lastPresenceAt:0};
+  const playerNum = mechmarinerAllocatePlayerNum(existing && existing.playerNum);
+  const client = {id,name,ws,playerNum,lastSeen:Date.now(),lastPresenceAt:0};
   mechmarinerClients.set(id, client);
   if (!mechmarinerJoinOrder.includes(id)) mechmarinerJoinOrder.push(id);
   ws._mechmarinerId = id;
@@ -2512,7 +2533,8 @@ function mechmarinerJoin(ws, m) {
   mechmarinerSend(ws, {
     ...mechmarinerRosterPacket("welcome"),
     id,
-    name
+    name,
+    player_num:playerNum
   });
   mechmarinerBroadcast({t:"join",game:"mechmariner",id,name,authority_id:mechmarinerAuthorityId,ts:Date.now()}, ws);
   mechmarinerAnnounceAuthority();
@@ -2533,10 +2555,13 @@ function mechmarinerHandle(ws, payload) {
     client.lastPresenceAt=now;
     const packet={
       t:"presence",game:"mechmariner",id:client.id,name:client.name,
-      x:Number(m.x)||0,y:Number(m.y)||0,heading:Number(m.heading)||0,
+      x:mechmarinerFinite(m.x),y:mechmarinerFinite(m.y),heading:mechmarinerFinite(m.heading,0,100000),
       moving:!!m.moving,firing:!!m.firing,
-      weapon:mechmarinerClean(m.weapon,8),shot_seq:Number(m.shot_seq)||0,
-      surface:mechmarinerClean(m.surface,12),ts:now
+      weapon:mechmarinerClean(m.weapon,8),shot_seq:Math.max(0,Math.trunc(mechmarinerFinite(m.shot_seq,0,2147483647))),
+      surface:mechmarinerClean(m.surface,12),scene:mechmarinerClean(m.scene,20),
+      node:Math.max(-1,Math.min(100000,Math.trunc(mechmarinerFinite(m.node,-1,100000)))),
+      floor_z:mechmarinerFinite(m.floor_z,0,100000),
+      player_num:Number(client.playerNum)||0,ts:now
     };
     mechmarinerBroadcast(packet,ws);
     return;
@@ -2565,11 +2590,17 @@ function mechmarinerHandle(ws, payload) {
       if (!uid) continue;
       items.push([
         uid,
-        Number(row[1])||0,
-        Number(row[2])||0,
-        Math.max(0,Math.trunc(Number(row[3])||0)),
-        Math.max(1,Math.trunc(Number(row[4])||1)),
-        Math.trunc(Number(row[5])||0)
+        mechmarinerFinite(row[1]),
+        mechmarinerFinite(row[2]),
+        Math.max(0,Math.min(1000000,Math.trunc(mechmarinerFinite(row[3],0,1000000)))),
+        Math.max(1,Math.min(1000000,Math.trunc(mechmarinerFinite(row[4],1,1000000)))),
+        Math.max(-1000,Math.min(1000,Math.trunc(mechmarinerFinite(row[5],0,1000)))),
+        mechmarinerClean(row[6] == null ? "continuance" : row[6],32) || "continuance",
+        mechmarinerClean(row[7] == null ? "idle" : row[7],24) || "idle",
+        Math.max(0,Math.min(255,Math.trunc(mechmarinerFinite(row[8],0,255)))),
+        mechmarinerFinite(row[9],0,100000),
+        !!row[10],
+        mechmarinerFinite(row[11],0,100000)
       ]);
     }
     mechmarinerBroadcast({t:"enemies",game:"mechmariner",id:client.id,name:client.name,authority_id:client.id,items,ts:Date.now()},ws);
@@ -2612,8 +2643,30 @@ function mechmarinerHandle(ws, payload) {
     return;
   }
 
+  if (t === "enemy_kill_credit") {
+    mechmarinerChooseAuthority();
+    if (!mechmarinerAuthorityId || client.id !== mechmarinerAuthorityId) return;
+    const targetId=mechmarinerSafeId(m.target_id);
+    const target=targetId ? mechmarinerClients.get(targetId) : null;
+    const uid=mechmarinerSafeId(m.uid);
+    const creditId=mechmarinerSafeId(m.credit_id || `${targetId}-${uid}-${Date.now()}`);
+    if (!target || !target.ws || target.ws.readyState !== WebSocket.OPEN || targetId === client.id || !uid || !creditId) return;
+    const now=Date.now();
+    if (mechmarinerSeenKillCredits.has(creditId)) return;
+    mechmarinerSeenKillCredits.set(creditId,now);
+    mechmarinerSweepSeen(mechmarinerSeenKillCredits,now);
+    mechmarinerSend(target.ws,{
+      t:"enemy_kill_credit",game:"mechmariner",id:client.id,name:client.name,target_id:targetId,uid,
+      x:mechmarinerFinite(m.x),y:mechmarinerFinite(m.y),
+      max_hp:Math.max(1,Math.min(1000000,Math.trunc(mechmarinerFinite(m.max_hp,1,1000000)))),
+      underwater:!!m.underwater,kind:mechmarinerClean(m.kind || "continuance",32) || "continuance",
+      credit_id:creditId,ts:now
+    });
+    return;
+  }
+
   if (t === "request_roster") { mechmarinerSend(ws,mechmarinerRosterPacket("roster")); return; }
-  if (t === "ping") { mechmarinerSend(ws,{t:"pong",game:"mechmariner",authority_id:mechmarinerAuthorityId,ts:Date.now()}); return; }
+  if (t === "ping") { mechmarinerSend(ws,{t:"pong",game:"mechmariner",protocol_version:MECHMARINER_PROTOCOL_VERSION,authority_id:mechmarinerAuthorityId,ts:Date.now()}); return; }
 }
 
 // ----------------------------------
@@ -2812,10 +2865,7 @@ function strangePlaceHandle(ws, payload) {
   }
   if (t === "chat") {
     const text=strangePlaceClean(m.text,420); if (!text) return;
-    const allowedIcons=new Set(["player","minion","sidhetree","ashberry","broom_trainer"]);
-    const requestedIcon=strangePlaceClean(m.icon,32);
-    const icon=allowedIcons.has(requestedIcon) ? requestedIcon : "player";
-    strangePlaceBroadcast({t:"chat",game:"a_strange_place",id:c.id,name:c.name,text,icon,ts:Date.now()}); return;
+    strangePlaceBroadcast({t:"chat",game:"a_strange_place",id:c.id,name:c.name,text,ts:Date.now()}); return;
   }
   if (t === "ping") { strangePlaceSend(ws,{t:"pong",game:"a_strange_place",ts:Date.now()}); return; }
 }
