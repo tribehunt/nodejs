@@ -1,5 +1,5 @@
 // server.js - supports Almighty Python, GROWTH, House Nocturne, Illithid Throne,
-// LUXBOUND, MECHMARINER and A STRANGE PLACE. One process, one port, isolated rooms by game.
+// LUXBOUND, MECHMARINER, A STRANGE PLACE & Slimecraft. One process, one port, isolated rooms by game.
 // https://raw.githubusercontent.com/tribehunt/nodejs/refs/heads/main/server.js
 // all games produced and engineered by © Dedset Media 08/31/2026
 const http = require("http");
@@ -2417,6 +2417,161 @@ function luxboundHandle(ws, payload) {
 }
 
 // ----------------------------------------
+// SLIMECRAFT Railway player presence
+// Shares mm: framing with MECHMARINER; game:"slimecraft" selects this route.
+// ----------------------------------------
+const SLIMECRAFT_RAILWAY_PROTOCOL_VERSION = 3;
+const SLIMECRAFT_RAILWAY_MAX_PLAYERS = Math.max(2, Math.min(32, Number(process.env.SLIMECRAFT_RAILWAY_MAX_PLAYERS || 32) || 32));
+const SLIMECRAFT_RAILWAY_PRESENCE_MIN_MS = Math.max(50, Math.min(1000, Number(process.env.SLIMECRAFT_RAILWAY_PRESENCE_MIN_MS || 100) || 100));
+const slimecraftRailwayClients = new Map();
+function slimecraftRailwayClean(v, max=128) {
+  return String(v == null ? "" : v).replace(/[\r\n\t]/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
+}
+function slimecraftRailwaySafeId(v) {
+  return slimecraftRailwayClean(v, 80).replace(/[^A-Za-z0-9_.-]/g, "");
+}
+function slimecraftRailwayFinite(v, fallback=0, limit=1000000) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return Number(fallback) || 0;
+  return Math.max(-limit, Math.min(limit, n));
+}
+function slimecraftRailwaySend(ws, packet) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  try { ws.send("mm:" + JSON.stringify(packet)); return true; } catch { return false; }
+}
+function slimecraftRailwayPublic(client) {
+  if (!client || !client.state) return null;
+  return Object.assign({}, client.state, {
+    t:"presence",
+    game:"slimecraft",
+    protocol_version:SLIMECRAFT_RAILWAY_PROTOCOL_VERSION,
+    lieutenant_id:client.id,
+    id:client.id
+  });
+}
+function slimecraftRailwayRoster(excludeId="") {
+  const out=[];
+  for (const client of slimecraftRailwayClients.values()) {
+    if (!client || client.id === excludeId || !client.state) continue;
+    const row=slimecraftRailwayPublic(client);
+    if (row) out.push(row);
+  }
+  return out.slice(0, SLIMECRAFT_RAILWAY_MAX_PLAYERS);
+}
+function slimecraftRailwayBroadcast(packet, excludeWs=null) {
+  for (const client of slimecraftRailwayClients.values()) {
+    if (!client || client.ws === excludeWs || !client.ws || client.ws.readyState !== WebSocket.OPEN) continue;
+    slimecraftRailwaySend(client.ws, packet);
+  }
+}
+function slimecraftRailwayDetach(ws, silent=false) {
+  const id = ws && ws._slimecraftRailwayId ? String(ws._slimecraftRailwayId) : "";
+  if (!id) return;
+  const client = slimecraftRailwayClients.get(id);
+  try { delete ws._slimecraftRailwayId; } catch {}
+  if (!client || client.ws !== ws) return;
+  slimecraftRailwayClients.delete(id);
+  if (!silent) slimecraftRailwayBroadcast({
+    t:"leave",game:"slimecraft",protocol_version:SLIMECRAFT_RAILWAY_PROTOCOL_VERSION,
+    lieutenant_id:id,id,ts:Date.now()
+  }, ws);
+}
+function slimecraftRailwayJoin(ws, m) {
+  const id = slimecraftRailwaySafeId(m.lieutenant_id || m.id);
+  if (!id) {
+    slimecraftRailwaySend(ws,{t:"error",game:"slimecraft",code:"missing_id",message:"Missing SLIMECRAFT lieutenant_id.",ts:Date.now()});
+    return null;
+  }
+  const requestedVersion = Math.trunc(Number(m.protocol_version || SLIMECRAFT_RAILWAY_PROTOCOL_VERSION) || 0);
+  if (requestedVersion !== SLIMECRAFT_RAILWAY_PROTOCOL_VERSION) {
+    slimecraftRailwaySend(ws,{t:"error",game:"slimecraft",code:"protocol_version",protocol_version:SLIMECRAFT_RAILWAY_PROTOCOL_VERSION,ts:Date.now()});
+    return null;
+  }
+  const existing = slimecraftRailwayClients.get(id);
+  if (!existing && slimecraftRailwayClients.size >= SLIMECRAFT_RAILWAY_MAX_PLAYERS) {
+    slimecraftRailwaySend(ws,{t:"error",game:"slimecraft",code:"room_full",max_players:SLIMECRAFT_RAILWAY_MAX_PLAYERS,ts:Date.now()});
+    return null;
+  }
+  if (existing && existing.ws && existing.ws !== ws) {
+    try { existing.ws.close(1008,"duplicate slimecraft railway lieutenant_id"); } catch {}
+    slimecraftRailwayClients.delete(id);
+  }
+  const client={id,ws,state:existing && existing.state ? existing.state : null,lastPresenceAt:0,joinedAt:Date.now()};
+  slimecraftRailwayClients.set(id,client);
+  ws._slimecraftRailwayId=id;
+  slimecraftRailwaySend(ws,{
+    t:"welcome",game:"slimecraft",protocol_version:SLIMECRAFT_RAILWAY_PROTOCOL_VERSION,
+    lieutenant_id:id,id,max_players:SLIMECRAFT_RAILWAY_MAX_PLAYERS,
+    players:slimecraftRailwayRoster(id),ts:Date.now()
+  });
+  return client;
+}
+function slimecraftRailwayPresenceState(client, m) {
+  const state={
+    lieutenant_id:client.id,
+    id:client.id,
+    x:slimecraftRailwayFinite(m.x),
+    y:slimecraftRailwayFinite(m.y),
+    zone:slimecraftRailwayClean(m.zone,32),
+    room:slimecraftRailwayClean(m.room,128),
+    site:slimecraftRailwayClean(m.site,96),
+    sprite_key:slimecraftRailwayClean(m.sprite_key,32),
+    class_name:slimecraftRailwayClean(m.class_name,32),
+    evolved:!!m.evolved,
+    level:Math.max(1,Math.min(999,Math.trunc(Number(m.level)||1))),
+    facing:slimecraftRailwayClean(m.facing,16),
+    flip:!!m.flip,
+    moving:!!m.moving,
+    form:!!m.form,
+    light_thing:!!m.light_thing,
+    ts:Date.now()
+  };
+  client.state=state;
+  return state;
+}
+function slimecraftRailwayHandle(ws, payload) {
+  let m=null;
+  try { m=JSON.parse(String(payload||"")); } catch { m=null; }
+  if (!m || typeof m !== "object") return;
+  const t=String(m.t || m.type || "").toLowerCase();
+  let id=ws && ws._slimecraftRailwayId ? String(ws._slimecraftRailwayId) : "";
+  let client=id ? slimecraftRailwayClients.get(id) : null;
+  if (t === "hello" || t === "join") {
+    slimecraftRailwayJoin(ws,m);
+    return;
+  }
+  if (!client) {
+    client=slimecraftRailwayJoin(ws,m);
+    if (!client) return;
+    id=client.id;
+  }
+  if (t === "presence") {
+    const now=Date.now();
+    if (now-Number(client.lastPresenceAt||0) < SLIMECRAFT_RAILWAY_PRESENCE_MIN_MS) return;
+    client.lastPresenceAt=now;
+    const state=slimecraftRailwayPresenceState(client,m);
+    slimecraftRailwayBroadcast(Object.assign({
+      t:"presence",game:"slimecraft",protocol_version:SLIMECRAFT_RAILWAY_PROTOCOL_VERSION
+    },state),ws);
+    return;
+  }
+  if (t === "request_players" || t === "request_roster" || t === "sync") {
+    slimecraftRailwaySend(ws,{
+      t:"players",game:"slimecraft",protocol_version:SLIMECRAFT_RAILWAY_PROTOCOL_VERSION,
+      players:slimecraftRailwayRoster(id),ts:Date.now()
+    });
+    return;
+  }
+  if (t === "leave") {
+    slimecraftRailwayDetach(ws,false);
+    return;
+  }
+  if (t === "ping") {
+    slimecraftRailwaySend(ws,{t:"pong",game:"slimecraft",protocol_version:SLIMECRAFT_RAILWAY_PROTOCOL_VERSION,ts:Date.now()});
+  }
+}
+
+// ----------------------------------------
 // MECHMARINER shared expedition protocol
 // Protocol prefix: mm:
 // ----------------------------------------
@@ -2877,6 +3032,7 @@ function detachAllProtocols(ws) {
   try { illithidDetach(ws); } catch {}
   try { luxboundDetach(ws); } catch {}
   try { mechmarinerDetach(ws); } catch {}
+  try { slimecraftRailwayDetach(ws, true); } catch {}
   try { strangePlaceDetach(ws, true); } catch {}
 }
 function routeSocketMessage(ws, data) {
@@ -2892,7 +3048,14 @@ function routeSocketMessage(ws, data) {
   if (raw.startsWith("gf:")) { growthHandle(ws, raw.slice(3)); return; }
   if (raw.startsWith("it:")) { illithidHandle(ws, raw.slice(3)); return; }
   if (raw.startsWith("lb:")) { luxboundHandle(ws, raw.slice(3)); return; }
-  if (raw.startsWith("mm:")) { mechmarinerHandle(ws, raw.slice(3)); return; }
+  if (raw.startsWith("mm:")) {
+    const mmPayload = raw.slice(3);
+    let mmMessage = null;
+    try { mmMessage = JSON.parse(mmPayload); } catch { mmMessage = null; }
+    const mmGame = mmMessage && typeof mmMessage === "object" ? String(mmMessage.game || mmMessage.g || "").toLowerCase() : "";
+    if (mmGame === "slimecraft" || mmGame === "slime_craft" || mmGame === "sc") { slimecraftRailwayHandle(ws, mmPayload); return; }
+    mechmarinerHandle(ws, mmPayload); return;
+  }
   if (raw.startsWith("asp:")) { strangePlaceHandle(ws, raw.slice(4)); return; }
   // Legacy/no-prefix fallback.
   let m = null;
@@ -2905,6 +3068,7 @@ function routeSocketMessage(ws, data) {
     if (game === "illithid_throne" || game === "illithid" || game === "it") { illithidHandle(ws, raw); return; }
     if (game === "luxbound" || game === "lyralan" || game === "lb") { luxboundHandle(ws, raw); return; }
     if (game === "mechmariner" || game === "mm") { mechmarinerHandle(ws, raw); return; }
+    if (game === "slimecraft" || game === "slime_craft" || game === "sc") { slimecraftRailwayHandle(ws, raw); return; }
     if (game === "a_strange_place" || game === "strange_place" || game === "asp") { strangePlaceHandle(ws, raw); return; }
     const t = String(m.t || m.type || "").toLowerCase();
     if (t === "presence" || t === "peer" || t === "visit" || t === "visit_position" || t === "rail_chat" || t === "visitor_chat" || t === "leave" || t === "request_peers" || t === "sync") {
@@ -2912,7 +3076,7 @@ function routeSocketMessage(ws, data) {
       return;
     }
   }
-  try { ws.send(JSON.stringify({ type: "error", code: "unsupported_protocol", message: "Use Almighty Python, House Nocturne, GROWTH, Illithid Throne, LUXBOUND, MECHMARINER, or A STRANGE PLACE protocol routing." })); } catch {}
+  try { ws.send(JSON.stringify({ type: "error", code: "unsupported_protocol", message: "Use Almighty Python, House Nocturne, GROWTH, Illithid Throne, LUXBOUND, SLIMECRAFT, MECHMARINER, or A STRANGE PLACE protocol routing." })); } catch {}
 }
 wss.on("connection", (ws, req) => {
   ws.isAlive = true;
@@ -2930,6 +3094,6 @@ wss.on("connection", (ws, req) => {
 });
 // --------------------------------------------------------------
 server.listen(PORT, HOST, () => {
-  console.log("Dedset relay (Almighty Python / GROWTH / House Nocturne / Illithid Throne / LUXBOUND / MECHMARINER / A STRANGE PLACE) on", HOST + ":" + PORT);
+  console.log("Dedset relay (Almighty Python / GROWTH / House Nocturne / Illithid Throne / LUXBOUND / SLIMECRAFT / MECHMARINER / A STRANGE PLACE) on", HOST + ":" + PORT);
   if (MEGA_CLAIM_REQUIRE_AUTH && !MEGA_CLAIM_SECRET) console.warn("MEGA claim endpoint is locked until MEGA_CLAIM_SECRET is configured.");
 });
