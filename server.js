@@ -1,5 +1,5 @@
 // server.js - supports Almighty Python, GROWTH, House Nocturne, Illithid Throne,
-// LUXBOUND, MECHMARINER, A STRANGE PLACE & Slimecraft. One process, one port, isolated rooms by game.
+// LUXBOUND, MECHMARINER, A STRANGE PLACE, Slimecraft & KRON. One process, one port, isolated rooms by game.
 // https://raw.githubusercontent.com/tribehunt/nodejs/refs/heads/main/server.js
 // all games produced and engineered by © Dedset Media 08/31/2026
 const http = require("http");
@@ -13,6 +13,7 @@ const PORT = process.env.PORT || 8080;
 const HOST = String(process.env.HOST || process.env.BIND_HOST || process.env.MEGA_CLAIM_HOST || (process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID ? "0.0.0.0" : "127.0.0.1")).trim() || "127.0.0.1";
 const server = http.createServer((req, res) => {
   if (handleMegaClaimHTTP(req, res)) return;
+  if (handleKronHTTP(req, res)) return;
   res.writeHead(200, { "content-type": "text/plain" });
   res.end("OK\n");
 });
@@ -3025,6 +3026,164 @@ function strangePlaceHandle(ws, payload) {
   if (t === "ping") { strangePlaceSend(ws,{t:"pong",game:"a_strange_place",ts:Date.now()}); return; }
 }
 
+
+// --------------------------------------------------------------
+// KRON authoritative Python-server Railway bridge (kron:...)
+// --------------------------------------------------------------
+// The public Node process is transport only. One KRON Python server registers
+// as the room host; game clients register as clients. Requests are forwarded to
+// that host and replies are routed back to the originating client. Persistence,
+// quests, REP, chat, GRIDMIND and presence therefore remain authoritative in
+// server_app.py rather than being duplicated here.
+const KRON_RELAY_SECRET = String(process.env.KRON_RELAY_SECRET || "").trim();
+const kronRooms = new Map(); // room -> {host,hostId,clients:Map<clientId,ws>}
+function kronRoom(name) {
+  const roomName = safeRoomId(name, "kron");
+  let room = kronRooms.get(roomName);
+  if (!room) {
+    room = { name: roomName, host: null, hostId: "", clients: new Map() };
+    kronRooms.set(roomName, room);
+  }
+  return room;
+}
+function kronToken(v, fallback = "") {
+  const s = String(v || fallback).replace(/[^A-Za-z0-9_.:-]/g, "").slice(0, 96);
+  return s || fallback;
+}
+function kronSend(ws, obj) {
+  try {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send("kron:" + JSON.stringify(obj));
+  } catch {}
+}
+function kronSecretOK(value) {
+  if (!KRON_RELAY_SECRET) return true;
+  try {
+    const a = Buffer.from(String(value || ""), "utf8");
+    const b = Buffer.from(KRON_RELAY_SECRET, "utf8");
+    return a.length === b.length && a.length > 0 && crypto.timingSafeEqual(a, b);
+  } catch { return false; }
+}
+function kronDetach(ws, silent = false) {
+  try {
+    const roomName = String(ws && ws._kronRoom || "");
+    if (!roomName) return;
+    const room = kronRooms.get(roomName);
+    if (!room) return;
+    if (room.host === ws) {
+      room.host = null;
+      room.hostId = "";
+      for (const c of room.clients.values()) kronSend(c, { t:"host_offline", game:"kron", room:room.name, ts:Date.now() });
+    }
+    const cid = String(ws._kronClientId || "");
+    if (cid && room.clients.get(cid) === ws) {
+      room.clients.delete(cid);
+      if (!silent && room.host) kronSend(room.host, { t:"client_left", game:"kron", room:room.name, client_id:cid, ts:Date.now() });
+    }
+    ws._kronRoom = "";
+    ws._kronClientId = "";
+    ws._kronRole = "";
+    if (!room.host && room.clients.size === 0) kronRooms.delete(room.name);
+  } catch {}
+}
+function kronHandle(ws, payloadStr) {
+  let m = null;
+  try { m = JSON.parse(String(payloadStr || "")); } catch { m = null; }
+  if (!m || typeof m !== "object") { kronSend(ws,{t:"error",game:"kron",code:"bad_json",message:"Invalid KRON relay packet."}); return; }
+  const t = String(m.t || m.type || "").toLowerCase();
+  const roomName = safeRoomId(m.room || ws._kronRoom || "kron", "kron");
+  let room = kronRoom(roomName);
+
+  if (t === "host") {
+    if (!kronSecretOK(m.secret)) { kronSend(ws,{t:"error",game:"kron",code:"host_auth",message:"KRON relay host authentication failed."}); return; }
+    const incomingHostId = kronToken(m.host_id, "KH-" + rid());
+    if (room.host && room.host !== ws && room.host.readyState === WebSocket.OPEN) {
+      if (room.hostId && room.hostId === incomingHostId) {
+        const staleHost = room.host;
+        room.host = null;
+        try { staleHost.terminate(); } catch { try { staleHost.close(); } catch {} }
+      } else {
+        kronSend(ws,{t:"error",game:"kron",code:"host_busy",message:"A KRON authoritative host is already online."});
+        return;
+      }
+    }
+    kronDetach(ws, true);
+    room = kronRoom(roomName);
+    room.host = ws;
+    room.hostId = incomingHostId;
+    ws._kronRole = "host";
+    ws._kronRoom = room.name;
+    kronSend(ws,{t:"hosted",game:"kron",room:room.name,host_id:room.hostId,clients:room.clients.size,ts:Date.now()});
+    for (const c of room.clients.values()) kronSend(c,{t:"host_online",game:"kron",room:room.name,ts:Date.now()});
+    return;
+  }
+
+  if (t === "hello") {
+    kronDetach(ws, true);
+    room = kronRoom(roomName);
+    const cid = kronToken(m.client_id, "KC-" + rid());
+    const old = room.clients.get(cid);
+    if (old && old !== ws) { try { old.close(); } catch {} }
+    room.clients.set(cid, ws);
+    ws._kronRole = "client";
+    ws._kronRoom = room.name;
+    ws._kronClientId = cid;
+    kronSend(ws,{t:"welcome",game:"kron",room:room.name,client_id:cid,host_online:!!(room.host && room.host.readyState===WebSocket.OPEN),ts:Date.now()});
+    return;
+  }
+
+  if (t === "request") {
+    const cid = String(ws._kronClientId || "");
+    if (ws._kronRole !== "client" || !cid || room.clients.get(cid) !== ws) {
+      kronSend(ws,{t:"error",game:"kron",code:"not_joined",message:"Send kron: hello first."}); return;
+    }
+    const reqId = kronToken(m.req_id, "KR-" + rid());
+    const now = Date.now();
+    if (!ws._kronRateStart || now - ws._kronRateStart >= 1000) { ws._kronRateStart = now; ws._kronRateCount = 0; }
+    ws._kronRateCount = Number(ws._kronRateCount || 0) + 1;
+    if (ws._kronRateCount > 30) { kronSend(ws,{t:"error",game:"kron",code:"rate_limited",req_id:reqId,message:"KRON relay request rate exceeded."}); return; }
+    const payload = (m.payload && typeof m.payload === "object" && !Array.isArray(m.payload)) ? m.payload : null;
+    if (!payload) { kronSend(ws,{t:"error",game:"kron",code:"bad_request",req_id:reqId,message:"KRON request payload must be an object."}); return; }
+    let payloadSize = 0; try { payloadSize = Buffer.byteLength(JSON.stringify(payload), "utf8"); } catch {}
+    if (!payloadSize || payloadSize > 65507) { kronSend(ws,{t:"error",game:"kron",code:"payload_too_large",req_id:reqId,message:"KRON relay payload exceeds UDP parity limit."}); return; }
+    if (!room.host || room.host.readyState !== WebSocket.OPEN) {
+      kronSend(ws,{t:"error",game:"kron",code:"host_offline",req_id:reqId,message:"KRON authoritative server is offline."}); return;
+    }
+    kronSend(room.host,{t:"request",game:"kron",room:room.name,client_id:cid,req_id:reqId,payload,ts:Date.now()});
+    return;
+  }
+
+  if (t === "reply") {
+    if (ws._kronRole !== "host" || room.host !== ws) return;
+    const cid = kronToken(m.client_id, "");
+    const reqId = kronToken(m.req_id, "");
+    const target = cid ? room.clients.get(cid) : null;
+    if (!target || target.readyState !== WebSocket.OPEN || !reqId) return;
+    const payload = (m.payload && typeof m.payload === "object" && !Array.isArray(m.payload)) ? m.payload : {ok:false,error:"invalid server reply"};
+    kronSend(target,{t:"reply",game:"kron",room:room.name,req_id:reqId,payload,ts:Date.now()});
+    return;
+  }
+
+  if (t === "ping") { kronSend(ws,{t:"pong",game:"kron",room:room.name,host_online:!!(room.host && room.host.readyState===WebSocket.OPEN),ts:Date.now()}); return; }
+  kronSend(ws,{t:"error",game:"kron",code:"unknown_type",message:"Unknown KRON relay packet."});
+}
+function handleKronHTTP(req, res) {
+  try {
+    const url = new URL(req.url || "/", "http://localhost");
+    const pathname = String(url.pathname || "").replace(/\/+$/, "") || "/";
+    if (pathname !== "/kron" && pathname !== "/api/kron") return false;
+    const room = kronRooms.get("kron");
+    const body = JSON.stringify({
+      ok:true, game:"kron", room:"kron",
+      host_online:!!(room && room.host && room.host.readyState === WebSocket.OPEN),
+      clients:room ? room.clients.size : 0,
+      ts:Date.now()
+    });
+    res.writeHead(200,{"content-type":"application/json","cache-control":"no-store"});
+    res.end(body);
+    return true;
+  } catch { return false; }
+}
+
 function detachAllProtocols(ws) {
   try { almightyPythonDetach(ws, true); } catch {}
   try { umbralDetach(ws, true); } catch {}
@@ -3034,6 +3193,7 @@ function detachAllProtocols(ws) {
   try { mechmarinerDetach(ws); } catch {}
   try { slimecraftRailwayDetach(ws, true); } catch {}
   try { strangePlaceDetach(ws, true); } catch {}
+  try { kronDetach(ws, true); } catch {}
 }
 function routeSocketMessage(ws, data) {
   let raw = "";
@@ -3057,6 +3217,7 @@ function routeSocketMessage(ws, data) {
     mechmarinerHandle(ws, mmPayload); return;
   }
   if (raw.startsWith("asp:")) { strangePlaceHandle(ws, raw.slice(4)); return; }
+  if (raw.startsWith("kron:")) { kronHandle(ws, raw.slice(5)); return; }
   // Legacy/no-prefix fallback.
   let m = null;
   try { m = JSON.parse(raw); } catch { m = null; }
@@ -3070,13 +3231,14 @@ function routeSocketMessage(ws, data) {
     if (game === "mechmariner" || game === "mm") { mechmarinerHandle(ws, raw); return; }
     if (game === "slimecraft" || game === "slime_craft" || game === "sc") { slimecraftRailwayHandle(ws, raw); return; }
     if (game === "a_strange_place" || game === "strange_place" || game === "asp") { strangePlaceHandle(ws, raw); return; }
+    if (game === "kron" || game === "kr") { kronHandle(ws, raw); return; }
     const t = String(m.t || m.type || "").toLowerCase();
     if (t === "presence" || t === "peer" || t === "visit" || t === "visit_position" || t === "rail_chat" || t === "visitor_chat" || t === "leave" || t === "request_peers" || t === "sync") {
       umbralHandle(ws, raw, false);
       return;
     }
   }
-  try { ws.send(JSON.stringify({ type: "error", code: "unsupported_protocol", message: "Use Almighty Python, House Nocturne, GROWTH, Illithid Throne, LUXBOUND, SLIMECRAFT, MECHMARINER, or A STRANGE PLACE protocol routing." })); } catch {}
+  try { ws.send(JSON.stringify({ type: "error", code: "unsupported_protocol", message: "Use Almighty Python, House Nocturne, GROWTH, Illithid Throne, LUXBOUND, SLIMECRAFT, MECHMARINER, A STRANGE PLACE, or KRON protocol routing." })); } catch {}
 }
 wss.on("connection", (ws, req) => {
   ws.isAlive = true;
@@ -3094,6 +3256,6 @@ wss.on("connection", (ws, req) => {
 });
 // --------------------------------------------------------------
 server.listen(PORT, HOST, () => {
-  console.log("Dedset relay (Almighty Python / GROWTH / House Nocturne / Illithid Throne / LUXBOUND / SLIMECRAFT / MECHMARINER / A STRANGE PLACE) on", HOST + ":" + PORT);
+  console.log("Dedset relay (Almighty Python / GROWTH / House Nocturne / Illithid Throne / LUXBOUND / SLIMECRAFT / MECHMARINER / A STRANGE PLACE / KRON) on", HOST + ":" + PORT);
   if (MEGA_CLAIM_REQUIRE_AUTH && !MEGA_CLAIM_SECRET) console.warn("MEGA claim endpoint is locked until MEGA_CLAIM_SECRET is configured.");
 });
