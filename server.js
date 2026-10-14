@@ -1,5 +1,5 @@
 // server.js - supports Almighty Python, GROWTH, House Nocturne, Illithid Throne,
-// LUXBOUND, MECHMARINER, A STRANGE PLACE, Slimecraft & KRON. One process, one port, isolated rooms by game.
+// LUXBOUND, MECHMARINER, A STRANGE PLACE, Slimecraft, KRON & SHEOL. One process, one port, isolated rooms by game.
 // https://raw.githubusercontent.com/tribehunt/nodejs/refs/heads/main/server.js
 // all games produced and engineered by © Dedset Media 08/31/2026
 const http = require("http");
@@ -14,6 +14,7 @@ const HOST = String(process.env.HOST || process.env.BIND_HOST || process.env.MEG
 const server = http.createServer((req, res) => {
   if (handleMegaClaimHTTP(req, res)) return;
   if (handleKronHTTP(req, res)) return;
+  if (handleSheolHTTP(req, res)) return;
   res.writeHead(200, { "content-type": "text/plain" });
   res.end("OK\n");
 });
@@ -3184,6 +3185,129 @@ function handleKronHTTP(req, res) {
   } catch { return false; }
 }
 
+
+// --------------------------------------------------------------
+// SHEOL authoritative TRENCHMIND / NPC Railway bridge (sheol:...)
+// --------------------------------------------------------------
+// server_app.py is the single authority for HUTCH resident identity, memory,
+// story state and local Qwen inference. This Node service is transport only:
+// WAN players register as clients and their requests are forwarded to the same
+// Python host that LAN players reach directly on SHEOL's configured LAN port.
+const SHEOL_RELAY_SECRET = String(process.env.SHEOL_RELAY_SECRET || "").trim();
+const sheolRooms = new Map();
+function sheolRoom(name) {
+  const roomName = safeRoomId(name, "sheol");
+  let room = sheolRooms.get(roomName);
+  if (!room) {
+    room = { name: roomName, host: null, hostId: "", clients: new Map() };
+    sheolRooms.set(roomName, room);
+  }
+  return room;
+}
+function sheolToken(v, fallback = "") {
+  const x = String(v || fallback).replace(/[^A-Za-z0-9_.:-]/g, "").slice(0, 96);
+  return x || fallback;
+}
+function sheolSend(ws, obj) {
+  try { if (ws && ws.readyState === WebSocket.OPEN) ws.send("sheol:" + JSON.stringify(obj)); } catch {}
+}
+function sheolSecretOK(value) {
+  if (!SHEOL_RELAY_SECRET) return true;
+  try {
+    const a = Buffer.from(String(value || ""), "utf8");
+    const b = Buffer.from(SHEOL_RELAY_SECRET, "utf8");
+    return a.length === b.length && a.length > 0 && crypto.timingSafeEqual(a, b);
+  } catch { return false; }
+}
+function sheolDetach(ws, silent = false) {
+  try {
+    const roomName = String(ws && ws._sheolRoom || "");
+    if (!roomName) return;
+    const room = sheolRooms.get(roomName);
+    if (!room) return;
+    if (room.host === ws) {
+      room.host = null; room.hostId = "";
+      for (const c of room.clients.values()) sheolSend(c,{t:"host_offline",game:"sheol",room:room.name,ts:Date.now()});
+    }
+    const cid = String(ws._sheolClientId || "");
+    if (cid && room.clients.get(cid) === ws) {
+      room.clients.delete(cid);
+      if (!silent && room.host) sheolSend(room.host,{t:"client_left",game:"sheol",room:room.name,client_id:cid,ts:Date.now()});
+    }
+    ws._sheolRoom = ""; ws._sheolClientId = ""; ws._sheolRole = "";
+    if (!room.host && room.clients.size === 0) sheolRooms.delete(room.name);
+  } catch {}
+}
+function sheolHandle(ws, payloadStr) {
+  let m = null;
+  try { m = JSON.parse(String(payloadStr || "")); } catch { m = null; }
+  if (!m || typeof m !== "object") { sheolSend(ws,{t:"error",game:"sheol",code:"bad_json",message:"Invalid SHEOL relay packet."}); return; }
+  const t = String(m.t || m.type || "").toLowerCase();
+  const roomName = safeRoomId(m.room || ws._sheolRoom || "sheol", "sheol");
+  let room = sheolRoom(roomName);
+  if (t === "host") {
+    if (!sheolSecretOK(m.secret)) { sheolSend(ws,{t:"error",game:"sheol",code:"host_auth",message:"SHEOL relay host authentication failed."}); return; }
+    const incomingHostId = sheolToken(m.host_id, "SH-" + rid());
+    if (room.host && room.host !== ws && room.host.readyState === WebSocket.OPEN) {
+      if (room.hostId && room.hostId === incomingHostId) {
+        const stale = room.host; room.host = null;
+        try { stale.terminate(); } catch { try { stale.close(); } catch {} }
+      } else { sheolSend(ws,{t:"error",game:"sheol",code:"host_busy",message:"A SHEOL authoritative host is already online."}); return; }
+    }
+    sheolDetach(ws, true); room = sheolRoom(roomName);
+    room.host = ws; room.hostId = incomingHostId;
+    ws._sheolRole = "host"; ws._sheolRoom = room.name;
+    sheolSend(ws,{t:"hosted",game:"sheol",room:room.name,host_id:room.hostId,clients:room.clients.size,ts:Date.now()});
+    for (const c of room.clients.values()) sheolSend(c,{t:"host_online",game:"sheol",room:room.name,ts:Date.now()});
+    return;
+  }
+  if (t === "hello") {
+    sheolDetach(ws, true); room = sheolRoom(roomName);
+    const cid = sheolToken(m.client_id, "SC-" + rid());
+    const old = room.clients.get(cid); if (old && old !== ws) { try { old.close(); } catch {} }
+    room.clients.set(cid, ws); ws._sheolRole = "client"; ws._sheolRoom = room.name; ws._sheolClientId = cid;
+    sheolSend(ws,{t:"welcome",game:"sheol",room:room.name,client_id:cid,host_online:!!(room.host && room.host.readyState===WebSocket.OPEN),ts:Date.now()});
+    return;
+  }
+  if (t === "request") {
+    const cid = String(ws._sheolClientId || "");
+    if (ws._sheolRole !== "client" || !cid || room.clients.get(cid) !== ws) { sheolSend(ws,{t:"error",game:"sheol",code:"not_joined",message:"Send sheol: hello first."}); return; }
+    const reqId = sheolToken(m.req_id, "SR-" + rid());
+    const now = Date.now();
+    if (!ws._sheolRateStart || now - ws._sheolRateStart >= 1000) { ws._sheolRateStart = now; ws._sheolRateCount = 0; }
+    ws._sheolRateCount = Number(ws._sheolRateCount || 0) + 1;
+    if (ws._sheolRateCount > 12) { sheolSend(ws,{t:"error",game:"sheol",code:"rate_limited",req_id:reqId,message:"SHEOL relay request rate exceeded."}); return; }
+    const payload = (m.payload && typeof m.payload === "object" && !Array.isArray(m.payload)) ? m.payload : null;
+    if (!payload) { sheolSend(ws,{t:"error",game:"sheol",code:"bad_request",req_id:reqId,message:"SHEOL request payload must be an object."}); return; }
+    let payloadSize = 0; try { payloadSize = Buffer.byteLength(JSON.stringify(payload),"utf8"); } catch {}
+    if (!payloadSize || payloadSize > 32768) { sheolSend(ws,{t:"error",game:"sheol",code:"payload_too_large",req_id:reqId,message:"SHEOL relay payload too large."}); return; }
+    if (!room.host || room.host.readyState !== WebSocket.OPEN) { sheolSend(ws,{t:"error",game:"sheol",code:"host_offline",req_id:reqId,message:"SHEOL authoritative server is offline."}); return; }
+    sheolSend(room.host,{t:"request",game:"sheol",room:room.name,client_id:cid,req_id:reqId,payload,ts:Date.now()});
+    return;
+  }
+  if (t === "reply") {
+    if (ws._sheolRole !== "host" || room.host !== ws) return;
+    const cid = sheolToken(m.client_id, ""); const reqId = sheolToken(m.req_id, "");
+    const target = cid ? room.clients.get(cid) : null;
+    if (!target || target.readyState !== WebSocket.OPEN || !reqId) return;
+    const payload = (m.payload && typeof m.payload === "object" && !Array.isArray(m.payload)) ? m.payload : {ok:false,error:"invalid server reply"};
+    sheolSend(target,{t:"reply",game:"sheol",room:room.name,req_id:reqId,payload,ts:Date.now()});
+    return;
+  }
+  if (t === "ping") { sheolSend(ws,{t:"pong",game:"sheol",room:room.name,host_online:!!(room.host && room.host.readyState===WebSocket.OPEN),ts:Date.now()}); return; }
+  sheolSend(ws,{t:"error",game:"sheol",code:"unknown_type",message:"Unknown SHEOL relay packet."});
+}
+function handleSheolHTTP(req, res) {
+  try {
+    const url = new URL(req.url || "/", "http://localhost");
+    const pathname = String(url.pathname || "").replace(/\/+$/, "") || "/";
+    if (pathname !== "/sheol" && pathname !== "/api/sheol") return false;
+    const room = sheolRooms.get("sheol");
+    const body = JSON.stringify({ok:true,game:"sheol",room:"sheol",host_online:!!(room&&room.host&&room.host.readyState===WebSocket.OPEN),clients:room?room.clients.size:0,ts:Date.now()});
+    res.writeHead(200,{"content-type":"application/json","cache-control":"no-store"}); res.end(body); return true;
+  } catch { return false; }
+}
+
 function detachAllProtocols(ws) {
   try { almightyPythonDetach(ws, true); } catch {}
   try { umbralDetach(ws, true); } catch {}
@@ -3194,6 +3318,7 @@ function detachAllProtocols(ws) {
   try { slimecraftRailwayDetach(ws, true); } catch {}
   try { strangePlaceDetach(ws, true); } catch {}
   try { kronDetach(ws, true); } catch {}
+  try { sheolDetach(ws, true); } catch {}
 }
 function routeSocketMessage(ws, data) {
   let raw = "";
@@ -3218,6 +3343,7 @@ function routeSocketMessage(ws, data) {
   }
   if (raw.startsWith("asp:")) { strangePlaceHandle(ws, raw.slice(4)); return; }
   if (raw.startsWith("kron:")) { kronHandle(ws, raw.slice(5)); return; }
+  if (raw.startsWith("sheol:")) { sheolHandle(ws, raw.slice(6)); return; }
   // Legacy/no-prefix fallback.
   let m = null;
   try { m = JSON.parse(raw); } catch { m = null; }
@@ -3232,13 +3358,14 @@ function routeSocketMessage(ws, data) {
     if (game === "slimecraft" || game === "slime_craft" || game === "sc") { slimecraftRailwayHandle(ws, raw); return; }
     if (game === "a_strange_place" || game === "strange_place" || game === "asp") { strangePlaceHandle(ws, raw); return; }
     if (game === "kron" || game === "kr") { kronHandle(ws, raw); return; }
+    if (game === "sheol" || game === "sh") { sheolHandle(ws, raw); return; }
     const t = String(m.t || m.type || "").toLowerCase();
     if (t === "presence" || t === "peer" || t === "visit" || t === "visit_position" || t === "rail_chat" || t === "visitor_chat" || t === "leave" || t === "request_peers" || t === "sync") {
       umbralHandle(ws, raw, false);
       return;
     }
   }
-  try { ws.send(JSON.stringify({ type: "error", code: "unsupported_protocol", message: "Use Almighty Python, House Nocturne, GROWTH, Illithid Throne, LUXBOUND, SLIMECRAFT, MECHMARINER, A STRANGE PLACE, or KRON protocol routing." })); } catch {}
+  try { ws.send(JSON.stringify({ type: "error", code: "unsupported_protocol", message: "Use Almighty Python, House Nocturne, GROWTH, Illithid Throne, LUXBOUND, SLIMECRAFT, MECHMARINER, A STRANGE PLACE, KRON, or SHEOL protocol routing." })); } catch {}
 }
 wss.on("connection", (ws, req) => {
   ws.isAlive = true;
@@ -3256,6 +3383,6 @@ wss.on("connection", (ws, req) => {
 });
 // --------------------------------------------------------------
 server.listen(PORT, HOST, () => {
-  console.log("Dedset relay (Almighty Python / GROWTH / House Nocturne / Illithid Throne / LUXBOUND / SLIMECRAFT / MECHMARINER / A STRANGE PLACE / KRON) on", HOST + ":" + PORT);
+  console.log("Dedset relay (Almighty Python / GROWTH / House Nocturne / Illithid Throne / LUXBOUND / SLIMECRAFT / MECHMARINER / A STRANGE PLACE / KRON / SHEOL) on", HOST + ":" + PORT);
   if (MEGA_CLAIM_REQUIRE_AUTH && !MEGA_CLAIM_SECRET) console.warn("MEGA claim endpoint is locked until MEGA_CLAIM_SECRET is configured.");
 });
