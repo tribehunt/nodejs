@@ -2,6 +2,7 @@
 // LUXBOUND, MECHMARINER, A STRANGE PLACE, Slimecraft, KRON & SHEOL. One process, one port, isolated rooms by game.
 // https://raw.githubusercontent.com/tribehunt/nodejs/refs/heads/main/server.js
 // all games produced and engineered by © Dedset Media 08/31/2026
+// token = bm9kZWpzLXByb2R1Y3Rpb24tNzQwYmM=
 const http = require("http");
 const https = require("https");
 const zlib = require("zlib");
