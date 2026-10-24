@@ -14,6 +14,7 @@ const server = http.createServer((req, res) => {
   if (handleMegaClaimHTTP(req, res)) return;
   if (handleKronHTTP(req, res)) return;
   if (handleSheolHTTP(req, res)) return;
+  if (handleSheolQwenHTTP(req, res)) return;
   res.writeHead(200, { "content-type": "text/plain" });
   res.end("OK\n");
 });
@@ -2562,6 +2563,152 @@ function handleKronHTTP(req, res) {
   } catch { return false; }
 }
 // ---------------------------------------------------------------
+// Dedicated SHEOL Qwen inference bridge (sq:...) -- independent of multiplayer
+// The Qwen model runs on SHEOL's PC; Railway routes requests, never loads GGUF.
+// ---------------------------------------------------------------
+const SHEOL_QWEN_HOST_SECRET = String(process.env.SHEOL_QWEN_HOST_SECRET || process.env.SHEOL_QWEN_RELAY_SECRET || process.env.SHEOL_RELAY_SECRET || "").trim();
+const SHEOL_QWEN_CLIENT_SECRET = String(process.env.SHEOL_QWEN_CLIENT_SECRET || process.env.SHEOL_QWEN_RELAY_SECRET || process.env.SHEOL_RELAY_SECRET || "").trim();
+let sheolQwenHost = null;
+let sheolQwenModel = "";
+let sheolQwenContext = 1024;
+const sheolQwenPending = new Map();
+const sheolQwenRate = new Map();
+function sheolQwenEqual(a, b) {
+  if (!a || !b) return false;
+  try {
+    const aHash = crypto.createHash("sha256").update(String(a)).digest();
+    const bHash = crypto.createHash("sha256").update(String(b)).digest();
+    return crypto.timingSafeEqual(aHash, bHash);
+  } catch { return false; }
+}
+function sheolQwenRespond(res, status, data) {
+  if (res.writableEnded || res.destroyed) return;
+  try {
+    res.writeHead(status, {"content-type":"application/json", "cache-control":"no-store"});
+    res.end(JSON.stringify(data));
+  } catch {}
+}
+function sheolQwenFailPending(reason) {
+  for (const [id, pending] of sheolQwenPending) {
+    clearTimeout(pending.timer);
+    sheolQwenPending.delete(id);
+    sheolQwenRespond(pending.res, 503, {error:"sheol_qwen_offline", detail:reason});
+  }
+}
+function sheolQwenDetach(ws) {
+  if (ws !== sheolQwenHost) return;
+  sheolQwenHost = null;
+  sheolQwenModel = "";
+  sheolQwenContext = 1024;
+  sheolQwenFailPending("SHEOL Qwen host disconnected");
+}
+function sheolQwenHandle(ws, raw) {
+  let m;
+  try { m = JSON.parse(raw); } catch { return; }
+  if (!m || typeof m !== "object") return;
+  if (m.t === "host") {
+    if (!SHEOL_QWEN_HOST_SECRET || !sheolQwenEqual(m.secret, SHEOL_QWEN_HOST_SECRET)) {
+      try { ws.send('sq:{"t":"error","code":"unauthorized"}'); ws.close(1008); } catch {}
+      return;
+    }
+    if (sheolQwenHost && sheolQwenHost !== ws && sheolQwenHost.readyState === WebSocket.OPEN) {
+      try { ws.send('sq:{"t":"error","code":"host_busy"}'); ws.close(1008); } catch {}
+      return;
+    }
+    sheolQwenHost = ws;
+    sheolQwenModel = String(m.model || "sheol-qwen").slice(0, 160);
+    sheolQwenContext = Math.max(256, Math.min(65536, Math.floor(Number(m.context_tokens || 1024)) || 1024));
+    ws._sheolQwenHost = true;
+    try { ws.send('sq:' + JSON.stringify({t:"hosted",model:sheolQwenModel})); } catch {}
+    return;
+  }
+  if (m.t === "reply" && ws === sheolQwenHost) {
+    const id = String(m.req_id || "");
+    const pending = sheolQwenPending.get(id);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    sheolQwenPending.delete(id);
+    if (m.ok === false) {
+      const upstream = Number(m.status || 502);
+      sheolQwenRespond(pending.res, [400,413,422,429,500,502,503,504].includes(upstream) ? upstream : 502,
+                       {error:"sheol_qwen_inference_failed",detail:String(m.error || "inference failed").slice(0, 1200)});
+    } else if (m.result && typeof m.result === "object" && Array.isArray(m.result.choices)) {
+      sheolQwenRespond(pending.res, 200, m.result);
+    } else {
+      sheolQwenRespond(pending.res, 502, {error:"invalid_sheol_qwen_reply"});
+    }
+    return;
+  }
+  if (m.t === "ping" && ws === sheolQwenHost) {
+    try { ws.send('sq:{"t":"pong"}'); } catch {}
+  }
+}
+function handleSheolQwenHTTP(req, res) {
+  const route = (String(req.url || "/").split("?", 1)[0] || "/").replace(/\/+$/, "");
+  if (route !== "/api/sheol-qwen/status" && route !== "/api/sheol-qwen/chat") return false;
+  if (route.endsWith("/status") && req.method !== "GET") {
+    sheolQwenRespond(res, 405, {error:"method_not_allowed"}); return true;
+  }
+  if (!route.endsWith("/status") && req.method !== "POST") {
+    sheolQwenRespond(res, 405, {error:"method_not_allowed"}); return true;
+  }
+  if (!SHEOL_QWEN_CLIENT_SECRET || !SHEOL_QWEN_HOST_SECRET) {
+    sheolQwenRespond(res, 503, {error:"sheol_qwen_relay_not_configured"}); return true;
+  }
+  const auth = String(req.headers.authorization || "").match(/^Bearer\s+(.+)$/i);
+  if (!auth || !sheolQwenEqual(auth[1].trim(), SHEOL_QWEN_CLIENT_SECRET)) {
+    sheolQwenRespond(res, 401, {error:"unauthorized"}); return true;
+  }
+  if (route.endsWith("/status")) {
+    sheolQwenRespond(res, 200, {ok:true, configured:true,
+      host_online:!!(sheolQwenHost && sheolQwenHost.readyState===WebSocket.OPEN),
+      model:sheolQwenModel, context_tokens:sheolQwenContext});
+    return true;
+  }
+  if (!sheolQwenHost || sheolQwenHost.readyState !== WebSocket.OPEN) {
+    sheolQwenRespond(res, 503, {error:"sheol_qwen_host_offline"}); return true;
+  }
+  const ip = pickIP(req) || "unknown";
+  const now = Date.now();
+  let rate = sheolQwenRate.get(ip);
+  if (!rate || now - rate.start > 60000) rate = {start:now, count:0};
+  rate.count++;
+  sheolQwenRate.set(ip, rate);
+  if (sheolQwenRate.size > 2048) for (const [key, entry] of sheolQwenRate) if (now-entry.start > 60000) sheolQwenRate.delete(key);
+  if (rate.count > 40) { sheolQwenRespond(res, 429, {error:"rate_limited"}); return true; }
+  if (sheolQwenPending.size >= 4) { sheolQwenRespond(res, 503, {error:"sheol_qwen_busy"}); return true; }
+  let body = ""; let tooLarge = false;
+  req.on("data", chunk => {
+    if (tooLarge) return;
+    body += chunk.toString("utf8");
+    if (Buffer.byteLength(body, "utf8") > 32768) { tooLarge = true; body = ""; }
+  });
+  req.on("end", () => {
+    if (tooLarge) { sheolQwenRespond(res, 413, {error:"payload_too_large"}); return; }
+    let payload;
+    try { payload = JSON.parse(body); } catch { sheolQwenRespond(res, 400, {error:"bad_json"}); return; }
+    if (!payload || !Array.isArray(payload.messages) || !payload.messages.length || payload.messages.length > 40 || payload.stream === true ||
+        payload.messages.some(x => !x || !["system","user","assistant"].includes(x.role) || typeof x.content !== "string")) {
+      sheolQwenRespond(res, 400, {error:"invalid_chat_request"}); return;
+    }
+    payload.max_tokens = Math.max(1, Math.min(256, Number(payload.max_tokens || 128) || 128));
+    // Limit size and model options again in the SHEOL host process.
+    if (!sheolQwenHost || sheolQwenHost.readyState !== WebSocket.OPEN) { sheolQwenRespond(res, 503, {error:"sheol_qwen_host_offline"}); return; }
+    const id = "SQ-" + crypto.randomBytes(12).toString("hex");
+    const timer = setTimeout(() => {
+      sheolQwenPending.delete(id);
+      sheolQwenRespond(res, 504, {error:"sheol_qwen_timeout"});
+    }, 65000);
+    sheolQwenPending.set(id, {res, timer});
+    res.on("close", () => { if (!res.writableEnded) { clearTimeout(timer); sheolQwenPending.delete(id); } });
+    try { sheolQwenHost.send('sq:' + JSON.stringify({t:"infer", req_id:id, payload})); }
+    catch { clearTimeout(timer); sheolQwenPending.delete(id); sheolQwenRespond(res, 503, {error:"sheol_qwen_send_failed"}); }
+  });
+  req.on("error", () => {});
+  return true;
+}
+
+// ---------------------------------------------------------------
 // SHEOL authoritative TRENCHMIND / NPC Railway bridge (sheol:...)
 // ---------------------------------------------------------------
 // server_app.py is the single authority for HUTCH resident identity, memory,
@@ -2691,6 +2838,7 @@ function detachAllProtocols(ws) {
   try { slimecraftRailwayDetach(ws, true); } catch {}
   try { kronDetach(ws, true); } catch {}
   try { sheolDetach(ws, true); } catch {}
+  try { sheolQwenDetach(ws); } catch {}
 }
 function routeSocketMessage(ws, data) {
   let raw = "";
@@ -2714,6 +2862,7 @@ function routeSocketMessage(ws, data) {
   }
   if (raw.startsWith("kron:")) { kronHandle(ws, raw.slice(5)); return; }
   if (raw.startsWith("sheol:")) { sheolHandle(ws, raw.slice(6)); return; }
+  if (raw.startsWith("sq:")) { sheolQwenHandle(ws, raw.slice(3)); return; }
   // Legacy/no-prefix fallback.
   let m = null;
   try { m = JSON.parse(raw); } catch { m = null; }
