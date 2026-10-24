@@ -1,11 +1,9 @@
-// server.js - supports Almighty Python, GROWTH, House Nocturne, Illithid Throne,
-// LUXBOUND, MECHMARINER, A STRANGE PLACE, Slimecraft, KRON & SHEOL. One process, one port, isolated rooms by game.
+// server.js - supports Almighty Python, GROWTH, House Nocturne,
+// LUXBOUND, MECHMARINER, Slimecraft, KRON & SHEOL. One process, one port, isolated rooms by game.
 // https://raw.githubusercontent.com/tribehunt/nodejs/refs/heads/main/server.js
 // all games produced and engineered by © Dedset Media 08/31/2026
 // RAILYARD = bm9kZWpzLXByb2R1Y3Rpb24tNzQwYmM=
 const http = require("http");
-const https = require("https");
-const zlib = require("zlib");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
@@ -370,16 +368,6 @@ function handleMegaClaimHTTP(req, res) {
 // --------------
 // Shared helpers
 // --------------
-function normNameKey(s) {
-  try {
-    return String(s || "")
-      .replace(/\s+/g, " ")
-      .trim()
-      .toLowerCase();
-  } catch {
-    return "";
-  }
-}
 function _cleanIP(raw) {
   try {
     let ip = String(raw || "").trim();
@@ -433,240 +421,6 @@ function rid() {
 }
 function nowSeed() {
   return (Date.now() ^ (Math.random() * 0xffffffff)) >>> 0;
-}
-// ---------------------------------------
-// Reserved names / skeletonkey admin gate
-// ---------------------------------------
-const SKELETON_URL = "https://www.hhfashion.org/uploads/1/5/3/2/153241525/skeletonkey.txt";
-const RESERVED_NAMES = new Set(["dedset", "dedsetmedia", "psychonauticum", "hhfashion", "realhhfashion", "admin"]);
-let skeletonIP = "";
-let skeletonFetchedAt = 0;
-let skeletonFetchInFlight = false;
-let skeletonLastAttemptAt = 0;
-let skeletonLastStatus = 0;
-let skeletonLastErr = "";
-let skeletonLastURL = "";
-let skeletonLastBodyLen = 0;
-let skeletonLastBodySample = "";
-function isValidIPv4(ip) {
-  if (!ip) return false;
-  const m = String(ip).trim().match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (!m) return false;
-  for (let i = 1; i <= 4; i++) {
-    const n = Number(m[i]);
-    if (!Number.isInteger(n) || n < 0 || n > 255) return false;
-  }
-  return true;
-}
-function decodeSkeletonKey(body) {
-  try {
-    const raw = String(body || "").trim();
-    if (!raw) return "";
-    const toks = [];
-    toks.push(raw);
-    const reTok = /[A-Za-z0-9+/=]{8,}/g;
-    let mm;
-    while ((mm = reTok.exec(raw)) !== null) {
-      toks.push(mm[0]);
-      if (toks.length > 64) break;
-    }
-    for (const t of toks) {
-      try {
-        const ip = Buffer.from(String(t).trim(), "base64").toString("utf8").trim();
-        if (isValidIPv4(ip)) return ip;
-      } catch {}
-    }
-    return "";
-  } catch {
-    return "";
-  }
-}
-function _httpsGetFollow(url, redirectsLeft, cb) {
-  try {
-    const u0 = new URL(String(url));
-    const lib = (u0.protocol === "http:") ? http : https;
-    const req = lib.request(u0, {
-      method: "GET",
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Railway/Node)",
-        "Accept": "text/plain,*/*"
-      }
-    }, (res) => {
-      const sc = Number(res.statusCode || 0);
-      const loc = res.headers ? res.headers.location : null;
-      if (sc >= 300 && sc < 400 && loc && redirectsLeft > 0) {
-        let next = "";
-        try { next = new URL(String(loc), u0).toString(); } catch { next = String(loc); }
-        try { res.resume(); } catch {}
-        _httpsGetFollow(next, redirectsLeft - 1, cb);
-        return;
-      }
-      const chunks = [];
-      let total = 0;
-      res.on("data", (c) => {
-        try {
-          chunks.push(c);
-          total += c.length || 0;
-          if (total > 65536) {
-            try { req.destroy(); } catch {}
-          }
-        } catch {}
-      });
-      res.on("end", () => {
-        try {
-          const buf = Buffer.concat(chunks);
-          let outBuf = buf;
-          const enc = String((res.headers && res.headers["content-encoding"]) || "").toLowerCase();
-          try {
-            if (enc.includes("gzip")) outBuf = zlib.gunzipSync(buf);
-            else if (enc.includes("deflate")) outBuf = zlib.inflateSync(buf);
-          } catch {}
-          const body = outBuf.toString("utf8");
-          cb(null, body, sc, u0.toString());
-        } catch (e) {
-          cb(e, "", sc, u0.toString());
-        }
-      });
-    });
-    req.on("error", (e) => cb(e, "", 0, u0.toString()));
-    req.setTimeout(8000, () => { try { req.destroy(new Error("timeout")); } catch {} });
-    req.end();
-  } catch (e) {
-    cb(e, "", 0, String(url || ""));
-  }
-}
-function _sendReservedNameError(ws, proto, desired) {
-  try {
-    if (proto === "prison") prisonSend(ws, { t: "error", code: "reserved_name", message: `Name "${desired}" is reserved.` });
-    else {
-      try { ws.send(JSON.stringify({ type: "error", message: `Name "${desired}" is reserved.` })); } catch {}
-    }
-  } catch {}
-}
-function _tryApplyPendingReserved(ws) {
-  try {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const pr = ws._pending_reserved;
-    if (!pr) return;
-    const desired = String(pr.desired || "").slice(0, 24);
-    const proto = String(pr.proto || "");
-    const started = Number(pr.at || 0);
-    if (!skeletonIP) {
-      if (Date.now() - started < 12000) {
-        ws._pending_reserved_timer = setTimeout(() => _tryApplyPendingReserved(ws), 300);
-        return;
-      }
-      _sendReservedNameError(ws, proto, desired);
-      ws._pending_reserved = null;
-      ws._pending_reserved_timer = null;
-      return;
-    }
-    const ip = ws && ws._ip ? String(ws._ip) : "";
-    if (!isSkeletonAuthorized(ip)) {
-      _sendReservedNameError(ws, proto, desired);
-      ws._pending_reserved = null;
-      ws._pending_reserved_timer = null;
-      return;
-    }
-    if (proto === "prison") {
-      const room = ws._prisonRoomName ? prisonRooms.get(ws._prisonRoomName) : null;
-      if (room) {
-        const old = String(ws._prisonName || "");
-        if (room.nameMap && old) {
-          const ok = normNameKey(old);
-          if (ok && room.nameMap.get(ok) === ws) room.nameMap.delete(ok);
-        }
-        const newName = prisonMakeUniqueName(room, desired, ws._prisonId);
-        ws._prisonName = newName;
-        if (room.nameMap) room.nameMap.set(normNameKey(newName), ws);
-        prisonSend(ws, { t: "welcome", id: ws._prisonId, room: room.name, name: newName });
-        if (old && normNameKey(old) !== normNameKey(newName)) {
-          prisonBroadcast(room, { t: "sys", msg: `${old} is now ${newName}.` });
-        }
-      }
-    }
-    ws._pending_reserved = null;
-    ws._pending_reserved_timer = null;
-  } catch {}
-}
-function fetchSkeletonIP() {
-  if (skeletonFetchInFlight) return;
-  const now = Date.now();
-  if (now - (skeletonLastAttemptAt || 0) < 5000) return;
-  skeletonFetchInFlight = true;
-  skeletonLastAttemptAt = now;
-  _httpsGetFollow(SKELETON_URL, 3, (err, body, status, finalUrl) => {
-    try {
-      skeletonLastStatus = Number(status || 0);
-      skeletonLastURL = String(finalUrl || SKELETON_URL);
-      skeletonLastErr = err ? String(err && err.message ? err.message : err) : "";
-      skeletonLastBodyLen = body ? String(body).length : 0;
-      skeletonLastBodySample = body ? String(body).slice(0, 64).replace(/\s+/g, " ").trim() : "";
-    } catch {}
-    try {
-      const ip = err ? "" : decodeSkeletonKey(body);
-      if (ip) {
-        skeletonIP = ip;
-        skeletonFetchedAt = Date.now();
-      }
-    } catch {}
-    skeletonFetchInFlight = false;
-    try {
-      if (wss && wss.clients) {
-        for (const c of wss.clients) {
-          if (c && c._pending_reserved) _tryApplyPendingReserved(c);
-        }
-      }
-    } catch {}
-  });
-}
-fetchSkeletonIP();
-try {
-  const t = setInterval(fetchSkeletonIP, 5 * 60 * 1000);
-  if (t && typeof t.unref === "function") t.unref();
-} catch {}
-function isReservedName(name) {
-  const k = normNameKey(name);
-  return !!k && RESERVED_NAMES.has(k);
-}
-function isSkeletonAuthorized(ip) {
-  if (!skeletonIP) fetchSkeletonIP();
-  const a = String(ip || "").trim();
-  return !!a && !!skeletonIP && a === skeletonIP;
-}
-/**
- * Enforce exact reserved-name gate. If blocked, returns a safe replacement.
- * @returns {{name:string, blocked:boolean, reservedKey:string}}
- */
-function enforceReservedName(ws, desired, currentName, fallbackId, proto) {
-  const reservedKey = normNameKey(desired);
-  if (!reservedKey || !RESERVED_NAMES.has(reservedKey)) {
-    return { name: desired, blocked: false, reservedKey: "" };
-  }
-  const ip = ws && ws._ip ? String(ws._ip) : "";
-  if (isSkeletonAuthorized(ip)) {
-    return { name: desired, blocked: false, reservedKey };
-  }
-  if (!skeletonIP) {
-    try {
-      if (ws && !ws._pending_reserved) {
-        ws._pending_reserved = { desired: String(desired || "").slice(0, 24), proto: String(proto || ""), at: Date.now() };
-        ws._pending_reserved_timer = setTimeout(() => _tryApplyPendingReserved(ws), 300);
-      }
-    } catch {}
-    const cur = String(currentName || "").slice(0, 24);
-    if (cur && !isReservedName(cur)) return { name: cur, blocked: true, reservedKey };
-    const fb = String(fallbackId || "USER").slice(0, 24);
-    return { name: fb, blocked: true, reservedKey };
-  }
-  const cur = String(currentName || "").slice(0, 24);
-  if (cur && !isReservedName(cur)) {
-    _sendReservedNameError(ws, proto, desired);
-    return { name: cur, blocked: true, reservedKey };
-  }
-  const fb = String(fallbackId || "USER").slice(0, 24);
-  _sendReservedNameError(ws, proto, desired);
-  return { name: fb, blocked: true, reservedKey };
 }
 // ---------------------------------------------------------------------------------------------------------
 // GROWTH Frog-Hole / Croakline protocol (gf:...)
@@ -1337,7 +1091,6 @@ function growthHandle(ws, payloadStr) {
 }
 // -------------------------------------------------------------------------------
 // ALMIGHTY PYTHON // Velvet Byte multiplayer lobby
-// Python client connects to: wss://nodejs-production-740bc.up.railway.app
 // Protocol prefix: ap:
 // Four players per lobby. The first connected player is the Real Almighty Python;
 // the other three are story-canon clones.
@@ -1884,7 +1637,6 @@ try {
 // ------------------------------------------------------------------------------------------------------------------
 // HOUSE NOCTURNE / VESPERA Umbral Rail protocol
 // Raw JSON, plus optional ur: prefix for future clients.
-// Python client connects to: wss://nodejs-production-740bc.up.railway.app
 // Clients send:  {"type":"presence","id":"UR-XXXX","name":"King","floor":0,"x":10.5,"y":10.5,"angle":0,"maps":{...}}
 //                {"type":"visit","target":"UR-OTHER","visitor":{...}}
 //                {"type":"visit_position","target":"UR-OTHER","visitor":{...}}
@@ -2069,7 +1821,6 @@ function umbralHandle(ws, payloadStr, prefixed = false) {
   try { m = JSON.parse(String(payloadStr || "")); } catch { m = null; }
   if (!m || typeof m !== "object") return;
   const typ = String(m.type || m.t || "").toLowerCase();
-
   if (typ === "presence" || typ === "peer" || typ === "hello" || typ === "join") {
     const got = umbralRememberPresence(ws, m);
     if (!got || !got.client) return;
@@ -2156,167 +1907,9 @@ try {
   const _umbralSweep = setInterval(umbralCleanRooms, 15000);
   if (_umbralSweep && typeof _umbralSweep.unref === "function") _umbralSweep.unref();
 } catch {}
-// -------------------------------------
-// Illithid Throne shared-world protocol
-// -------------------------------------
-const illithidClients = new Map();
-let illithidJoinSeq = 0;
-const ILLITHID_MAX_PLAYERS = 4;
-const ILLITHID_STATE_MIN_MS = 75;
-const ILLITHID_EVENT_RATE_MAX = 48;
-const ILLITHID_MAX_STATE_BYTES = 768 * 1024;
-const ILLITHID_MAX_EVENT_BYTES = 96 * 1024;
-function illithidSend(ws, packet) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-  try { ws.send(JSON.stringify(packet)); return true; } catch { return false; }
-}
-function illithidLiveClients() {
-  return [...illithidClients.values()].filter(c => c && c.ws && c.ws.readyState === WebSocket.OPEN);
-}
-function illithidHost() {
-  const live = illithidLiveClients().sort((a,b) => a.seq-b.seq);
-  return live.length ? live[0] : null;
-}
-function illithidShade(client) {
-  if (!client) return 160;
-  const shades = [218,204,190,176,162,148,134,120,106,92];
-  return shades[Math.abs(Number(client.seq || 0)) % shades.length];
-}
-function illithidBroadcast(packet, exceptWs=null) {
-  for (const c of illithidLiveClients()) if (c.ws !== exceptWs) illithidSend(c.ws, packet);
-}
-function illithidAnnounceHost() {
-  const host = illithidHost();
-  illithidBroadcast({ t:'host', game:'illithid_throne', id:host ? host.id : '', name:host ? host.name : '', ts:Date.now() });
-}
-function illithidSafeProfile(rawProfile) {
-  rawProfile=(rawProfile&&typeof rawProfile==='object')?rawProfile:{};
-  return {
-    head:Math.max(0,Math.min(99,Number(rawProfile.head||0)|0)),
-    armor_head:String(rawProfile.armor_head||'').replace(/[^a-zA-Z0-9_.:\/-]/g,'').slice(0,160),
-    armor_torso:String(rawProfile.armor_torso||'').replace(/[^a-zA-Z0-9_.:\/-]/g,'').slice(0,160),
-    armor_hands:String(rawProfile.armor_hands||'').replace(/[^a-zA-Z0-9_.:\/-]/g,'').slice(0,160)
-  };
-}
-function illithidSafeBalances(rawBalances) {
-  rawBalances=(rawBalances&&typeof rawBalances==='object')?rawBalances:{};
-  return {
-    matter:Math.max(0,Math.min(1000000000,Number(rawBalances.matter||0)|0)),
-    essence:Math.max(0,Math.min(1000000000,Number(rawBalances.essence||0)|0))
-  };
-}
-function illithidPublicClient(c, host) {
-  return {
-    id:c.id, name:c.name, host:!!host&&host.id===c.id,
-    shade:illithidShade(c), profile:c.profile,
-    balances:c.balances, state:c.state || null
-  };
-}
-function illithidJoin(ws, m) {
-  illithidDetach(ws, true);
-  if (illithidLiveClients().length >= ILLITHID_MAX_PLAYERS) {
-    illithidSend(ws,{t:'party_full',game:'illithid_throne',message:'The current co-op world already holds four Dukes.',online:illithidLiveClients().length,ts:Date.now()});
-    try { ws.close(1008,'illithid co-op party full'); } catch {}
-    return;
-  }
-  const id = String(m.id || '').replace(/[^a-zA-Z0-9_.:-]/g,'').slice(0,80) || `duke-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const name = String(m.name || 'The Duke').replace(/[\r\n\t]/g,' ').replace(/\s+/g,' ').trim().slice(0,48) || 'The Duke';
-  const profile=illithidSafeProfile(m.profile);
-  const balances=illithidSafeBalances(m.balances);
-  const old=illithidClients.get(id);
-  if (old && old.ws && old.ws !== ws) { try { old.ws.close(1008, 'duplicate duke id'); } catch {} }
-  const client = {
-    id, name, ws, seq:++illithidJoinSeq, profile, balances, state:null,
-    lastStateAt:0, eventWindowAt:Date.now(), eventCount:0
-  };
-  illithidClients.set(id, client); ws._illithidId=id;
-  const host=illithidHost();
-  illithidSend(ws,{t:'welcome',game:'illithid_throne',id,name,host:!!host&&host.id===id,host_id:host?host.id:'',shade:illithidShade(client),online:illithidLiveClients().length,max_players:ILLITHID_MAX_PLAYERS,players:illithidLiveClients().map(c=>illithidPublicClient(c,host)),ts:Date.now()});
-  illithidBroadcast({t:'join',game:'illithid_throne',id,name,host:!!host&&host.id===id,shade:illithidShade(client),profile:client.profile,text:'Another shadow lurks...',ts:Date.now()},ws);
-  illithidAnnounceHost();
-}
-function illithidHandle(ws, payload) {
-  let m=null; try { m=JSON.parse(String(payload||'')); } catch { return; }
-  if (!m || typeof m !== 'object') return;
-  const t=String(m.t||m.type||'').toLowerCase();
-  if (t==='join') { illithidJoin(ws,m); return; }
-  const client=illithidClients.get(ws._illithidId); if (!client) return;
-  if (t==='chat') {
-    const text=String(m.text||m.msg||m.message||'').replace(/[\r\n\t]/g,' ').replace(/\s+/g,' ').trim().slice(0,220);
-    if (!text) return;
-    const host=illithidHost();
-    illithidBroadcast({t:'chat',game:'illithid_throne',id:client.id,name:client.name,text,host:!!host&&host.id===client.id,shade:illithidShade(client),ts:Date.now()});
-    return;
-  }
-  if (t==='balance') {
-    client.balances=illithidSafeBalances(m.balances);
-    return;
-  }
-  if (t==='profile') {
-    client.profile=illithidSafeProfile(m.profile);
-    illithidBroadcast({t:'profile',game:'illithid_throne',id:client.id,name:client.name,profile:client.profile,ts:Date.now()},ws);
-    return;
-  }
-  if (t==='gift') {
-    const target=illithidClients.get(String(m.target||''));
-    const resource=String(m.resource||'').toLowerCase();
-    const amount=Math.max(1,Math.min(1000000000,Number(m.amount||0)|0));
-    if (!target || !target.ws || target.ws.readyState!==WebSocket.OPEN || target.id===client.id) { illithidSend(ws,{t:'gift_error',message:'That Duke is no longer within the veil.'}); return; }
-    if (resource!=='matter' && resource!=='essence') { illithidSend(ws,{t:'gift_error',message:'Unknown tribute.'}); return; }
-    if (!client.balances || Number(client.balances[resource]||0)<amount) { illithidSend(ws,{t:'gift_error',message:`You do not possess enough ${resource.toUpperCase()}.`}); return; }
-    client.balances[resource]-=amount; target.balances=target.balances||{matter:0,essence:0}; target.balances[resource]=Math.max(0,Number(target.balances[resource]||0))+amount;
-    illithidSend(ws,{t:'gift_ok',resource,amount,target:target.id,target_name:target.name,balances:client.balances,ts:Date.now()});
-    illithidSend(target.ws,{t:'gift_receive',resource,amount,from:client.id,from_name:client.name,balances:target.balances,ts:Date.now()});
-    return;
-  }
-  if (t==='world_state') {
-    const now=Date.now();
-    if (now-Number(client.lastStateAt||0)<ILLITHID_STATE_MIN_MS) return;
-    if (!m.state || typeof m.state!=='object' || Array.isArray(m.state)) return;
-    let bytes=0; try { bytes=Buffer.byteLength(JSON.stringify(m.state),'utf8'); } catch { return; }
-    if (bytes>ILLITHID_MAX_STATE_BYTES) return;
-    const incoming=Object.assign({},m.state);
-    const legacyHorde=Array.isArray(incoming.horde)?incoming.horde:[];
-    let daemonCount=Number(incoming.daemon_count);
-    if (!Number.isFinite(daemonCount)) {
-      daemonCount=legacyHorde.reduce((n,u)=>n+(u&&typeof u==='object'&&u.loyal!==false&&Number(u.hp||1)>0&&String(u.duty||'FIELD')==='FIELD'?1:0),0);
-    }
-    incoming.daemon_count=Math.max(0,Math.min(999,daemonCount|0));
-    delete incoming.horde;
-    client.lastStateAt=now; client.state=incoming;
-    const host=illithidHost();
-    illithidBroadcast({t:'world_state',game:'illithid_throne',id:client.id,name:client.name,host:!!host&&host.id===client.id,host_id:host?host.id:'',state:client.state,ts:now},ws);
-    return;
-  }
-  if (t==='world_event') {
-    const now=Date.now();
-    if (now-Number(client.eventWindowAt||0)>=1000) { client.eventWindowAt=now; client.eventCount=0; }
-    client.eventCount=Number(client.eventCount||0)+1;
-    if (client.eventCount>ILLITHID_EVENT_RATE_MAX) return;
-    if (!m.event || typeof m.event!=='object' || Array.isArray(m.event)) return;
-    let bytes=0; try { bytes=Buffer.byteLength(JSON.stringify(m.event),'utf8'); } catch { return; }
-    if (bytes>ILLITHID_MAX_EVENT_BYTES) return;
-    illithidBroadcast({t:'world_event',game:'illithid_throne',id:client.id,name:client.name,event:m.event,ts:now},ws);
-    return;
-  }
-  if (t==='request_world') {
-    const host=illithidHost();
-    illithidSend(ws,{t:'world_snapshot',game:'illithid_throne',host_id:host?host.id:'',players:illithidLiveClients().filter(c=>c.id!==client.id).map(c=>illithidPublicClient(c,host)),ts:Date.now()});
-    return;
-  }
-  if (t==='ping') { illithidSend(ws,{t:'pong',game:'illithid_throne',ts:Date.now()}); return; }
-}
-function illithidDetach(ws, silent=false) {
-  const id=ws && ws._illithidId; if (!id) return;
-  const client=illithidClients.get(id); illithidClients.delete(id); try { delete ws._illithidId; } catch {}
-  if (client && !silent) {
-    illithidBroadcast({t:'leave',game:'illithid_throne',id:client.id,name:client.name,host:false,shade:illithidShade(client),text:'A shadow slips beyond the veil...',ts:Date.now()});
-    illithidAnnounceHost();
-  }
-}
-// ----------------------------------------
+// ------------------------------------------
 // LUXBOUND / LYRALAN observer-admin protocol
-// ----------------------------------------
+// ------------------------------------------
 const luxboundPlayers = new Map();
 const luxboundAdmins = new Map();
 const LUXBOUND_STATE_MIN_MS = 120;
@@ -2418,11 +2011,10 @@ function luxboundHandle(ws, payload) {
   if (t === "request_players" && aid) { luxboundSendRoster(ws); return; }
   if (t === "ping") { luxboundSend(ws,{t:"pong",game:"luxbound",ts:Date.now()}); return; }
 }
-
-// ----------------------------------------
+// --------------------------------------------------------------------------
 // SLIMECRAFT Railway player presence
 // Shares mm: framing with MECHMARINER; game:"slimecraft" selects this route.
-// ----------------------------------------
+// --------------------------------------------------------------------------
 const SLIMECRAFT_RAILWAY_PROTOCOL_VERSION = 3;
 const SLIMECRAFT_RAILWAY_MAX_PLAYERS = Math.max(2, Math.min(32, Number(process.env.SLIMECRAFT_RAILWAY_MAX_PLAYERS || 32) || 32));
 const SLIMECRAFT_RAILWAY_PRESENCE_MIN_MS = Math.max(50, Math.min(1000, Number(process.env.SLIMECRAFT_RAILWAY_PRESENCE_MIN_MS || 100) || 100));
@@ -2573,11 +2165,10 @@ function slimecraftRailwayHandle(ws, payload) {
     slimecraftRailwaySend(ws,{t:"pong",game:"slimecraft",protocol_version:SLIMECRAFT_RAILWAY_PROTOCOL_VERSION,ts:Date.now()});
   }
 }
-
-// ----------------------------------------
+// --------------------------------------
 // MECHMARINER shared expedition protocol
 // Protocol prefix: mm:
-// ----------------------------------------
+// --------------------------------------
 const MECHMARINER_PROTOCOL_VERSION = 3;
 const MECHMARINER_MAX_PLAYERS = Math.max(2, Math.min(32, Number(process.env.MECHMARINER_MAX_PLAYERS || 32) || 32));
 const MECHMARINER_PRESENCE_MIN_MS = 50;
@@ -2706,7 +2297,6 @@ function mechmarinerHandle(ws, payload) {
   const client=id ? mechmarinerClients.get(id) : null;
   if (!client || client.ws !== ws) return;
   client.lastSeen=Date.now();
-
   if (t === "presence") {
     const now=Date.now();
     if (now-Number(client.lastPresenceAt || 0) < MECHMARINER_PRESENCE_MIN_MS) return;
@@ -2724,7 +2314,6 @@ function mechmarinerHandle(ws, payload) {
     mechmarinerBroadcast(packet,ws);
     return;
   }
-
   if (t === "chat") {
     const text=mechmarinerClean(m.text,500);
     if (!text) return;
@@ -2736,7 +2325,6 @@ function mechmarinerHandle(ws, payload) {
     mechmarinerBroadcast({t:"chat",game:"mechmariner",id:client.id,name:client.name,text,msg_id:msgId,ts:now},ws);
     return;
   }
-
   if (t === "enemies") {
     mechmarinerChooseAuthority();
     if (client.id !== mechmarinerAuthorityId) return;
@@ -2764,7 +2352,6 @@ function mechmarinerHandle(ws, payload) {
     mechmarinerBroadcast({t:"enemies",game:"mechmariner",id:client.id,name:client.name,authority_id:client.id,items,ts:Date.now()},ws);
     return;
   }
-
   if (t === "enemy_hit") {
     mechmarinerChooseAuthority();
     if (!mechmarinerAuthorityId || client.id === mechmarinerAuthorityId) return;
@@ -2781,7 +2368,6 @@ function mechmarinerHandle(ws, payload) {
     mechmarinerSend(authority.ws,{t:"enemy_hit",game:"mechmariner",id:client.id,name:client.name,uid,damage,hit_id:hitId,ts:now});
     return;
   }
-
   if (t === "enemy_blast") {
     mechmarinerChooseAuthority();
     if (!mechmarinerAuthorityId || client.id === mechmarinerAuthorityId) return;
@@ -2800,7 +2386,6 @@ function mechmarinerHandle(ws, payload) {
     mechmarinerSend(authority.ws,{t:"enemy_blast",game:"mechmariner",id:client.id,name:client.name,x,y,radius,force,blast_id:blastId,ts:now});
     return;
   }
-
   if (t === "enemy_kill_credit") {
     mechmarinerChooseAuthority();
     if (!mechmarinerAuthorityId || client.id !== mechmarinerAuthorityId) return;
@@ -2822,216 +2407,12 @@ function mechmarinerHandle(ws, payload) {
     });
     return;
   }
-
   if (t === "request_roster") { mechmarinerSend(ws,mechmarinerRosterPacket("roster")); return; }
   if (t === "ping") { mechmarinerSend(ws,{t:"pong",game:"mechmariner",protocol_version:MECHMARINER_PROTOCOL_VERSION,authority_id:mechmarinerAuthorityId,ts:Date.now()}); return; }
 }
-
-// ----------------------------------
-// Shared WebSocket connection router
-// ----------------------------------
-
-// ----------------------------------------
-// A STRANGE PLACE persistent REALM protocol
-// Protocol prefix: asp:
-// Shared by design: player presence/stats, quest/collision objects, enemy state.
-// Incidental local scenery/weather is intentionally NOT relayed.
-// ----------------------------------------
-const ASTRANGEPLACE_MAX_PLAYERS = Math.max(2, Math.min(64, Number(process.env.ASTRANGEPLACE_MAX_PLAYERS || 32) || 32));
-const ASTRANGEPLACE_PRESENCE_MIN_MS = 20;
-const strangePlaceClients = new Map();
-let strangePlaceJoinOrder = [];
-let strangePlaceAuthorityId = "";
-const strangePlaceStateFile = String(process.env.ASTRANGEPLACE_STATE_FILE || path.join(process.cwd(), "a_strange_place_state.json"));
-let strangePlaceWorld = { version: 1, objects: {}, enemies: {}, updated_at: Date.now() };
-let strangePlaceSaveTimer = null;
-function strangePlaceClean(v, max=96) {
-  return String(v == null ? "" : v).replace(/[\r\n\t]/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
-}
-function strangePlaceSafeId(v) {
-  return strangePlaceClean(v, 96).replace(/[^A-Za-z0-9_.-]/g, "");
-}
-function strangePlaceFinite(v, fallback=0, limit=1000000) {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return Number(fallback) || 0;
-  return Math.max(-limit, Math.min(limit, n));
-}
-function strangePlaceAttackMods(v) {
-  const src = v && typeof v === "object" && !Array.isArray(v) ? v : {};
-  const out = {};
-  for (const [rawId, rawBonus] of Object.entries(src)) {
-    const id = strangePlaceSafeId(rawId);
-    if (!id || Object.keys(out).length >= 64) continue;
-    out[id] = Math.max(0, Math.min(99, Math.round(strangePlaceFinite(rawBonus,0,99))));
-  }
-  return out;
-}
-function strangePlaceSend(ws, packet) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-  try { ws.send("asp:" + JSON.stringify(packet)); return true; } catch { return false; }
-}
-function strangePlaceBroadcast(packet, exclude=null) {
-  for (const c of strangePlaceClients.values()) {
-    if (!c || !c.ws || c.ws === exclude || c.ws.readyState !== WebSocket.OPEN) continue;
-    strangePlaceSend(c.ws, packet);
-  }
-}
-function strangePlaceChooseAuthority() {
-  strangePlaceJoinOrder = strangePlaceJoinOrder.filter(id => strangePlaceClients.has(id));
-  if (!strangePlaceAuthorityId || !strangePlaceClients.has(strangePlaceAuthorityId)) {
-    strangePlaceAuthorityId = strangePlaceJoinOrder[0] || "";
-    strangePlaceBroadcast({t:"authority",game:"a_strange_place",id:strangePlaceAuthorityId});
-  }
-  return strangePlaceAuthorityId;
-}
-function strangePlacePlayerPacket(c) {
-  if (!c) return null;
-  return { id:c.id, name:c.name || "Nobody", role:c.role || "Janus", x:c.x || 0, y:c.y || 0,
-    level:c.level || 1, xp:c.xp || 0, hp:c.hp || 0, max_hp:c.max_hp || 0, ac:c.ac || 10,
-    stats:c.stats || {}, broom_head:c.broom_head || "", staff_state:c.staff_state || "", ts:c.lastPresence || Date.now() };
-}
-function strangePlaceRoster() {
-  return [...strangePlaceClients.values()].map(strangePlacePlayerPacket).filter(Boolean);
-}
-function strangePlaceLoadWorld() {
-  try {
-    if (!fs.existsSync(strangePlaceStateFile)) return;
-    const parsed = JSON.parse(fs.readFileSync(strangePlaceStateFile, "utf8"));
-    if (!parsed || typeof parsed !== "object") return;
-    strangePlaceWorld = {
-      version: Math.max(1, Number(parsed.version || 1) || 1),
-      objects: parsed.objects && typeof parsed.objects === "object" ? parsed.objects : {},
-      enemies: parsed.enemies && typeof parsed.enemies === "object" ? parsed.enemies : {},
-      updated_at: Number(parsed.updated_at || Date.now()) || Date.now()
-    };
-  } catch (err) { console.warn("A STRANGE PLACE state load failed:", err && err.message ? err.message : err); }
-}
-function strangePlaceSaveWorldSoon() {
-  strangePlaceWorld.updated_at = Date.now();
-  if (strangePlaceSaveTimer) return;
-  strangePlaceSaveTimer = setTimeout(() => {
-    strangePlaceSaveTimer = null;
-    try {
-      const dir = path.dirname(strangePlaceStateFile);
-      try { fs.mkdirSync(dir, {recursive:true}); } catch {}
-      const tmp = strangePlaceStateFile + ".tmp";
-      fs.writeFileSync(tmp, JSON.stringify(strangePlaceWorld));
-      fs.renameSync(tmp, strangePlaceStateFile);
-    } catch (err) { console.warn("A STRANGE PLACE state save failed:", err && err.message ? err.message : err); }
-  }, 300);
-  try { if (strangePlaceSaveTimer && typeof strangePlaceSaveTimer.unref === "function") strangePlaceSaveTimer.unref(); } catch {}
-}
-strangePlaceLoadWorld();
-function strangePlaceDetach(ws, broadcast=true) {
-  const id = ws && ws._strangePlaceId ? String(ws._strangePlaceId) : "";
-  if (!id) return;
-  const c = strangePlaceClients.get(id);
-  if (c && c.ws === ws) strangePlaceClients.delete(id);
-  try { delete ws._strangePlaceId; } catch {}
-  strangePlaceJoinOrder = strangePlaceJoinOrder.filter(x => x !== id);
-  if (broadcast) strangePlaceBroadcast({t:"leave",game:"a_strange_place",id,ts:Date.now()});
-  if (strangePlaceAuthorityId === id) strangePlaceAuthorityId = "";
-  strangePlaceChooseAuthority();
-}
-function strangePlaceSanitizeStats(stats) {
-  const src = stats && typeof stats === "object" ? stats : {};
-  const out = {};
-  for (const k of ["str","dex","con","int","wis","cha"]) out[k] = Math.max(1, Math.min(30, Math.round(strangePlaceFinite(src[k],10,30))));
-  return out;
-}
-function strangePlaceApplyPresence(c, m) {
-  c.name = strangePlaceClean(m.name || c.name || "Nobody", 32) || "Nobody";
-  c.role = strangePlaceClean(m.role || c.role || "Janus", 32) || "Janus";
-  c.x = strangePlaceFinite(m.x, c.x || 0, 512); c.y = strangePlaceFinite(m.y, c.y || 0, 512);
-  c.level = Math.max(1, Math.min(99, Math.round(strangePlaceFinite(m.level,c.level || 1,99))));
-  c.xp = Math.max(0, Math.round(strangePlaceFinite(m.xp,c.xp || 0,1000000000)));
-  c.hp = Math.round(strangePlaceFinite(m.hp,c.hp || 0,1000000));
-  c.max_hp = Math.max(1, Math.round(strangePlaceFinite(m.max_hp,c.max_hp || 1,1000000)));
-  c.ac = Math.max(1, Math.min(99, Math.round(strangePlaceFinite(m.ac,c.ac || 10,99))));
-  c.stats = strangePlaceSanitizeStats(m.stats || c.stats);
-  c.broom_head = strangePlaceClean(m.broom_head || c.broom_head,48);
-  c.staff_state = strangePlaceClean(m.staff_state || c.staff_state,48);
-  c.lastPresence = Date.now();
-}
-function strangePlaceHandle(ws, payload) {
-  let m = null;
-  try { m = typeof payload === "string" ? JSON.parse(payload) : JSON.parse(String(payload || "")); } catch { return; }
-  if (!m || typeof m !== "object") return;
-  const t = String(m.t || m.type || "").toLowerCase();
-  if (t === "hello" || t === "join") {
-    let id = strangePlaceSafeId(m.id);
-    if (!id) id = "ASP-" + rid();
-    const existing = strangePlaceClients.get(id);
-    if (existing && existing.ws && existing.ws !== ws) { try { existing.ws.close(); } catch {} strangePlaceClients.delete(id); }
-    if (!existing && strangePlaceClients.size >= ASTRANGEPLACE_MAX_PLAYERS) { strangePlaceSend(ws,{t:"error",code:"realm_full",message:"The REALM is full."}); return; }
-    strangePlaceDetach(ws, false);
-    const c = {id, ws, name:"Nobody", role:"Janus", x:36, y:256, level:1, xp:0, hp:10, max_hp:10, ac:12, stats:{}, lastPresence:Date.now()};
-    strangePlaceApplyPresence(c,m);
-    strangePlaceClients.set(id,c); ws._strangePlaceId=id; strangePlaceJoinOrder.push(id); strangePlaceChooseAuthority();
-    strangePlaceSend(ws,{t:"welcome",game:"a_strange_place",id,authority_id:strangePlaceAuthorityId,players:strangePlaceRoster(),world:strangePlaceWorld,ts:Date.now()});
-    strangePlaceBroadcast({t:"peer",game:"a_strange_place",...strangePlacePlayerPacket(c)},ws);
-    return;
-  }
-  const id = ws && ws._strangePlaceId ? String(ws._strangePlaceId) : strangePlaceSafeId(m.id);
-  const c = id ? strangePlaceClients.get(id) : null;
-  if (!c || c.ws !== ws) { strangePlaceSend(ws,{t:"error",code:"not_joined",message:"Send asp: hello first."}); return; }
-  if (t === "presence") {
-    const now=Date.now(); if (now-(c.lastPresence || 0) < ASTRANGEPLACE_PRESENCE_MIN_MS) return;
-    strangePlaceApplyPresence(c,m); strangePlaceBroadcast({t:"presence",game:"a_strange_place",...strangePlacePlayerPacket(c)},ws); return;
-  }
-  if (t === "request_world" || t === "sync") { strangePlaceSend(ws,{t:"world_snapshot",game:"a_strange_place",world:strangePlaceWorld,players:strangePlaceRoster(),authority_id:strangePlaceAuthorityId,ts:Date.now()}); return; }
-  if (t === "object_state") {
-    const oid=strangePlaceSafeId(m.id); const state=strangePlaceClean(m.state,64); if (!oid || !state) return;
-    if (Object.keys(strangePlaceWorld.objects).length >= 2048 && !(oid in strangePlaceWorld.objects)) return;
-    strangePlaceWorld.objects[oid]=state; strangePlaceSaveWorldSoon(); strangePlaceBroadcast({t:"object_state",game:"a_strange_place",id:oid,state,by:c.id,ts:Date.now()}); return;
-  }
-  if (t === "enemy_state") {
-    const eid=strangePlaceSafeId(m.id); const st=m.state && typeof m.state === "object" ? m.state : m; if (!eid) return;
-    if (Object.keys(strangePlaceWorld.enemies).length >= 4096 && !(eid in strangePlaceWorld.enemies)) return;
-    const prev = strangePlaceWorld.enemies[eid] && typeof strangePlaceWorld.enemies[eid] === "object" ? strangePlaceWorld.enemies[eid] : {};
-    const clean = {
-      species:strangePlaceClean(st.species || prev.species,32),x:strangePlaceFinite(st.x,prev.x || 0,512),y:strangePlaceFinite(st.y,prev.y || 0,512),
-      hp:Math.round(strangePlaceFinite(st.hp,prev.hp || 0,1000000)),alive:!!st.alive,
-      role:strangePlaceClean(st.role || prev.role,48),sprite_path:strangePlaceClean(st.sprite_path || prev.sprite_path,240),
-      attack_sprite_path:strangePlaceClean(st.attack_sprite_path || prev.attack_sprite_path,240),display_name:strangePlaceClean(st.display_name || prev.display_name,96),
-      damage:Math.max(0,Math.round(strangePlaceFinite(st.damage,prev.damage || 0,1000000))),scale:Math.max(0.01,Math.min(8,strangePlaceFinite(st.scale,prev.scale || 1,8))),
-      non_hostile:(st.non_hostile === undefined ? !!prev.non_hostile : !!st.non_hostile),invulnerable:(st.invulnerable === undefined ? !!prev.invulnerable : !!st.invulnerable),group:strangePlaceClean(st.group || prev.group,64),master_id:strangePlaceSafeId(st.master_id || prev.master_id)
-    };
-    clean.anchor_x=strangePlaceFinite(st.anchor_x,prev.anchor_x === undefined ? clean.x : prev.anchor_x,512);
-    clean.anchor_y=strangePlaceFinite(st.anchor_y,prev.anchor_y === undefined ? clean.y : prev.anchor_y,512);
-    clean.max_hp=Math.max(1,Math.round(strangePlaceFinite(st.max_hp,prev.max_hp || Math.max(1,clean.hp),1000000)));
-    clean.ac=Math.max(1,Math.min(99,Math.round(strangePlaceFinite(st.ac,prev.ac || 10,99))));
-    clean.level=Math.max(1,Math.min(99,Math.round(strangePlaceFinite(st.level,prev.level || 1,99))));
-    clean.xp=Math.max(0,Math.round(strangePlaceFinite(st.xp,prev.xp || 0,1000000000)));
-    clean.sex=/^[FM]$/.test(String(st.sex === undefined ? prev.sex || "" : st.sex).toUpperCase()) ? String(st.sex === undefined ? prev.sex || "" : st.sex).toUpperCase() : "";
-    clean.born_at=strangePlaceFinite(st.born_at,prev.born_at || 0,10000000000000);
-    clean.generation=Math.max(0,Math.min(9999,Math.round(strangePlaceFinite(st.generation,prev.generation || 0,9999))));
-    clean.dynamic_spawn=(st.dynamic_spawn === undefined ? !!prev.dynamic_spawn : !!st.dynamic_spawn);
-    clean.ecology_state=strangePlaceClean(st.ecology_state === undefined ? prev.ecology_state : st.ecology_state,32);
-    clean.mate_id=strangePlaceSafeId(st.mate_id === undefined ? prev.mate_id : st.mate_id);
-    clean.breed_ready_at=strangePlaceFinite(st.breed_ready_at,prev.breed_ready_at || 0,10000000000000);
-    clean.gestation_until=strangePlaceFinite(st.gestation_until,prev.gestation_until || 0,10000000000000);
-    clean.nursery_x=strangePlaceFinite(st.nursery_x,prev.nursery_x || 0,512);
-    clean.nursery_y=strangePlaceFinite(st.nursery_y,prev.nursery_y || 0,512);
-    clean.respawn_at=strangePlaceFinite(st.respawn_at,prev.respawn_at || 0,10000000000000);
-    const mergedMods = Object.assign({}, strangePlaceAttackMods(prev.absorbed_attack_mods), strangePlaceAttackMods(st.absorbed_attack_mods));
-    if (Object.keys(mergedMods).length) {
-      clean.absorbed_attack_mods = mergedMods;
-      if (clean.species === "harpy_king" || clean.role === "harpy_king") clean.damage = 15 + Object.values(mergedMods).reduce((a,b)=>a+b,0);
-    }
-    strangePlaceWorld.enemies[eid]=clean; strangePlaceSaveWorldSoon(); strangePlaceBroadcast({t:"enemy_state",game:"a_strange_place",id:eid,state:clean,by:c.id,ts:Date.now()}); return;
-  }
-  if (t === "chat") {
-    const text=strangePlaceClean(m.text,420); if (!text) return;
-    strangePlaceBroadcast({t:"chat",game:"a_strange_place",id:c.id,name:c.name,text,ts:Date.now()}); return;
-  }
-  if (t === "ping") { strangePlaceSend(ws,{t:"pong",game:"a_strange_place",ts:Date.now()}); return; }
-}
-
-
-// --------------------------------------------------------------
+// ----------------------------------------------------------
 // KRON authoritative Python-server Railway bridge (kron:...)
-// --------------------------------------------------------------
+// ----------------------------------------------------------
 // The public Node process is transport only. One KRON Python server registers
 // as the room host; game clients register as clients. Requests are forwarded to
 // that host and replies are routed back to the originating client. Persistence,
@@ -3094,7 +2475,6 @@ function kronHandle(ws, payloadStr) {
   const t = String(m.t || m.type || "").toLowerCase();
   const roomName = safeRoomId(m.room || ws._kronRoom || "kron", "kron");
   let room = kronRoom(roomName);
-
   if (t === "host") {
     if (!kronSecretOK(m.secret)) { kronSend(ws,{t:"error",game:"kron",code:"host_auth",message:"KRON relay host authentication failed."}); return; }
     const incomingHostId = kronToken(m.host_id, "KH-" + rid());
@@ -3118,7 +2498,6 @@ function kronHandle(ws, payloadStr) {
     for (const c of room.clients.values()) kronSend(c,{t:"host_online",game:"kron",room:room.name,ts:Date.now()});
     return;
   }
-
   if (t === "hello") {
     kronDetach(ws, true);
     room = kronRoom(roomName);
@@ -3132,7 +2511,6 @@ function kronHandle(ws, payloadStr) {
     kronSend(ws,{t:"welcome",game:"kron",room:room.name,client_id:cid,host_online:!!(room.host && room.host.readyState===WebSocket.OPEN),ts:Date.now()});
     return;
   }
-
   if (t === "request") {
     const cid = String(ws._kronClientId || "");
     if (ws._kronRole !== "client" || !cid || room.clients.get(cid) !== ws) {
@@ -3153,7 +2531,6 @@ function kronHandle(ws, payloadStr) {
     kronSend(room.host,{t:"request",game:"kron",room:room.name,client_id:cid,req_id:reqId,payload,ts:Date.now()});
     return;
   }
-
   if (t === "reply") {
     if (ws._kronRole !== "host" || room.host !== ws) return;
     const cid = kronToken(m.client_id, "");
@@ -3164,7 +2541,6 @@ function kronHandle(ws, payloadStr) {
     kronSend(target,{t:"reply",game:"kron",room:room.name,req_id:reqId,payload,ts:Date.now()});
     return;
   }
-
   if (t === "ping") { kronSend(ws,{t:"pong",game:"kron",room:room.name,host_online:!!(room.host && room.host.readyState===WebSocket.OPEN),ts:Date.now()}); return; }
   kronSend(ws,{t:"error",game:"kron",code:"unknown_type",message:"Unknown KRON relay packet."});
 }
@@ -3185,11 +2561,9 @@ function handleKronHTTP(req, res) {
     return true;
   } catch { return false; }
 }
-
-
-// --------------------------------------------------------------
+// ---------------------------------------------------------------
 // SHEOL authoritative TRENCHMIND / NPC Railway bridge (sheol:...)
-// --------------------------------------------------------------
+// ---------------------------------------------------------------
 // server_app.py is the single authority for HUTCH resident identity, memory,
 // story state and local Qwen inference. This Node service is transport only:
 // WAN players register as clients and their requests are forwarded to the same
@@ -3308,16 +2682,13 @@ function handleSheolHTTP(req, res) {
     res.writeHead(200,{"content-type":"application/json","cache-control":"no-store"}); res.end(body); return true;
   } catch { return false; }
 }
-
 function detachAllProtocols(ws) {
   try { almightyPythonDetach(ws, true); } catch {}
   try { umbralDetach(ws, true); } catch {}
   try { growthDetach(ws); } catch {}
-  try { illithidDetach(ws); } catch {}
   try { luxboundDetach(ws); } catch {}
   try { mechmarinerDetach(ws); } catch {}
   try { slimecraftRailwayDetach(ws, true); } catch {}
-  try { strangePlaceDetach(ws, true); } catch {}
   try { kronDetach(ws, true); } catch {}
   try { sheolDetach(ws, true); } catch {}
 }
@@ -3332,7 +2703,6 @@ function routeSocketMessage(ws, data) {
   if (raw.startsWith("ap:")) { almightyPythonHandle(ws, raw.slice(3)); return; }
   if (raw.startsWith("ur:")) { umbralHandle(ws, raw.slice(3), true); return; }
   if (raw.startsWith("gf:")) { growthHandle(ws, raw.slice(3)); return; }
-  if (raw.startsWith("it:")) { illithidHandle(ws, raw.slice(3)); return; }
   if (raw.startsWith("lb:")) { luxboundHandle(ws, raw.slice(3)); return; }
   if (raw.startsWith("mm:")) {
     const mmPayload = raw.slice(3);
@@ -3342,7 +2712,6 @@ function routeSocketMessage(ws, data) {
     if (mmGame === "slimecraft" || mmGame === "slime_craft" || mmGame === "sc") { slimecraftRailwayHandle(ws, mmPayload); return; }
     mechmarinerHandle(ws, mmPayload); return;
   }
-  if (raw.startsWith("asp:")) { strangePlaceHandle(ws, raw.slice(4)); return; }
   if (raw.startsWith("kron:")) { kronHandle(ws, raw.slice(5)); return; }
   if (raw.startsWith("sheol:")) { sheolHandle(ws, raw.slice(6)); return; }
   // Legacy/no-prefix fallback.
@@ -3353,11 +2722,9 @@ function routeSocketMessage(ws, data) {
     if (game === "almighty_python" || game === "almighty" || game === "ap") { almightyPythonHandle(ws, raw); return; }
     if (game === "umbral" || game === "umbral_rail" || game === "house_nocturne" || game === "vespera" || game === "ur") { umbralHandle(ws, raw, false); return; }
     if (game === "growth" || game === "gf") { growthHandle(ws, raw); return; }
-    if (game === "illithid_throne" || game === "illithid" || game === "it") { illithidHandle(ws, raw); return; }
     if (game === "luxbound" || game === "lyralan" || game === "lb") { luxboundHandle(ws, raw); return; }
     if (game === "mechmariner" || game === "mm") { mechmarinerHandle(ws, raw); return; }
     if (game === "slimecraft" || game === "slime_craft" || game === "sc") { slimecraftRailwayHandle(ws, raw); return; }
-    if (game === "a_strange_place" || game === "strange_place" || game === "asp") { strangePlaceHandle(ws, raw); return; }
     if (game === "kron" || game === "kr") { kronHandle(ws, raw); return; }
     if (game === "sheol" || game === "sh") { sheolHandle(ws, raw); return; }
     const t = String(m.t || m.type || "").toLowerCase();
@@ -3366,11 +2733,10 @@ function routeSocketMessage(ws, data) {
       return;
     }
   }
-  try { ws.send(JSON.stringify({ type: "error", code: "unsupported_protocol", message: "Use Almighty Python, House Nocturne, GROWTH, Illithid Throne, LUXBOUND, SLIMECRAFT, MECHMARINER, A STRANGE PLACE, KRON, or SHEOL protocol routing." })); } catch {}
+  try { ws.send(JSON.stringify({ type: "error", code: "unsupported_protocol", message: "Use Almighty Python, House Nocturne, GROWTH, LUXBOUND, SLIMECRAFT, MECHMARINER, KRON, or SHEOL protocol routing." })); } catch {}
 }
-wss.on("connection", (ws, req) => {
+wss.on("connection", (ws) => {
   ws.isAlive = true;
-  ws._ip = pickIP(req) || "";
   ws.on("pong", () => { ws.isAlive = true; });
   ws.on("ping", () => { ws.isAlive = true; });
   ws.on("message", (data) => {
@@ -3382,8 +2748,8 @@ wss.on("connection", (ws, req) => {
   ws.on("close", () => { detachAllProtocols(ws); });
   ws.on("error", () => { detachAllProtocols(ws); });
 });
-// --------------------------------------------------------------
+// --------------------------------------------------------------------------------------------------------------------------------------------------
 server.listen(PORT, HOST, () => {
-  console.log("Dedset relay (Almighty Python / GROWTH / House Nocturne / Illithid Throne / LUXBOUND / SLIMECRAFT / MECHMARINER / A STRANGE PLACE / KRON / SHEOL) on", HOST + ":" + PORT);
+  console.log("Dedset relay (Almighty Python / GROWTH / House Nocturne / LUXBOUND / SLIMECRAFT / MECHMARINER / KRON / SHEOL) on", HOST + ":" + PORT);
   if (MEGA_CLAIM_REQUIRE_AUTH && !MEGA_CLAIM_SECRET) console.warn("MEGA claim endpoint is locked until MEGA_CLAIM_SECRET is configured.");
 });
