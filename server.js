@@ -1,4 +1,4 @@
-// server.js - supports Almighty Python, GROWTH, House Nocturne,
+// server.js - supports Almighty Python, GROWTH, House Nocturne, Requiem of a Pilgrimage
 // LUXBOUND, MECHMARINER, Slimecraft, KRON & SHEOL. One process, one port, isolated rooms by game.
 // https://raw.githubusercontent.com/tribehunt/nodejs/refs/heads/main/server.js
 // all games produced and engineered by © Dedset Media 08/31/2026
@@ -14,14 +14,24 @@ const pilgrim = (() => {
 // Requiem of a Pilgrimage: server-only geography and authoritative shared state.
 
 const dir=path.join(__dirname,'data');
-if (!fs.existsSync(dir)) fs.mkdirSync(dir,{recursive:true});
-const world=JSON.parse(fs.readFileSync(path.join(dir,'pilgrim_world.json'),'utf8'));
+const worldPath=path.join(dir,'pilgrim_world.json');
+let world=null;
+let worldLoadError='';
+function ensureWorld(){
+ if(world)return true;
+ try {
+  const parsed=JSON.parse(fs.readFileSync(worldPath,'utf8'));
+  if(!parsed||!Array.isArray(parsed.cells)||!Array.isArray(parsed.regions)||!Array.isArray(parsed.static_encounters)||!parsed.church||!parsed.church.head_bishop)throw new Error('invalid pilgrimage world schema');
+  world=parsed;worldLoadError='';return true;
+ }catch(err){worldLoadError=String(err.code||err.message||err);return false;}
+} 
+
 const statePath=path.join(dir,'pilgrim_state.json');
 let state={schema:1,revision:0,church_banked_provisions:0,donations:{},blessings:{},encounters:{},ledger:[]};
 try {const saved=JSON.parse(fs.readFileSync(statePath,'utf8'));if(saved&&saved.schema===1)state={...state,...saved};}catch(e){if(e.code!=='ENOENT')throw e;}
 let sockets=new Map();let recentChat=[];
 const open=ws=>ws&&ws.readyState===1;
-function save(){state.revision++;const tmp=statePath+'.'+process.pid+'.tmp';fs.writeFileSync(tmp,JSON.stringify(state));fs.renameSync(tmp,statePath);}
+function save(){fs.mkdirSync(dir,{recursive:true});state.revision++;const tmp=statePath+'.'+process.pid+'.tmp';fs.writeFileSync(tmp,JSON.stringify(state));fs.renameSync(tmp,statePath);}
 function send(ws,o){if(open(ws))ws.send('pilgrim:'+JSON.stringify({game:'pilgrim',...o}));}
 function publicPlayer(p){return {id:p.id,name:p.name,x:p.x,y:p.y,in_church:p.in_church};}
 function churchPlayers(){return [...sockets.values()].filter(p=>p.in_church&&open(p.ws)).map(publicPlayer);}
@@ -32,7 +42,7 @@ function rid(){return crypto.randomBytes(8).toString('hex');}
 function clean(s,n){return String(s||'').replace(/[\x00-\x1f\x7f]/g,'').trim().slice(0,n);}
 function error(ws,code){send(ws,{t:'error',code});}
 function detach(ws){const p=ws._pilgrim;if(!p)return;if(sockets.get(p.id)===p){sockets.delete(p.id);if(p.in_church)broadcast({t:'presence',players:churchPlayers()},true);}delete ws._pilgrim;}
-function handle(ws,raw){let m;try{m=JSON.parse(raw);}catch{return error(ws,'invalid_json');}if(!m||typeof m!=='object'||Array.isArray(m))return;
+function handle(ws,raw){if(!ensureWorld())return error(ws,'world_unavailable');let m;try{m=JSON.parse(raw);}catch{return error(ws,'invalid_json');}if(!m||typeof m!=='object'||Array.isArray(m))return;
  const t=clean(m.t||m.type,32);if(t==='hello'){
   const id=clean(m.player_id,64);if(!/^[a-zA-Z0-9_-]{8,64}$/.test(id))return error(ws,'player_id_required');
   detach(ws);const old=sockets.get(id);if(old){detach(old.ws);try{old.ws.close();}catch{}}
@@ -54,7 +64,7 @@ function handle(ws,raw){let m;try{m=JSON.parse(raw);}catch{return error(ws,'inva
  if(t==='encounter_status'){const id=clean(m.encounter_id,64);const found=world.static_encounters.find(e=>e.id===id);if(!found)return error(ws,'unknown_encounter');return send(ws,{t:'encounter_status',encounter:found,completed:!!state.encounters[id]});}
  if(t==='ping')return send(ws,{t:'pong',ts:now});error(ws,'unknown_type');
 }
-function http(req,res){const url=new URL(req.url||'/','http://localhost');if(url.pathname!=='/pilgrim'&&url.pathname!=='/api/pilgrim')return false;res.writeHead(200,{'content-type':'application/json','cache-control':'no-store'});res.end(JSON.stringify({ok:true,game:'pilgrim',world_id:world.world_id,world_cells:world.cells.length,encounters:world.static_encounters.length,church:world.church.name,economy:economy(),online:sockets.size}));return true;}
+function http(req,res){const url=new URL(req.url||'/','http://localhost');if(url.pathname!=='/pilgrim'&&url.pathname!=='/api/pilgrim')return false;if(!ensureWorld()){res.writeHead(503,{'content-type':'application/json','cache-control':'no-store'});res.end(JSON.stringify({ok:false,game:'pilgrim',error:'world_unavailable',detail:worldLoadError}));return true;}res.writeHead(200,{'content-type':'application/json','cache-control':'no-store'});res.end(JSON.stringify({ok:true,game:'pilgrim',world_id:world.world_id,world_cells:world.cells.length,encounters:world.static_encounters.length,church:world.church.name,economy:economy(),online:sockets.size}));return true;}
 return {handle,detach,http};
 })();
 // ==== END PILGRIMAGE ====
