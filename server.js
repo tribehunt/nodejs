@@ -50,6 +50,40 @@ function handle(ws,raw){if(!ensureWorld())return error(ws,'world_unavailable');l
  }
  const p=ws._pilgrim;if(!p||sockets.get(p.id)!==p)return error(ws,'not_authenticated');
  const now=Date.now();if(now-p.lastAction<80)return error(ws,'rate_limited');p.lastAction=now;
+
+ // Persistent server-issued pilgrimage positions. The client never chooses terrain or fixed encounters.
+ if(t==='journey_status'||t==='journey_begin'||t==='journey_advance'){
+  const routes=['open_field','haunted_forest','wasteland','miasma_marsh'];
+  const route=clean(m.route,40);
+  if(!routes.includes(route))return error(ws,'unknown_pilgrimage_route');
+  state.journeys=state.journeys||{};
+  const previous=state.journeys[p.id]||{};
+  if(t==='journey_begin'||(t==='journey_status'&&previous.route!==route)){
+   const routeIndex=routes.indexOf(route);
+   const routePrefix=routeIndex*16;
+   state.journeys[p.id]={route,step:0,started_at:now,region_start:routePrefix};save();
+  }else if(previous.route!==route){return error(ws,'journey_not_started');}
+  const journey=state.journeys[p.id];
+  if(t==='journey_advance'){
+   const requested=Number(m.expected_step);
+   if(!Number.isSafeInteger(requested)||requested!==journey.step)return error(ws,'journey_step_mismatch');
+   if(journey.step<64){journey.step++;save();}
+  }
+  const step=journey.step;
+  const ri=routes.indexOf(route);
+  const region=world.regions[ri*16+Math.min(15,Math.floor(Math.max(0,step-1)/4))];
+  const cells=world.cells.filter(c=>c.region===region.id).sort((a,b)=>a.id.localeCompare(b.id));
+  const index=Math.min(cells.length-1,Math.max(0,((Math.max(0,step-1)%4)*17+ri*7)%cells.length));
+  const cell=cells[index];
+  const fixed=world.static_encounters.find(e=>e.cell===cell.id)||null;
+  const eventKeys=['bridge','pilgrims','ambush','plague','relic','storm','merchant','deserters'];
+  const seed=(ri*131+step*19+Math.round(cell.hazard*100))>>>0;
+  const encounter=(step>0&&step<64)?{key:eventKeys[seed%eventKeys.length],fixed_id:fixed?fixed.id:null,kind:fixed?fixed.type:null}:null;
+  return send(ws,{t:'journey_step',route,step,total_steps:64,arrived:step>=64,
+   region:{id:region.id,name:region.name,biome:region.biome,danger_tier:region.danger_tier},
+   cell:{id:cell.id,x:cell.x,y:cell.y,biome:cell.biome,hazard:cell.hazard,road:cell.road,river:cell.river},
+   encounter,world_id:world.world_id});
+ }
  if(t==='world'){send(ws,{t:'world',world:{...world,cells:undefined,static_encounters:undefined}});return;}
  if(t==='economy'){send(ws,{t:'economy',economy:economy()});return;}
  if(t==='region'){const id=clean(m.region_id,64);const region=world.regions.find(r=>r.id===id);if(!region)return error(ws,'unknown_region');send(ws,{t:'region',region,cells:world.cells.filter(c=>c.region===id),encounters:world.static_encounters.filter(e=>{const cell=world.cells.find(c=>c.id===e.cell);return cell&&cell.region===id;})});return;}
