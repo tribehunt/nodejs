@@ -8,9 +8,61 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const WebSocket = require("ws");
+
+// ==== REQUIEM OF A PILGRIMAGE: SERVER-AUTHORITATIVE WORLD / CHURCH ====
+const pilgrim = (() => {
+// Requiem of a Pilgrimage: server-only geography and authoritative shared state.
+
+const dir=path.join(__dirname,'data');
+if (!fs.existsSync(dir)) fs.mkdirSync(dir,{recursive:true});
+const world=JSON.parse(fs.readFileSync(path.join(dir,'pilgrim_world.json'),'utf8'));
+const statePath=path.join(dir,'pilgrim_state.json');
+let state={schema:1,revision:0,church_banked_provisions:0,donations:{},blessings:{},encounters:{},ledger:[]};
+try {const saved=JSON.parse(fs.readFileSync(statePath,'utf8'));if(saved&&saved.schema===1)state={...state,...saved};}catch(e){if(e.code!=='ENOENT')throw e;}
+let sockets=new Map();let recentChat=[];
+const open=ws=>ws&&ws.readyState===1;
+function save(){state.revision++;const tmp=statePath+'.'+process.pid+'.tmp';fs.writeFileSync(tmp,JSON.stringify(state));fs.renameSync(tmp,statePath);}
+function send(ws,o){if(open(ws))ws.send('pilgrim:'+JSON.stringify({game:'pilgrim',...o}));}
+function publicPlayer(p){return {id:p.id,name:p.name,x:p.x,y:p.y,in_church:p.in_church};}
+function churchPlayers(){return [...sockets.values()].filter(p=>p.in_church&&open(p.ws)).map(publicPlayer);}
+function broadcast(o,onlyChurch=false){for(const p of sockets.values())if(!onlyChurch||p.in_church)send(p.ws,o);}
+function economy(){return {banked_provisions:state.church_banked_provisions,donations_count:state.ledger.length,revision:state.revision};}
+function snapshot(p){return {t:'welcome',world:{id:world.world_id,title:world.title,extent:world.extent,regions:world.regions,biomes:world.biomes,church:world.church,sites:world.sites,encounter_count:world.static_encounters.length},economy:economy(),players:churchPlayers(),chat:recentChat,server_hour:Math.floor(Date.now()/3600000),next_blessing_hour:(state.blessings[p.id]||-1)+1};}
+function rid(){return crypto.randomBytes(8).toString('hex');}
+function clean(s,n){return String(s||'').replace(/[\x00-\x1f\x7f]/g,'').trim().slice(0,n);}
+function error(ws,code){send(ws,{t:'error',code});}
+function detach(ws){const p=ws._pilgrim;if(!p)return;if(sockets.get(p.id)===p){sockets.delete(p.id);if(p.in_church)broadcast({t:'presence',players:churchPlayers()},true);}delete ws._pilgrim;}
+function handle(ws,raw){let m;try{m=JSON.parse(raw);}catch{return error(ws,'invalid_json');}if(!m||typeof m!=='object'||Array.isArray(m))return;
+ const t=clean(m.t||m.type,32);if(t==='hello'){
+  const id=clean(m.player_id,64);if(!/^[a-zA-Z0-9_-]{8,64}$/.test(id))return error(ws,'player_id_required');
+  detach(ws);const old=sockets.get(id);if(old){detach(old.ws);try{old.ws.close();}catch{}}
+  const p={ws,id,name:clean(m.name,36)||'Pilgrim',x:world.church.x,y:world.church.y,in_church:false,lastChat:0,lastAction:0};ws._pilgrim=p;sockets.set(id,p);return send(ws,snapshot(p));
+ }
+ const p=ws._pilgrim;if(!p||sockets.get(p.id)!==p)return error(ws,'not_authenticated');
+ const now=Date.now();if(now-p.lastAction<80)return error(ws,'rate_limited');p.lastAction=now;
+ if(t==='world'){send(ws,{t:'world',world:{...world,cells:undefined,static_encounters:undefined}});return;}
+ if(t==='economy'){send(ws,{t:'economy',economy:economy()});return;}
+ if(t==='region'){const id=clean(m.region_id,64);const region=world.regions.find(r=>r.id===id);if(!region)return error(ws,'unknown_region');send(ws,{t:'region',region,cells:world.cells.filter(c=>c.region===id),encounters:world.static_encounters.filter(e=>{const cell=world.cells.find(c=>c.id===e.cell);return cell&&cell.region===id;})});return;}
+ if(t==='enter_church'){p.in_church=true;p.x=world.church.x;p.y=world.church.y;send(ws,{t:'entered_church',church:world.church,economy:economy(),chat:recentChat,players:churchPlayers()});broadcast({t:'presence',players:churchPlayers()},true);return;}
+ if(t==='leave_church'){p.in_church=false;send(ws,{t:'left_church'});broadcast({t:'presence',players:churchPlayers()},true);return;}
+ if(t==='position'){if(!p.in_church)return error(ws,'not_in_church');const x=Number(m.x),y=Number(m.y);if(!Number.isFinite(x)||!Number.isFinite(y)||Math.hypot(x-world.church.x,y-world.church.y)>world.church.safe_radius)return error(ws,'outside_church');p.x=x;p.y=y;broadcast({t:'presence',players:churchPlayers()},true);return;}
+ if(t==='cloister_chat'){if(!p.in_church)return error(ws,'not_in_church');if(now-p.lastChat<900)return error(ws,'chat_slowdown');const message=clean(m.message,400);if(!message)return; p.lastChat=now;const entry={id:rid(),player_id:p.id,name:p.name,message,ts:now};recentChat.push(entry);recentChat=recentChat.slice(-60);broadcast({t:'cloister_chat',entry},true);return;}
+ if(t==='donate'){if(!p.in_church)return error(ws,'not_in_church');const amount=Number(m.amount);if(!Number.isSafeInteger(amount)||amount<1||amount>100000)return error(ws,'invalid_amount');const tx=clean(m.transaction_id,80);if(!/^[a-zA-Z0-9_-]{8,80}$/.test(tx))return error(ws,'transaction_id_required');let previous=state.ledger.find(x=>x.transaction_id===tx);if(previous){if(previous.player_id!==p.id||previous.amount!==amount)return error(ws,'transaction_conflict');return send(ws,{t:'donation_ack',transaction_id:tx,amount,economy:economy(),duplicate:true});}
+  // The relay owns the bank; game-side inventory debits require server-authoritative player inventories in a later migration.
+  state.church_banked_provisions+=amount;state.donations[p.id]=(state.donations[p.id]||0)+amount;state.ledger.push({transaction_id:tx,player_id:p.id,amount,ts:now});save();send(ws,{t:'donation_ack',transaction_id:tx,amount,economy:economy()});broadcast({t:'economy',economy:economy()});return;}
+ if(t==='blessing'){if(!p.in_church)return error(ws,'not_in_church');const hour=Math.floor(now/3600000);if(state.blessings[p.id]===hour)return error(ws,'blessing_already_claimed_this_hour');const arr=world.church.head_bishop.blessings;const selected=arr[crypto.randomInt(arr.length)];state.blessings[p.id]=hour;save();send(ws,{t:'blessing',blessing:selected,server_hour:hour,next_hour:hour+1});return;}
+ if(t==='encounter_status'){const id=clean(m.encounter_id,64);const found=world.static_encounters.find(e=>e.id===id);if(!found)return error(ws,'unknown_encounter');return send(ws,{t:'encounter_status',encounter:found,completed:!!state.encounters[id]});}
+ if(t==='ping')return send(ws,{t:'pong',ts:now});error(ws,'unknown_type');
+}
+function http(req,res){const url=new URL(req.url||'/','http://localhost');if(url.pathname!=='/pilgrim'&&url.pathname!=='/api/pilgrim')return false;res.writeHead(200,{'content-type':'application/json','cache-control':'no-store'});res.end(JSON.stringify({ok:true,game:'pilgrim',world_id:world.world_id,world_cells:world.cells.length,encounters:world.static_encounters.length,church:world.church.name,economy:economy(),online:sockets.size}));return true;}
+return {handle,detach,http};
+})();
+// ==== END PILGRIMAGE ====
+
 const PORT = process.env.PORT || 8080;
 const HOST = String(process.env.HOST || process.env.BIND_HOST || process.env.MEGA_CLAIM_HOST || (process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID ? "0.0.0.0" : "127.0.0.1")).trim() || "127.0.0.1";
 const server = http.createServer((req, res) => {
+  if (pilgrim.http(req, res)) return;
   if (handleMegaClaimHTTP(req, res)) return;
   if (handleKronHTTP(req, res)) return;
   if (handleSheolHTTP(req, res)) return;
@@ -2830,6 +2882,7 @@ function handleSheolHTTP(req, res) {
   } catch { return false; }
 }
 function detachAllProtocols(ws) {
+  try { pilgrim.detach(ws); } catch {}
   try { almightyPythonDetach(ws, true); } catch {}
   try { umbralDetach(ws, true); } catch {}
   try { growthDetach(ws); } catch {}
@@ -2848,6 +2901,7 @@ function routeSocketMessage(ws, data) {
     raw = "";
   }
   if (!raw) return;
+  if (raw.startsWith("pilgrim:")) { pilgrim.handle(ws, raw.slice(8)); return; }
   if (raw.startsWith("ap:")) { almightyPythonHandle(ws, raw.slice(3)); return; }
   if (raw.startsWith("ur:")) { umbralHandle(ws, raw.slice(3), true); return; }
   if (raw.startsWith("gf:")) { growthHandle(ws, raw.slice(3)); return; }
@@ -2868,6 +2922,7 @@ function routeSocketMessage(ws, data) {
   try { m = JSON.parse(raw); } catch { m = null; }
   if (m && typeof m === "object") {
     const game = String(m.game || m.proto || m.protocol || m.g || "").toLowerCase();
+    if (game === "pilgrim" || game === "requiem_pilgrimage") { pilgrim.handle(ws, raw); return; }
     if (game === "almighty_python" || game === "almighty" || game === "ap") { almightyPythonHandle(ws, raw); return; }
     if (game === "umbral" || game === "umbral_rail" || game === "house_nocturne" || game === "vespera" || game === "ur") { umbralHandle(ws, raw, false); return; }
     if (game === "growth" || game === "gf") { growthHandle(ws, raw); return; }
@@ -2882,7 +2937,7 @@ function routeSocketMessage(ws, data) {
       return;
     }
   }
-  try { ws.send(JSON.stringify({ type: "error", code: "unsupported_protocol", message: "Use Almighty Python, House Nocturne, GROWTH, LUXBOUND, SLIMECRAFT, MECHMARINER, KRON, or SHEOL protocol routing." })); } catch {}
+  try { ws.send(JSON.stringify({ type: "error", code: "unsupported_protocol", message: "Use Almighty Python, House Nocturne, GROWTH, LUXBOUND, SLIMECRAFT, MECHMARINER, KRON, SHEOL, or PILGRIM protocol routing." })); } catch {}
 }
 wss.on("connection", (ws) => {
   ws.isAlive = true;
@@ -2899,6 +2954,6 @@ wss.on("connection", (ws) => {
 });
 // --------------------------------------------------------------------------------------------------------------------------------------------------
 server.listen(PORT, HOST, () => {
-  console.log("Dedset relay (Almighty Python / GROWTH / House Nocturne / LUXBOUND / SLIMECRAFT / MECHMARINER / KRON / SHEOL) on", HOST + ":" + PORT);
+  console.log("Dedset relay (Almighty Python / GROWTH / House Nocturne / LUXBOUND / SLIMECRAFT / MECHMARINER / KRON / SHEOL / PILGRIM) on", HOST + ":" + PORT);
   if (MEGA_CLAIM_REQUIRE_AUTH && !MEGA_CLAIM_SECRET) console.warn("MEGA claim endpoint is locked until MEGA_CLAIM_SECRET is configured.");
 });
