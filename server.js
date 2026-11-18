@@ -2934,7 +2934,121 @@ function pilgrimHandle(ws,payload){
 function pilgrimDetach(ws){if(!pilgrimClients.has(ws))return;pilgrimClients.delete(ws);pilgrimBroadcast('presence',{players:pilgrimPeople()});}
 // ---------------------- END PILGRIMAGE ----------------------
 
+// ---------------------- GRAVEWATER: Chicago Sluagh multiplayer ----------------------
+// Isolated protocol: gw:{"t":"hello","room":"...","id":"...","name":"..."}
+//              gw:{"t":"state","x":0,"y":0,"heading":0,"underground":true}
+//              gw:{"t":"chat","message":"..."}
+// Peer state is ephemeral. Local saves and NPCs remain client-owned.
+const gravewaterRooms = new Map();
+const GRAVEWATER_MAX_PEERS = 24;
+const GRAVEWATER_MIN_STATE_MS = 110;
+const GRAVEWATER_CHAT_COOLDOWN_MS = 650;
+function gravewaterSend(ws, packet) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  try { ws.send('gw:' + JSON.stringify({ game: 'gravewater', ...packet })); } catch {}
+}
+function gravewaterPublic(client) {
+  return { id: client.id, name: client.name, state: client.state };
+}
+function gravewaterBroadcast(room, packet, except = null) {
+  for (const client of room.values()) {
+    if (client.ws !== except) gravewaterSend(client.ws, packet);
+  }
+}
+function gravewaterDetach(ws) {
+  const roomName = String(ws._gravewaterRoom || '');
+  const pid = String(ws._gravewaterId || '');
+  ws._gravewaterRoom = ''; ws._gravewaterId = '';
+  if (!roomName || !pid) return;
+  const room = gravewaterRooms.get(roomName);
+  if (!room) return;
+  const person = room.get(pid);
+  // A reconnect may already have replaced this socket.
+  if (!person || person.ws !== ws) return;
+  room.delete(pid);
+  gravewaterBroadcast(room, { t: 'left', id: pid });
+  if (!room.size) gravewaterRooms.delete(roomName);
+}
+function gravewaterCleanState(m) {
+  const x = Number(m.x), y = Number(m.y), heading = Number(m.heading);
+  if (![x, y, heading].every(Number.isFinite)) return null;
+  if (x < -15550 || x > 7050 || y < -28050 || y > 16050) return null;
+  return { x, y, heading: ((heading % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI),
+    underground: !!m.underground, crouch: !!m.crouch };
+}
+function gravewaterHandle(ws, payload) {
+  if (Buffer.byteLength(String(payload || ''), 'utf8') > 4096) return;
+  let m;
+  try { m = JSON.parse(payload); } catch { return; }
+  if (!m || typeof m !== 'object' || Array.isArray(m)) return;
+  const t = String(m.t || '');
+  if (t === 'hello') {
+    const roomName = safeRoomId(m.room, '');
+    const id = String(m.id || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40);
+    const name = String(m.name || 'SLUAGH').replace(/[\r\n\t\x00-\x1f]/g, ' ').trim().slice(0, 20);
+    if (!roomName || !id) { gravewaterSend(ws, { t: 'error', code: 'bad_join' }); return; }
+    const requiredSecret = String(process.env.GRAVEWATER_SECRET || '');
+    if (requiredSecret) {
+      const incoming = String(m.secret || '');
+      const a = crypto.createHash('sha256').update(requiredSecret).digest();
+      const b = crypto.createHash('sha256').update(incoming).digest();
+      if (!crypto.timingSafeEqual(a, b)) {
+        gravewaterSend(ws, { t: 'error', code: 'authentication' }); return;
+      }
+    }
+    gravewaterDetach(ws);
+    let room = gravewaterRooms.get(roomName);
+    if (!room) { room = new Map(); gravewaterRooms.set(roomName, room); }
+    const old = room.get(id);
+    if (old) {
+      room.delete(id);
+      if (old.ws !== ws) {
+        gravewaterDetach(old.ws);
+        try { old.ws.close(); } catch {}
+      }
+    }
+    if (room.size >= GRAVEWATER_MAX_PEERS) {
+      gravewaterSend(ws, { t: 'error', code: 'room_full' }); return;
+    }
+    const client = { ws, id, name: name || 'SLUAGH', state: null, lastState: 0, lastChat: 0 };
+    ws._gravewaterRoom = roomName;
+    ws._gravewaterId = id;
+    room.set(id, client);
+    gravewaterSend(ws, { t: 'welcome', room: roomName, id,
+      players: [...room.values()].filter(c => c.id !== id && c.state).map(gravewaterPublic) });
+    gravewaterBroadcast(room, { t: 'joined', player: gravewaterPublic(client) }, ws);
+    return;
+  }
+  const room = gravewaterRooms.get(String(ws._gravewaterRoom || ''));
+  const client = room && room.get(String(ws._gravewaterId || ''));
+  if (!client || client.ws !== ws) return;
+  const now = Date.now();
+  if (t === 'state') {
+    if (now - client.lastState < GRAVEWATER_MIN_STATE_MS) return;
+    const state = gravewaterCleanState(m);
+    if (!state) return;
+    client.lastState = now;
+    client.state = state;
+    gravewaterBroadcast(room, { t: 'state', player: gravewaterPublic(client) }, ws);
+  } else if (t === 'chat') {
+    if (!client.state || now - client.lastChat < GRAVEWATER_CHAT_COOLDOWN_MS) return;
+    const message = String(m.message || '').replace(/[\r\n\t\x00-\x1f\x7f]/g, ' ').trim().slice(0, 110);
+    if (!message) return;
+    client.lastChat = now;
+    // Local speech: same surface/sewer layer, within 65 actual metres.
+    for (const target of room.values()) {
+      if (!target.state || target.state.underground !== client.state.underground) continue;
+      if (Math.hypot(target.state.x-client.state.x, target.state.y-client.state.y) > 65) continue;
+      gravewaterSend(target.ws, { t: 'chat', id: client.id, name: client.name, message });
+    }
+  } else if (t === 'ping') {
+    gravewaterSend(ws, { t: 'pong' });
+  }
+}
+// ---------------------- END GRAVEWATER ----------------------
+
 function detachAllProtocols(ws) {
+  try { gravewaterDetach(ws); } catch {}
   try { pilgrimDetach(ws); } catch {}
   try { almightyPythonDetach(ws, true); } catch {}
   try { umbralDetach(ws, true); } catch {}
@@ -2954,6 +3068,7 @@ function routeSocketMessage(ws, data) {
     raw = "";
   }
   if (!raw) return;
+  if (raw.startsWith("gw:")) { gravewaterHandle(ws, raw.slice(3)); return; }
   if (raw.startsWith("pilgrim:")) { pilgrimHandle(ws, raw.slice(8)); return; }
   if (raw.startsWith("ap:")) { almightyPythonHandle(ws, raw.slice(3)); return; }
   if (raw.startsWith("ur:")) { umbralHandle(ws, raw.slice(3), true); return; }
@@ -2975,6 +3090,7 @@ function routeSocketMessage(ws, data) {
   try { m = JSON.parse(raw); } catch { m = null; }
   if (m && typeof m === "object") {
     const game = String(m.game || m.proto || m.protocol || m.g || "").toLowerCase();
+    if (game === "gravewater" || game === "gw") { gravewaterHandle(ws, raw); return; }
     if (game === "pilgrim" || game === "pilgrimage") { pilgrimHandle(ws, raw); return; }
     if (game === "almighty_python" || game === "almighty" || game === "ap") { almightyPythonHandle(ws, raw); return; }
     if (game === "umbral" || game === "umbral_rail" || game === "house_nocturne" || game === "vespera" || game === "ur") { umbralHandle(ws, raw, false); return; }
@@ -2990,7 +3106,7 @@ function routeSocketMessage(ws, data) {
       return;
     }
   }
-  try { ws.send(JSON.stringify({ type: "error", code: "unsupported_protocol", message: "Use Almighty Python, House Nocturne, GROWTH, LUXBOUND, SLIMECRAFT, MECHMARINER, KRON, or SHEOL protocol routing." })); } catch {}
+  try { ws.send(JSON.stringify({ type: "error", code: "unsupported_protocol", message: "Use a supported game prefix, including gw: for GRAVEWATER." })); } catch {}
 }
 wss.on("connection", (ws) => {
   ws.isAlive = true;
