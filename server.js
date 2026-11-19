@@ -1,5 +1,5 @@
 // server.js - supports Almighty Python, GROWTH, House Nocturne,
-// LUXBOUND, MECHMARINER, Slimecraft, KRON & SHEOL. One process, one port, isolated rooms by game.
+// LUXBOUND, MECHMARINER, Slimecraft, KRON, SHEOL & BLAIR MOUNTAIN. One process, one port, isolated rooms by game.
 // https://raw.githubusercontent.com/tribehunt/nodejs/refs/heads/main/server.js
 // all games produced and engineered by © Dedset Media 08/31/2026
 // RAILYARD = bm9kZWpzLXByb2R1Y3Rpb24tNzQwYmM=
@@ -2934,6 +2934,121 @@ function pilgrimHandle(ws,payload){
 function pilgrimDetach(ws){if(!pilgrimClients.has(ws))return;pilgrimClients.delete(ws);pilgrimBroadcast('presence',{players:pilgrimPeople()});}
 // ---------------------- END PILGRIMAGE ----------------------
 
+// ---------------------- BLAIR MOUNTAIN 1921: miners' battlefield ----------------------
+// Dedicated Railway protocol for the single open-world Blair Mountain battle.
+// bm:{"t":"hello","room":"blair_mountain_1921","id":"...","name":"MINER"}
+// bm:{"t":"state","x":0,"y":0,"heading":0,"crouch":false}
+// bm:{"t":"chat","message":"..."}
+// Isolated from gw:/Sluagh and every other game on this relay.
+// Relay presence and chat only; local combat simulation remains client-owned.
+const blairMountainRooms = new Map();
+const BLAIR_MOUNTAIN_MAX_PEERS = 32;
+const BLAIR_MOUNTAIN_MIN_STATE_MS = 120;
+const BLAIR_MOUNTAIN_CHAT_COOLDOWN_MS = 650;
+function blairMountainSend(ws, packet) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  try { ws.send('bm:' + JSON.stringify({ game: 'blair_mountain', ...packet })); } catch {}
+}
+function blairMountainPublic(client) {
+  return { id: client.id, name: client.name, state: client.state };
+}
+function blairMountainBroadcast(room, packet, except = null) {
+  for (const client of room.values()) {
+    if (client.ws !== except) blairMountainSend(client.ws, packet);
+  }
+}
+function blairMountainDetach(ws) {
+  const roomName = String(ws._blairMountainRoom || '');
+  const id = String(ws._blairMountainId || '');
+  ws._blairMountainRoom = ''; ws._blairMountainId = '';
+  if (!roomName || !id) return;
+  const room = blairMountainRooms.get(roomName);
+  if (!room) return;
+  const client = room.get(id);
+  if (!client || client.ws !== ws) return;
+  room.delete(id);
+  blairMountainBroadcast(room, { t: 'left', id });
+  if (room.size === 0) blairMountainRooms.delete(roomName);
+}
+function blairMountainCleanState(m) {
+  const x = Number(m.x), y = Number(m.y), heading = Number(m.heading);
+  if (![x, y, heading].every(Number.isFinite)) return null;
+  // These bounds are the playable extent of Blair Mountain, in metres.
+  if (x < 0 || x > 5200 || y < 0 || y > 6500) return null;
+  return { x, y,
+    heading: ((heading % (2 * Math.PI)) + (2 * Math.PI)) % (2 * Math.PI),
+    crouch: !!m.crouch, underground: false, climb_z: 0, watch: '' };
+}
+function blairMountainHandle(ws, payload) {
+  if (Buffer.byteLength(String(payload || ''), 'utf8') > 4096) return;
+  let m;
+  try { m = JSON.parse(payload); } catch { return; }
+  if (!m || typeof m !== 'object' || Array.isArray(m)) return;
+  const t = String(m.t || '');
+  if (t === 'hello') {
+    const roomName = safeRoomId(m.room, '');
+    const id = String(m.id || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40);
+    const name = String(m.name || 'MINER').replace(/[\r\n\t\x00-\x1f]/g, ' ').trim().slice(0, 20);
+    if (!roomName || !id) { blairMountainSend(ws, { t: 'error', code: 'bad_join' }); return; }
+    // Optional: configure BLAIR_MOUNTAIN_SECRET on Railway and set the matching
+    // railway_secret in the game's data/server.info; never hardcode secrets.
+    const required = String(process.env.BLAIR_MOUNTAIN_SECRET || '');
+    if (required) {
+      const incoming = String(m.secret || '');
+      const a = crypto.createHash('sha256').update(required).digest();
+      const b = crypto.createHash('sha256').update(incoming).digest();
+      if (!crypto.timingSafeEqual(a, b)) {
+        blairMountainSend(ws, { t: 'error', code: 'authentication' }); return;
+      }
+    }
+    blairMountainDetach(ws);
+    let room = blairMountainRooms.get(roomName);
+    if (!room) { room = new Map(); blairMountainRooms.set(roomName, room); }
+    const old = room.get(id);
+    if (old) {
+      // A reconnect with the same ID replaces its stale socket cleanly.
+      blairMountainDetach(old.ws);
+      if (old.ws !== ws) { try { old.ws.close(); } catch {} }
+    }
+    if (room.size >= BLAIR_MOUNTAIN_MAX_PEERS) {
+      blairMountainSend(ws, { t: 'error', code: 'room_full' }); return;
+    }
+    const client = { ws, id, name: name || 'MINER', state: null,
+                     lastState: 0, lastChat: 0 };
+    ws._blairMountainRoom = roomName;
+    ws._blairMountainId = id;
+    room.set(id, client);
+    blairMountainSend(ws, { t: 'welcome', protocol_version: 2, room: roomName,
+      id, players: [...room.values()].filter(c => c.id !== id && c.state).map(blairMountainPublic) });
+    blairMountainBroadcast(room, { t: 'joined', player: blairMountainPublic(client) }, ws);
+    return;
+  }
+  const room = blairMountainRooms.get(String(ws._blairMountainRoom || ''));
+  const client = room && room.get(String(ws._blairMountainId || ''));
+  if (!client || client.ws !== ws) return;
+  const now = Date.now();
+  if (t === 'state') {
+    if (now - client.lastState < BLAIR_MOUNTAIN_MIN_STATE_MS) return;
+    const state = blairMountainCleanState(m);
+    if (!state) return;
+    client.state = state;
+    client.lastState = now;
+    blairMountainBroadcast(room, { t: 'state', player: blairMountainPublic(client) }, ws);
+  } else if (t === 'chat') {
+    if (!client.state || now - client.lastChat < BLAIR_MOUNTAIN_CHAT_COOLDOWN_MS) return;
+    const message = String(m.message || '').replace(/[\r\n\t\x00-\x1f\x7f]/g, ' ').trim().slice(0, 110);
+    if (!message) return;
+    client.lastChat = now;
+    for (const other of room.values()) {
+      blairMountainSend(other.ws, { t: 'chat', id: client.id, name: client.name, message });
+    }
+    blairMountainSend(ws, { t: 'chat_ack' });
+  } else if (t === 'ping') {
+    blairMountainSend(ws, { t: 'pong' });
+  }
+}
+// ---------------------- END BLAIR MOUNTAIN ----------------------
+
 // ---------------------- GRAVEWATER: Chicago Sluagh multiplayer ----------------------
 // Isolated protocol: gw:{"t":"hello","room":"...","id":"...","name":"..."}
 //              gw:{"t":"state","x":0,"y":0,"heading":0,"underground":true}
@@ -3073,6 +3188,7 @@ function gravewaterHandle(ws, payload) {
 // ---------------------- END GRAVEWATER ----------------------
 
 function detachAllProtocols(ws) {
+  try { blairMountainDetach(ws); } catch {}
   try { gravewaterDetach(ws); } catch {}
   try { pilgrimDetach(ws); } catch {}
   try { almightyPythonDetach(ws, true); } catch {}
@@ -3093,6 +3209,7 @@ function routeSocketMessage(ws, data) {
     raw = "";
   }
   if (!raw) return;
+  if (raw.startsWith("bm:")) { blairMountainHandle(ws, raw.slice(3)); return; }
   if (raw.startsWith("gw:")) { gravewaterHandle(ws, raw.slice(3)); return; }
   if (raw.startsWith("pilgrim:")) { pilgrimHandle(ws, raw.slice(8)); return; }
   if (raw.startsWith("ap:")) { almightyPythonHandle(ws, raw.slice(3)); return; }
@@ -3115,6 +3232,7 @@ function routeSocketMessage(ws, data) {
   try { m = JSON.parse(raw); } catch { m = null; }
   if (m && typeof m === "object") {
     const game = String(m.game || m.proto || m.protocol || m.g || "").toLowerCase();
+    if (game === "blair_mountain" || game === "bm") { blairMountainHandle(ws, raw); return; }
     if (game === "gravewater" || game === "gw") { gravewaterHandle(ws, raw); return; }
     if (game === "pilgrim" || game === "pilgrimage") { pilgrimHandle(ws, raw); return; }
     if (game === "almighty_python" || game === "almighty" || game === "ap") { almightyPythonHandle(ws, raw); return; }
@@ -3131,7 +3249,7 @@ function routeSocketMessage(ws, data) {
       return;
     }
   }
-  try { ws.send(JSON.stringify({ type: "error", code: "unsupported_protocol", message: "Use a supported game prefix, including gw: for GRAVEWATER." })); } catch {}
+  try { ws.send(JSON.stringify({ type: "error", code: "unsupported_protocol", message: "Use a supported game prefix, including bm: for BLAIR MOUNTAIN." })); } catch {}
 }
 wss.on("connection", (ws) => {
   ws.isAlive = true;
@@ -3148,6 +3266,6 @@ wss.on("connection", (ws) => {
 });
 // --------------------------------------------------------------------------------------------------------------------------------------------------
 server.listen(PORT, HOST, () => {
-  console.log("Dedset relay (Almighty Python / GROWTH / House Nocturne / LUXBOUND / SLIMECRAFT / MECHMARINER / KRON / SHEOL) on", HOST + ":" + PORT);
+  console.log("Dedset relay (Almighty Python / GROWTH / House Nocturne / LUXBOUND / SLIMECRAFT / MECHMARINER / KRON / SHEOL / BLAIR MOUNTAIN) on", HOST + ":" + PORT);
   if (MEGA_CLAIM_REQUIRE_AUTH && !MEGA_CLAIM_SECRET) console.warn("MEGA claim endpoint is locked until MEGA_CLAIM_SECRET is configured.");
 });
