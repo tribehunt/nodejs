@@ -2943,6 +2943,7 @@ const gravewaterRooms = new Map();
 const GRAVEWATER_MAX_PEERS = 24;
 const GRAVEWATER_MIN_STATE_MS = 110;
 const GRAVEWATER_CHAT_COOLDOWN_MS = 650;
+const GRAVEWATER_SNOOP_COOLDOWN_MS = 1800;
 function gravewaterSend(ws, packet) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   try { ws.send('gw:' + JSON.stringify({ game: 'gravewater', ...packet })); } catch {}
@@ -2973,8 +2974,12 @@ function gravewaterCleanState(m) {
   const x = Number(m.x), y = Number(m.y), heading = Number(m.heading);
   if (![x, y, heading].every(Number.isFinite)) return null;
   if (x < -15550 || x > 7050 || y < -28050 || y > 16050) return null;
+  const z = Number(m.climb_z || 0);
+  const watch = String(m.watch || '').slice(0,100);
   return { x, y, heading: ((heading % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI),
-    underground: !!m.underground, crouch: !!m.crouch };
+    underground: !!m.underground, crouch: !!m.crouch,
+    climb_z: Number.isFinite(z) ? Math.max(0, Math.min(20,z)) : 0,
+    watch: /^[a-zA-Z0-9:._-]*$/.test(watch) ? watch : '' };
 }
 function gravewaterHandle(ws, payload) {
   if (Buffer.byteLength(String(payload || ''), 'utf8') > 4096) return;
@@ -3010,11 +3015,11 @@ function gravewaterHandle(ws, payload) {
     if (room.size >= GRAVEWATER_MAX_PEERS) {
       gravewaterSend(ws, { t: 'error', code: 'room_full' }); return;
     }
-    const client = { ws, id, name: name || 'SLUAGH', state: null, lastState: 0, lastChat: 0 };
+    const client = { ws, id, name: name || 'SLUAGH', state: null, lastState: 0, lastChat: 0, lastSnoop: 0 };
     ws._gravewaterRoom = roomName;
     ws._gravewaterId = id;
     room.set(id, client);
-    gravewaterSend(ws, { t: 'welcome', room: roomName, id,
+    gravewaterSend(ws, { t: 'welcome', protocol_version: 2, room: roomName, id,
       players: [...room.values()].filter(c => c.id !== id && c.state).map(gravewaterPublic) });
     gravewaterBroadcast(room, { t: 'joined', player: gravewaterPublic(client) }, ws);
     return;
@@ -3035,11 +3040,31 @@ function gravewaterHandle(ws, payload) {
     const message = String(m.message || '').replace(/[\r\n\t\x00-\x1f\x7f]/g, ' ').trim().slice(0, 110);
     if (!message) return;
     client.lastChat = now;
-    // Local speech: same surface/sewer layer, within 65 actual metres.
+    // Room-wide Sluagh whisper network. World distance and sewer layer do not
+    // suppress messages; the first build silently dropped them without feedback.
+    // Include the sender so their own message is visible in the chat history.
     for (const target of room.values()) {
-      if (!target.state || target.state.underground !== client.state.underground) continue;
-      if (Math.hypot(target.state.x-client.state.x, target.state.y-client.state.y) > 65) continue;
       gravewaterSend(target.ws, { t: 'chat', id: client.id, name: client.name, message });
+    }
+    gravewaterSend(ws, { t: 'chat_ack' });
+  } else if (t === 'snoop') {
+    // Shared confidences are deliberately local. A distant room member cannot
+    // obtain somebody's private overhearing merely by being online.
+    if (!client.state || client.state.underground || !client.state.watch ||
+        now - client.lastSnoop < GRAVEWATER_SNOOP_COOLDOWN_MS) return;
+    const win = String(m.window || '').slice(0,100);
+    const sid = String(m.sid || '').slice(0,64);
+    const speaker = String(m.speaker || '').replace(/[\x00-\x1f\x7f]/g,' ').slice(0,64);
+    const district = String(m.district || '').replace(/[\x00-\x1f\x7f]/g,' ').slice(0,64);
+    if (!/^[a-zA-Z0-9:._-]{1,100}$/.test(win) || win !== client.state.watch ||
+        !/^[a-zA-Z0-9_]{1,64}$/.test(sid) || !speaker || !district) return;
+    client.lastSnoop = now;
+    for (const target of room.values()) {
+      if (target === client || !target.state || target.state.underground ||
+          target.state.watch !== win) continue;
+      const dist = Math.hypot(target.state.x-client.state.x,target.state.y-client.state.y);
+      if (dist > 12 || Math.abs(target.state.climb_z-client.state.climb_z)>2) continue;
+      gravewaterSend(target.ws,{t:'snoop', id:client.id, sid, speaker, district});
     }
   } else if (t === 'ping') {
     gravewaterSend(ws, { t: 'pong' });
